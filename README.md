@@ -31,7 +31,7 @@ A fast, keyboard-friendly Windows file manager written in pure C with OpenGL 3.3
 - **Shell context menu** — right-click invokes the real Windows context menu via `IContextMenu`, including *Open with*, *Send to*, *Properties*, etc. (Convert to / Rotate / Scan With are filtered out as noise)
 - **Open terminal in the current folder** — `Ctrl+D` launches your default terminal rooted at the focused tab's path
 - **Recycle Bin** entry in the sidebar opens the system Recycle Bin
-- **Bookmarks** sidebar — right-click *Remove from bookmarks*; bookmarks are saved to `%APPDATA%\filepilot\bookmarks.txt`
+- **Bookmarks** sidebar — right-click *Remove from bookmarks*; bookmarks are saved to `%APPDATA%\filepathx\bookmarks.txt`
 - **File-system watcher** — directory contents auto-refresh when files are added/removed/renamed externally
 
 ### Rendering & platform
@@ -88,7 +88,7 @@ gcc -O2 -Wall -o build/FilePathX.exe \
 
 ## Persistence
 
-State is saved under `%APPDATA%\filepilot\`:
+State is saved under `%APPDATA%\filepathx\`:
 
 - `bookmarks.txt` — one path per line
 - `tabs.txt` — active index + one path per line

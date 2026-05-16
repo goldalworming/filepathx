@@ -1182,13 +1182,13 @@ static void app_data_file(const char* name, char* out, int n) {
     SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, wappdata);
     char appdata[MAX_PATH] = {0};
     w_to_u8(wappdata, appdata, MAX_PATH);
-    _snprintf(out, n, "%s\\filepilot", appdata);
+    _snprintf(out, n, "%s\\filepathx", appdata);
     {
         WCHAR wdir[MAX_PATH];
         u8_to_w(out, wdir, MAX_PATH);
         CreateDirectoryW(wdir, NULL);
     }
-    _snprintf(out, n, "%s\\filepilot\\%s", appdata, name);
+    _snprintf(out, n, "%s\\filepathx\\%s", appdata, name);
 }
 
 /* fopen wrapper that handles UTF-8 paths via _wfopen */
