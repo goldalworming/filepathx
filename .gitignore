@@ -1,0 +1,32 @@
+# Build artifacts
+build/
+*.obj
+*.exe
+*.res
+*.o
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Toolchain (download separately)
+w64devkit/
+w64devkit*.exe
+w64devkit*.7z
+
+# Experiments / scratch
+experiments/
+
+# IDE & tooling
+.claude/
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Source icon (keep .ico, the PNG is large)
+icon.png
