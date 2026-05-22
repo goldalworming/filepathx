@@ -328,6 +328,14 @@ static int g_drag_panel = -1;        /* which panel the drag started in */
 static int g_drag_x0  = 0, g_drag_y0 = 0;
 static int g_dragging = 0;
 
+/* ---- Marquee (rubber-band) selection in icon views ---- */
+static int   g_marquee_active = 0;
+static int   g_marquee_panel  = -1;
+static float g_marquee_x0     = 0;   /* content-space (scroll-adjusted) start */
+static float g_marquee_y0     = 0;
+static int   g_marquee_additive = 0;
+static unsigned char g_marquee_anchor[MAX_ENTRIES];
+
 static void start_drag_out(Tab* t) {
     if (g_dragging) return;
     /* Collect selected non-".." entries */
@@ -544,7 +552,7 @@ typedef struct {
     DWORD  last_used;
 } ThumbEntry;
 typedef struct { char path[MAX_PATH]; } ThumbReq;
-typedef struct { char path[MAX_PATH]; HBITMAP bmp; int w, h; } ThumbDone;
+typedef struct { char path[MAX_PATH]; HBITMAP bmp; int w, h; int flip_v; } ThumbDone;
 
 static ThumbEntry g_thumb_cache[THUMB_CACHE_CAP];
 static int        g_thumb_count = 0;
@@ -642,8 +650,18 @@ static DWORD WINAPI thumb_worker(LPVOID arg) {
                 if (SUCCEEDED(IShellItem_QueryInterface(item, &IID_IShellItemImageFactory, (void**)&fac)) && fac) {
                     SIZE sz = { THUMB_PX, THUMB_PX };
                     HBITMAP hbmp = NULL;
+                    /* First try thumbnail-only — Windows returns these upright.
+                       If no thumbnail provider is available (empty folder, .exe,
+                       generic file types), fall back to the icon path which
+                       comes back upside down and needs a vertical flip. */
                     HRESULT hr = fac->lpVtbl->GetImage(fac, sz,
-                        SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK, &hbmp);
+                        SIIGBF_THUMBNAILONLY | SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK, &hbmp);
+                    int is_thumb = SUCCEEDED(hr) && hbmp;
+                    if (!is_thumb) {
+                        if (hbmp) { DeleteObject(hbmp); hbmp = NULL; }
+                        hr = fac->lpVtbl->GetImage(fac, sz,
+                            SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK, &hbmp);
+                    }
                     if (SUCCEEDED(hr) && hbmp) {
                         DIBSECTION ds = {0};
                         GetObject(hbmp, sizeof(ds), &ds);
@@ -655,6 +673,9 @@ static DWORD WINAPI thumb_worker(LPVOID arg) {
                             d->bmp = hbmp;
                             d->w = ds.dsBm.bmWidth;
                             d->h = abs(ds.dsBm.bmHeight);
+                            /* Thumbnails come back upright; icon fallbacks
+                               come back upside down. */
+                            d->flip_v = !is_thumb;
                         } else {
                             DeleteObject(hbmp);
                         }
@@ -690,21 +711,18 @@ static void thumb_init(void) {
     g_thumb_initialized = 1;
 }
 
-static GLuint hbmp_to_gl(HBITMAP hbmp, int* out_w, int* out_h) {
+static GLuint hbmp_to_gl(HBITMAP hbmp, int* out_w, int* out_h, int flip_v) {
     DIBSECTION ds = {0};
     if (GetObject(hbmp, sizeof(ds), &ds) == 0 || !ds.dsBm.bmBits) return 0;
     int w = ds.dsBm.bmWidth;
     int h = abs(ds.dsBm.bmHeight);
-    if (h <= 0) h = abs(ds.dsBmih.biHeight);
     int stride = ds.dsBm.bmWidthBytes;
     unsigned char* src = (unsigned char*)ds.dsBm.bmBits;
     unsigned char* tmp = (unsigned char*)malloc((size_t)w * h * 4);
     if (!tmp) return 0;
-    /* IShellItemImageFactory returns top-down DIB. Row 0 of bmBits = top of
-       image. Copy directly (no flip) so dst row 0 = top → GL texture v=0 maps
-       to screen top. */
     for (int y = 0; y < h; y++) {
-        unsigned char* sr = src + y * stride;
+        int src_y = flip_v ? (h - 1 - y) : y;
+        unsigned char* sr = src + src_y * stride;
         unsigned char* dr = tmp + y * w * 4;
         for (int x = 0; x < w; x++) {
             unsigned char b = sr[0], g = sr[1], r = sr[2], a = sr[3];
@@ -788,17 +806,26 @@ static GLuint load_logo_texture(HINSTANCE hInst) {
     memset(bits, 0, sz * sz * 4);
     DrawIconEx(dc, 0, 0, icon, sz, sz, 0, NULL, DI_NORMAL);
     GdiFlush();
-    uint8_t* p = (uint8_t*)bits;
-    for (int i = 0; i < sz * sz; i++) {
-        uint8_t b = p[0], g = p[1], rv = p[2], a = p[3];
-        if (a == 0 && (rv|g|b)) a = 255;
-        p[0]=rv; p[1]=g; p[2]=b; p[3]=a;
-        p += 4;
+    /* Horizontally mirror the icon while converting BGRA -> RGBA. The source
+       art has its chevron pointing the wrong way; flipping here gives the
+       intended "X →" branding without needing to re-author the .ico. */
+    uint8_t* out = (uint8_t*)malloc(sz * sz * 4);
+    if (!out) { SelectObject(dc, old); DeleteObject(bmp); DeleteDC(dc); DestroyIcon(icon); return 0; }
+    uint8_t* src = (uint8_t*)bits;
+    for (int y = 0; y < sz; y++) {
+        for (int x = 0; x < sz; x++) {
+            uint8_t* sp = src + (y * sz + x) * 4;
+            uint8_t* dp = out + (y * sz + (sz - 1 - x)) * 4;
+            uint8_t b = sp[0], g = sp[1], rv = sp[2], a = sp[3];
+            if (a == 0 && (rv|g|b)) a = 255;
+            dp[0] = rv; dp[1] = g; dp[2] = b; dp[3] = a;
+        }
     }
     GLuint tex;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, sz, sz, 0, GL_RGBA, GL_UNSIGNED_BYTE, bits);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, sz, sz, 0, GL_RGBA, GL_UNSIGNED_BYTE, out);
+    free(out);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1040,17 +1067,38 @@ static void scan_directory(Tab* tab) {
 
 /* ---- Navigation ---- */
 static void tab_navigate(Tab* tab, const char* path, int add_hist) {
-    if (add_hist) {
-        if (tab->hist_pos < tab->hist_count - 1) tab->hist_count = tab->hist_pos + 1;
-        if (tab->hist_count < MAX_HIST) {
-            strncpy(tab->history[tab->hist_count], tab->path, MAX_PATH);
-            tab->hist_count++;
-            tab->hist_pos = tab->hist_count - 1;
+    char norm[MAX_PATH];
+    strncpy(norm, path, MAX_PATH-1); norm[MAX_PATH-1] = 0;
+    int nlen = (int)strlen(norm);
+    if (nlen > 3 && norm[nlen-1] == '\\') norm[nlen-1] = 0;
+    if (!add_hist || tab->hist_count == 0) {
+        /* Seed: history becomes just [norm], pos=0. */
+        strncpy(tab->history[0], norm, MAX_PATH-1);
+        tab->history[0][MAX_PATH-1] = 0;
+        tab->hist_count = 1;
+        tab->hist_pos = 0;
+    } else {
+        /* Skip if already on this path (avoid bogus duplicate history entries) */
+        if (strcmp(tab->history[tab->hist_pos], norm) != 0) {
+            /* Truncate forward stack */
+            tab->hist_count = tab->hist_pos + 1;
+            if (tab->hist_count < MAX_HIST) {
+                strncpy(tab->history[tab->hist_count], norm, MAX_PATH-1);
+                tab->history[tab->hist_count][MAX_PATH-1] = 0;
+                tab->hist_pos = tab->hist_count;
+                tab->hist_count++;
+            } else {
+                /* Full: shift left, keep newest */
+                for (int i = 0; i < MAX_HIST - 1; i++)
+                    memcpy(tab->history[i], tab->history[i+1], MAX_PATH);
+                strncpy(tab->history[MAX_HIST-1], norm, MAX_PATH-1);
+                tab->history[MAX_HIST-1][MAX_PATH-1] = 0;
+                tab->hist_pos = MAX_HIST - 1;
+            }
         }
     }
-    strncpy(tab->path, path, MAX_PATH-1);
-    int len = (int)strlen(tab->path);
-    if (len > 3 && tab->path[len-1] == '\\') tab->path[len-1] = 0;
+    strncpy(tab->path, norm, MAX_PATH-1);
+    tab->path[MAX_PATH-1] = 0;
     /* Navigation: reset UI state so scan_directory's name-preserving logic
        starts with a clean slate (no leaks from old folder). */
     tab->selected = -1;
@@ -1064,29 +1112,55 @@ static void tab_navigate(Tab* tab, const char* path, int add_hist) {
 }
 
 static void tab_go_up(Tab* tab) {
-    char parent[MAX_PATH];
+    char parent[MAX_PATH], leaf[MAX_PATH] = {0};
     strncpy(parent, tab->path, MAX_PATH);
+    const char* slash = strrchr(parent, '\\');
+    if (slash && slash[1]) strncpy(leaf, slash + 1, MAX_PATH - 1);
     PathRemoveFileSpecA(parent);
-    if (strlen(parent) >= 2) tab_navigate(tab, parent, 1);
+    if (strlen(parent) < 2) return;
+    tab_navigate(tab, parent, 1);
+    if (leaf[0]) {
+        for (int i = 0; i < tab->entry_count; i++) {
+            if (strcmp(tab->entries[i].name, leaf) == 0) {
+                tab->selected = i;
+                tab->sel_anchor = i;
+                tab->sel_mask[i] = 1;
+                scroll_to_entry(tab, i);
+                break;
+            }
+        }
+    }
 }
 
 static void tab_go_back(Tab* tab) {
     if (tab->hist_pos > 0) {
-        if (tab->hist_pos == tab->hist_count - 1 && tab->hist_count < MAX_HIST) {
-            strncpy(tab->history[tab->hist_count], tab->path, MAX_PATH);
-            tab->hist_count++;
-        }
         tab->hist_pos--;
-        strncpy(tab->path, tab->history[tab->hist_pos], MAX_PATH);
+        strncpy(tab->path, tab->history[tab->hist_pos], MAX_PATH-1);
+        tab->path[MAX_PATH-1] = 0;
+        tab->selected = -1;
+        tab->sel_anchor = -1;
+        memset(tab->sel_mask, 0, sizeof(tab->sel_mask));
+        tab->target_scroll = 0;
+        tab->scroll_y = 0;
         scan_directory(tab);
+        watch_start(tab->path);
+        tabs_save();
     }
 }
 
 static void tab_go_forward(Tab* tab) {
-    if (tab->hist_pos < tab->hist_count - 1) {
+    if (tab->hist_pos + 1 < tab->hist_count) {
         tab->hist_pos++;
-        strncpy(tab->path, tab->history[tab->hist_pos], MAX_PATH);
+        strncpy(tab->path, tab->history[tab->hist_pos], MAX_PATH-1);
+        tab->path[MAX_PATH-1] = 0;
+        tab->selected = -1;
+        tab->sel_anchor = -1;
+        memset(tab->sel_mask, 0, sizeof(tab->sel_mask));
+        tab->target_scroll = 0;
+        tab->scroll_y = 0;
         scan_directory(tab);
+        watch_start(tab->path);
+        tabs_save();
     }
 }
 
@@ -2163,11 +2237,14 @@ static void scroll_to_entry(Tab* t, int idx) {
     }
     int r = entry_to_row(t, idx);
     if (r < 0) return;
-    float lh = (float)(g_height - CONTENT_TOP - COL_HDR_H);
+    float lh = (float)(g_height - CONTENT_TOP - COL_HDR_H - STATUS_BAR_H);
     float ry = (float)r * ROW_H;
-    if (ry < t->target_scroll) t->target_scroll = ry;
-    else if (ry + ROW_H > t->target_scroll + lh)
-        t->target_scroll = ry + ROW_H - lh;
+    /* If already comfortably in view (top half not too high, bottom not clipped), leave it. */
+    float margin = ROW_H * 2;
+    if (ry >= t->target_scroll + margin && ry + ROW_H <= t->target_scroll + lh - margin) return;
+    /* Otherwise center the entry in the viewport. */
+    t->target_scroll = ry + ROW_H * 0.5f - lh * 0.5f;
+    if (t->target_scroll < 0) t->target_scroll = 0;
 }
 
 /* ---- Selection helpers ---- */
@@ -3189,6 +3266,71 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
         }
         if (!g_mouse_down) { g_drag_idx = -1; g_drag_panel = -1; }
 
+        /* ---- Marquee (rubber-band) selection ---- */
+        {
+            int mouse_in_list = (g_mouse_x >= lx && g_mouse_x < lx + lw &&
+                                 g_mouse_y >= ly && g_mouse_y < ly + lh);
+            int ctrl_p = GetKeyState(VK_CONTROL) < 0;
+            /* Start: mouse press inside list, no item was clicked (g_drag_idx still -1) */
+            if (!g_marquee_active && g_drag_idx < 0 &&
+                g_ui.input.mouse_clicked && mouse_in_list) {
+                g_marquee_active = 1;
+                g_marquee_panel  = g_app.active_panel;
+                g_marquee_x0     = (float)g_mouse_x - lx;
+                g_marquee_y0     = (float)g_mouse_y - ly + t->scroll_y;
+                g_marquee_additive = ctrl_p;
+                if (ctrl_p) memcpy(g_marquee_anchor, t->sel_mask, sizeof(g_marquee_anchor));
+                else        { memset(g_marquee_anchor, 0, sizeof(g_marquee_anchor));
+                              sel_clear(t); t->selected = -1; t->sel_anchor = -1; }
+            }
+            /* Update + draw */
+            if (g_marquee_active && g_marquee_panel == g_app.active_panel && g_mouse_down) {
+                float mx_c = (float)g_mouse_x - lx;
+                float my_c = (float)g_mouse_y - ly + t->scroll_y;
+                float rx0 = g_marquee_x0 < mx_c ? g_marquee_x0 : mx_c;
+                float rx1 = g_marquee_x0 < mx_c ? mx_c        : g_marquee_x0;
+                float ry0 = g_marquee_y0 < my_c ? g_marquee_y0 : my_c;
+                float ry1 = g_marquee_y0 < my_c ? my_c        : g_marquee_y0;
+                /* Update selection based on item content rects */
+                int s = 0;
+                for (int i = 0; i < t->entry_count; i++) {
+                    if (strcmp(t->entries[i].name, "..") == 0) continue;
+                    int rr = s / cols, cc = s % cols;
+                    s++;
+                    float ix_c = 4 + cc * item_w;
+                    float iy_c = 4 + rr * item_h;
+                    float iw_c = item_w - 4, ih_c = item_h - 4;
+                    int hit = !(ix_c > rx1 || ix_c + iw_c < rx0 ||
+                                iy_c > ry1 || iy_c + ih_c < ry0);
+                    if (g_marquee_additive)
+                        t->sel_mask[i] = g_marquee_anchor[i] || hit;
+                    else
+                        t->sel_mask[i] = hit;
+                }
+                /* Draw band in screen coords */
+                float sx0 = rx0 + lx;
+                float sx1 = rx1 + lx;
+                float sy0 = ry0 + ly - t->scroll_y;
+                float sy1 = ry1 + ly - t->scroll_y;
+                if (sx0 < lx) sx0 = lx;
+                if (sx1 > lx + lw) sx1 = lx + lw;
+                if (sy0 < ly) sy0 = ly;
+                if (sy1 > ly + lh) sy1 = ly + lh;
+                if (sx1 > sx0 && sy1 > sy0) {
+                    render_quad(r, sx0, sy0, sx1 - sx0, sy1 - sy0, 0x4035BCFE);
+                    render_quad(r, sx0, sy0, sx1 - sx0, 1,         0xFF35BCFE);
+                    render_quad(r, sx0, sy1 - 1, sx1 - sx0, 1,     0xFF35BCFE);
+                    render_quad(r, sx0, sy0, 1, sy1 - sy0,         0xFF35BCFE);
+                    render_quad(r, sx1 - 1, sy0, 1, sy1 - sy0,     0xFF35BCFE);
+                }
+                g_needs_redraw = 1;
+            }
+            if (g_marquee_active && !g_mouse_down) {
+                g_marquee_active = 0;
+                g_marquee_panel  = -1;
+            }
+        }
+
         if (content_h > lh) {
             float new_scroll = ui_scrollbar(&g_ui, UIID(999), lx, ly, lw, lh, content_h, t->scroll_y);
             if (new_scroll != t->scroll_y) {
@@ -3933,7 +4075,17 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else if (wp=='N' && ctrl && shift) { do_new_folder(t); }
         else if (wp=='N' && ctrl) { do_new_file(t); }
         else if (wp=='T' && ctrl) { new_tab(t->path); g_needs_redraw=1; }
-        else if (wp == VK_TAB && g_app.split_active && !ctrl) {
+        else if (wp == VK_TAB && (ctrl || shift)) {
+            Panel* p = &g_app.panels[g_app.active_panel];
+            if (p->tab_count > 1) {
+                int dir = shift ? -1 : 1;
+                p->active_tab = (p->active_tab + dir + p->tab_count) % p->tab_count;
+                tabs_save();
+                g_needs_redraw = 1;
+            }
+            return 0;
+        }
+        else if (wp == VK_TAB && g_app.split_active && !ctrl && !shift) {
             g_app.active_panel = 1 - g_app.active_panel;
             tabs_save();
             g_needs_redraw = 1;
@@ -4012,7 +4164,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         LeaveCriticalSection(&g_thumb_cs);
         for (int i = 0; i < n; i++) {
             int w, h;
-            GLuint tex = hbmp_to_gl(done[i].bmp, &w, &h);
+            GLuint tex = hbmp_to_gl(done[i].bmp, &w, &h, done[i].flip_v);
             DeleteObject(done[i].bmp);
             if (tex) thumb_cache_put(done[i].path, tex, w, h);
         }
