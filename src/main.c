@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include "render.h"
 #include "ui.h"
 
@@ -1654,7 +1655,9 @@ static void inline_rename_commit(void) {
             scan_directory(t);
             for (int i = 0; i < t->entry_count; i++) {
                 if (strcmp(t->entries[i].name, new_name) == 0) {
+                    sel_only(t, i);
                     t->selected = i;
+                    t->sel_anchor = i;
                     scroll_to_entry(t, i);
                     break;
                 }
@@ -2004,6 +2007,46 @@ static void do_delete_selected(Tab* t) {
     free(list);
 }
 
+static void do_permanent_delete_selected(Tab* t) {
+    int n = sel_count(t);
+    if (n <= 0) return;
+    /* Build a confirmation message. Show the single file name when only one
+       is selected, otherwise just the count — keeps the dialog readable. */
+    WCHAR msg[1024];
+    if (n == 1) {
+        char only_name[MAX_PATH] = {0};
+        for (int i = 0; i < t->entry_count; i++) {
+            if (t->sel_mask[i] && strcmp(t->entries[i].name, "..") != 0) {
+                strncpy(only_name, t->entries[i].name, MAX_PATH-1);
+                break;
+            }
+        }
+        WCHAR wname[MAX_PATH];
+        u8_to_w(only_name, wname, MAX_PATH);
+        _snwprintf(msg, 1024,
+            L"Permanently delete '%ls'?\n\nThis file will NOT go to the Recycle Bin "
+            L"and cannot be undone.", wname);
+    } else {
+        _snwprintf(msg, 1024,
+            L"Permanently delete %d items?\n\nThese files will NOT go to the Recycle Bin "
+            L"and cannot be undone.", n);
+    }
+    int btn = MessageBoxW(g_hwnd, msg, L"Confirm permanent delete",
+                          MB_YESNO | MB_ICONWARNING);
+    if (btn != IDYES) return;
+
+    int wlen = 0;
+    WCHAR* list = build_selected_path_list_w(t, &wlen);
+    if (!list) return;
+    SHFILEOPSTRUCTW op = {0};
+    op.hwnd = g_hwnd;
+    op.wFunc = FO_DELETE;
+    op.pFrom = list;
+    op.fFlags = FOF_NOCONFIRMATION;  /* permanent + skip Windows' own prompt */
+    SHFileOperationW(&op);
+    free(list);
+}
+
 /* ---- Batch rename ---- */
 static void split_stem_ext(const char* name, char* stem, char* ext, int n) {
     strncpy(stem, name, n - 1); stem[n - 1] = 0;
@@ -2069,7 +2112,9 @@ static void focus_and_rename(Tab* t, const char* name) {
     scan_directory(t);
     for (int i = 0; i < t->entry_count; i++) {
         if (strcmp(t->entries[i].name, name) == 0) {
+            sel_only(t, i);
             t->selected = i;
+            t->sel_anchor = i;
             scroll_to_entry(t, i);
             inline_rename_start(i);
             return;
@@ -3721,7 +3766,7 @@ static void build_status_bar(void) {
     render_quad(r, SIDEBAR_W, y, w - SIDEBAR_W, STATUS_BAR_H, COL_HEADER);
     render_quad(r, SIDEBAR_W, y, w - SIDEBAR_W, 1, COL_BORDER);
     if (g_app.split_active) {
-        float split_x = SIDEBAR_W + g_app.split_ratio * (g_width - SIDEBAR_W);
+        float split_x = floorf(SIDEBAR_W + g_app.split_ratio * (g_width - SIDEBAR_W));
         render_panel_status(r, 0, SIDEBAR_W, split_x, y);
         render_panel_status(r, 1, split_x, w, y);
         render_quad(r, split_x - 1, y, 2, STATUS_BAR_H, COL_BORDER);
@@ -3754,7 +3799,10 @@ static void build_ui(void) {
     int win_btns_left = g_width - WIN_BTN_W * 3;
     float content_left = SIDEBAR_W;
     float content_right = (float)g_width;
-    float split_x = content_left + g_app.split_ratio * (content_right - content_left);
+    /* Snap to integer pixel so the right panel renders at whole-pixel x —
+       otherwise text glyphs land at fractional positions and bilinear
+       sampling on the font atlas makes them look fuzzy. */
+    float split_x = floorf(content_left + g_app.split_ratio * (content_right - content_left));
     if (!g_app.split_active) split_x = content_right;
 
     /* Tab bar tabs_xmin = 38 (after logo) for panel 0, split_x for panel 1.
@@ -4048,7 +4096,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else if (wp == VK_F5) { thumb_cache_clear(); scan_directory(t); }
         else if (wp == VK_F2 && t->selected >= 0) { do_rename(t, t->selected); }
         else if (wp == VK_DELETE && sel_count(t) > 0) {
-            do_delete_selected(t);
+            if (shift) do_permanent_delete_selected(t);
+            else       do_delete_selected(t);
             scan_directory(t);
         }
         else if (wp == VK_RETURN && t->selected >= 0) {
