@@ -1504,7 +1504,7 @@ static void bookmarks_load(void) {
 /* Hit-test sidebar: returns 1 if (mx,my) is on a bookmark item, sets *out_idx */
 static int sidebar_hit_bookmark(int mx, int my, int* out_idx) {
     if (mx < 0 || mx >= SIDEBAR_W) return 0;
-    float sy = CONTENT_TOP + 4;
+    float sy = TAB_BAR_H + 4;
     for (int s = 0; s < g_app.section_count; s++) {
         SidebarSection* sec = &g_app.sections[s];
         sy += 22;
@@ -1521,6 +1521,42 @@ static int sidebar_hit_bookmark(int mx, int my, int* out_idx) {
     return 0;
 }
 
+#define STORAGE_SECTION 1
+
+/* Repopulate the Storage section from the current set of mounted drives.
+   Called at init and whenever WM_DEVICECHANGE fires so a freshly-plugged
+   USB / external drive shows up without restarting the app. */
+static void refresh_storage_drives(void) {
+    SidebarSection* s = &g_app.sections[STORAGE_SECTION];
+    s->item_count = 0;
+    DWORD mask = GetLogicalDrives();
+    for (int i = 0; i < 26; i++) {
+        if (!(mask & (1u << i))) continue;
+        char root[8];
+        _snprintf(root, sizeof(root), "%c:\\", 'A' + i);
+        UINT dt = GetDriveTypeA(root);
+        if (dt == DRIVE_NO_ROOT_DIR || dt == DRIVE_UNKNOWN) continue;
+        /* Use the volume label when available, fall back to drive letter. */
+        char label[64] = {0};
+        WCHAR wroot[8]; u8_to_w(root, wroot, 8);
+        WCHAR wlabel[64] = {0};
+        if (GetVolumeInformationW(wroot, wlabel, 64, NULL, NULL, NULL, NULL, 0) && wlabel[0])
+            w_to_u8(wlabel, label, sizeof(label));
+        char name[96], shortp[8];
+        const char* prefix =
+            (dt == DRIVE_REMOVABLE) ? "Removable" :
+            (dt == DRIVE_CDROM)     ? "CD/DVD"    :
+            (dt == DRIVE_REMOTE)    ? "Network"   :
+                                      "Local Disk";
+        if (label[0]) _snprintf(name, sizeof(name), "%s (%c:)", label, 'A' + i);
+        else          _snprintf(name, sizeof(name), "%s (%c:)", prefix, 'A' + i);
+        _snprintf(shortp, sizeof(shortp), "%c:", 'A' + i);
+        add_sb(s, name, root, shortp, COL_ACCENT);
+        s->items[s->item_count - 1].icon_tex = get_path_icon(root);
+    }
+    g_needs_redraw = 1;
+}
+
 static void init_sidebar(void) {
     SidebarSection* s;
 
@@ -1530,9 +1566,7 @@ static void init_sidebar(void) {
 
     s = &g_app.sections[1];
     strcpy(s->title, "Storage"); s->expanded = 1;
-    add_sb(s, "Local Disk (C:)", "C:\\", "C:", COL_ACCENT);
-    if (GetDriveTypeA("D:\\") != DRIVE_NO_ROOT_DIR)
-        add_sb(s, "Local Disk (D:)", "D:\\", "D:", COL_ACCENT);
+    refresh_storage_drives();
 
     s = &g_app.sections[2];
     strcpy(s->title, "Places"); s->expanded = 1;
@@ -4010,6 +4044,16 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_RBUTTONUP:
         show_context_menu(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
         return 0;
+
+    case WM_DEVICECHANGE:
+        /* Volume mount/unmount events arrive here. The wParam is one of the
+           DBT_DEVICE* codes; we only care about volume arrival/removal which
+           affect the drive list. */
+        if (wp == 0x8000 /* DBT_DEVICEARRIVAL */ ||
+            wp == 0x8004 /* DBT_DEVICEREMOVECOMPLETE */) {
+            refresh_storage_drives();
+        }
+        return TRUE;
 
     case WM_CHAR: {
         if (g_edit_hwnd || g_addr_hwnd) break;
