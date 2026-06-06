@@ -329,6 +329,12 @@ static int g_drag_panel = -1;        /* which panel the drag started in */
 static int g_drag_x0  = 0, g_drag_y0 = 0;
 static int g_dragging = 0;
 
+/* ---- Bookmark reorder drag ---- */
+static int   g_bm_drag_idx     = -1;
+static int   g_bm_drag_y0      = 0;
+static int   g_bm_drag_active  = 0;
+static int   g_bm_drop_slot    = -1;
+
 /* ---- Marquee (rubber-band) selection in icon views ---- */
 static int   g_marquee_active = 0;
 static int   g_marquee_panel  = -1;
@@ -3100,12 +3106,17 @@ static void build_sidebar(void) {
             draw_bookmark(r, x + 16, sy + (22 - 13) / 2, 9, 13, COL_SUBTEXT);
         sy += 22;
         if (!sec->expanded) continue;
+        float section_first_iy = sy;
         for (int i = 0; i < sec->item_count; i++) {
             SidebarItem* it = &sec->items[i];
             float iy = sy;
             int hov = ui_hover(&g_ui, x, iy, w, 21);
             int active = (_stricmp(t->path, it->path) == 0);
-            if (active) render_quad(r, x+2, iy, w-4, 21, COL_SELECTED);
+            int is_dragged = (s == BOOKMARKS_SECTION && g_bm_drag_active && g_bm_drag_idx == i);
+            if (is_dragged) {
+                /* dim the source row while dragging */
+                render_quad(r, x+2, iy, w-4, 21, 0x33000000);
+            } else if (active) render_quad(r, x+2, iy, w-4, 21, COL_SELECTED);
             else if (hov) render_quad(r, x+2, iy, w-4, 21, COL_HOVER);
             float ty = iy + (21 - r->font_height) / 2;
             if (it->icon_tex)
@@ -3127,7 +3138,14 @@ static void build_sidebar(void) {
                     }
                 }
             }
-            if (ui_clicked(&g_ui, 400+s*20+i, x, iy, w, 21)) {
+            /* Begin bookmark drag on mouse press inside item */
+            if (s == BOOKMARKS_SECTION && hov && g_ui.input.mouse_clicked && g_bm_drag_idx < 0) {
+                g_bm_drag_idx    = i;
+                g_bm_drag_y0     = g_mouse_y;
+                g_bm_drag_active = 0;
+            }
+            int suppress_click = (s == BOOKMARKS_SECTION && g_bm_drag_active && g_bm_drag_idx == i);
+            if (ui_clicked(&g_ui, 400+s*20+i, x, iy, w, 21) && !suppress_click) {
                 if (strncmp(it->path, "shell:", 6) == 0) {
                     WCHAR wsp[MAX_PATH]; u8_to_w(it->path, wsp, MAX_PATH);
                     ShellExecuteW(NULL, L"open", wsp, NULL, NULL, SW_SHOWNORMAL);
@@ -3136,6 +3154,50 @@ static void build_sidebar(void) {
                     tab_navigate(t, it->path, 1);
             }
             sy += 21;
+        }
+        /* ---- Bookmark drag: compute drop slot, render indicator ---- */
+        if (s == BOOKMARKS_SECTION && g_bm_drag_idx >= 0) {
+            if (g_mouse_down) {
+                int dy = g_mouse_y - g_bm_drag_y0;
+                if (!g_bm_drag_active && (dy > 5 || dy < -5)) g_bm_drag_active = 1;
+                if (g_bm_drag_active) {
+                    /* Slot 0..item_count, computed against item centres */
+                    int slot = sec->item_count;
+                    for (int i = 0; i < sec->item_count; i++) {
+                        float centre = section_first_iy + i * 21 + 10.5f;
+                        if (g_mouse_y < centre) { slot = i; break; }
+                    }
+                    /* Don't show indicator at "no-op" positions (source row's
+                       own edge or just past it) */
+                    if (slot != g_bm_drag_idx && slot != g_bm_drag_idx + 1) {
+                        float dy_px = section_first_iy + slot * 21;
+                        render_quad(r, x + 2, dy_px - 1, w - 4, 2, COL_ACCENT);
+                    }
+                    g_bm_drop_slot = slot;
+                    g_needs_redraw = 1;
+                }
+            } else {
+                /* Released: commit reorder if it was a real drag */
+                if (g_bm_drag_active && g_bm_drop_slot >= 0 &&
+                    g_bm_drop_slot != g_bm_drag_idx &&
+                    g_bm_drop_slot != g_bm_drag_idx + 1) {
+                    SidebarItem moved = sec->items[g_bm_drag_idx];
+                    int dst = g_bm_drop_slot;
+                    if (dst > g_bm_drag_idx) dst--;  /* account for own removal */
+                    if (g_bm_drag_idx < dst) {
+                        for (int k = g_bm_drag_idx; k < dst; k++)
+                            sec->items[k] = sec->items[k+1];
+                    } else {
+                        for (int k = g_bm_drag_idx; k > dst; k--)
+                            sec->items[k] = sec->items[k-1];
+                    }
+                    sec->items[dst] = moved;
+                    bookmarks_save();
+                }
+                g_bm_drag_idx    = -1;
+                g_bm_drag_active = 0;
+                g_bm_drop_slot   = -1;
+            }
         }
         sy += 4;
     }
