@@ -5136,8 +5136,18 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int cmdShow)
     (void)hPrev; (void)cmdLine;
 
     /* Declare per-monitor DPI awareness so mouse coords and window size stay
-       in the same coord space when on a high-DPI / scaled monitor. */
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+       in the same coord space when on a high-DPI / scaled monitor. Resolved
+       dynamically so the binary still loads on Windows < 10 1607 (older
+       OSes silently fall back to whatever DPI awareness the manifest set). */
+    {
+        typedef BOOL (WINAPI *PFN_SetProcessDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
+        HMODULE u32 = GetModuleHandleW(L"user32.dll");
+        if (u32) {
+            PFN_SetProcessDpiAwarenessContext set_dpi =
+                (PFN_SetProcessDpiAwarenessContext)GetProcAddress(u32, "SetProcessDpiAwarenessContext");
+            if (set_dpi) set_dpi(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+    }
 
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     OleInitialize(NULL);
@@ -5186,11 +5196,34 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int cmdShow)
 
     HDC hdc = GetDC(g_hwnd);
     HGLRC glrc = create_gl_context(hdc);
-    if (!glrc || !render_load_gl_functions() || !render_init(&g_renderer) ||
-        !render_create_font(&g_renderer, "Segoe UI Semibold", 12) ||
-        !render_create_font_small(&g_renderer, "Segoe UI Semibold", 11) ||
-        !render_create_icons(&g_renderer, 16)) {
-        MessageBoxA(NULL, "Failed to initialize", "Error", MB_OK);
+    const char* fail = NULL;
+    if (!glrc) fail =
+        "Could not create an OpenGL 3.3 context.\n\n"
+        "This usually means:\n"
+        "  - the GPU driver doesn't support OpenGL 3.3 (very old GPU,\n"
+        "    Windows running over Remote Desktop, or a VM without\n"
+        "    GPU acceleration), or\n"
+        "  - no GPU driver is installed and Windows is using the\n"
+        "    basic display adapter (OpenGL 1.1 only).\n\n"
+        "Try updating your graphics driver from the GPU vendor\n"
+        "(Intel/AMD/NVIDIA). Windows Update's driver is sometimes too\n"
+        "old to expose OpenGL 3.3.";
+    else if (!render_load_gl_functions()) fail =
+        "An OpenGL 3.3 context was created but required OpenGL\n"
+        "functions could not be resolved. Update your GPU driver.";
+    else if (!render_init(&g_renderer)) fail =
+        "OpenGL shader / VBO setup failed.";
+    else if (!render_create_font(&g_renderer, "Segoe UI Semibold", 12)) fail =
+        "Could not create the primary font 'Segoe UI Semibold'.\n"
+        "Install the Segoe UI font family.";
+    else if (!render_create_font_small(&g_renderer, "Segoe UI Semibold", 11)) fail =
+        "Could not create the small font 'Segoe UI Semibold'.";
+    else if (!render_create_icons(&g_renderer, 16)) fail =
+        "Could not load the MDL2 icon font 'Segoe MDL2 Assets'.\n"
+        "This font ships with Windows 10 and 11. On older Windows you\n"
+        "would need to install it manually.";
+    if (fail) {
+        MessageBoxA(NULL, fail, "FilePathX — failed to initialize", MB_OK | MB_ICONERROR);
         return 1;
     }
 
