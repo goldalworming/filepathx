@@ -550,7 +550,7 @@ static void render_round_rect(Renderer* r, float x, float y, float w, float h, u
 
 /* ---- Thumbnail / large-icon cache (async worker thread) ---- */
 #define THUMB_CACHE_CAP 200
-#define THUMB_Q_CAP     64
+#define THUMB_Q_CAP     256
 #define THUMB_PX        192
 typedef struct {
     char  path[MAX_PATH];
@@ -1881,13 +1881,35 @@ static void inline_rename_start(int idx) {
 
 /* ---- Clipboard ---- */
 static void clipboard_copy_text(const char* text) {
-    int len = (int)strlen(text) + 1;
-    HGLOBAL hg = GlobalAlloc(GHND, len);
-    memcpy(GlobalLock(hg), text, len);
-    GlobalUnlock(hg);
-    OpenClipboard(g_hwnd);
+    /* Put the path on the clipboard as Unicode so Russian/Arabic/emoji file
+       names survive the round-trip. Also set CF_TEXT as an ANSI fallback —
+       Windows would auto-synthesise it anyway, but doing it explicitly avoids
+       weird shell extensions that try to "enrich" the clipboard (e.g. some
+       video shell-ext that injects a thumbnail when only CF_TEXT is present
+       for a media path). */
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
+    HGLOBAL hw = GlobalAlloc(GHND, wlen * sizeof(WCHAR));
+    if (!hw) return;
+    MultiByteToWideChar(CP_UTF8, 0, text, -1, (WCHAR*)GlobalLock(hw), wlen);
+    GlobalUnlock(hw);
+
+    int alen = (int)strlen(text) + 1;
+    HGLOBAL ha = GlobalAlloc(GHND, alen);
+    if (ha) { memcpy(GlobalLock(ha), text, alen); GlobalUnlock(ha); }
+
+    /* Other processes (e.g. Windows Snipping Tool right after a capture)
+       sometimes hold the clipboard for a few ms. If we silent-fail, the
+       *previous* clipboard contents (the snip's PNG) remain — and the user
+       thinks "Copy Path" pasted an image. Retry briefly. */
+    int opened = 0;
+    for (int i = 0; i < 10; i++) {
+        if (OpenClipboard(g_hwnd)) { opened = 1; break; }
+        Sleep(15);
+    }
+    if (!opened) { GlobalFree(hw); if (ha) GlobalFree(ha); return; }
     EmptyClipboard();
-    SetClipboardData(CF_TEXT, hg);
+    SetClipboardData(CF_UNICODETEXT, hw);
+    if (ha) SetClipboardData(CF_TEXT, ha);
     CloseClipboard();
 }
 
@@ -2190,6 +2212,691 @@ static void do_properties(const char* path) {
     ShellExecuteExA(&sei);
 }
 
+/* ---- Image viewer (separate window, GDI rendering) ---- */
+
+static int     g_viewer_skip_delete_warn = 0;   /* session-scoped */
+static WNDPROC g_viewer_edit_orig_proc   = NULL;
+
+/* ---- Async image-load worker for the viewer ---- */
+#define WM_VIEWER_LOADED  (WM_APP + 10)
+#define VLOAD_Q_CAP       16
+
+typedef struct {
+    HWND hwnd;
+    char path[MAX_PATH];
+    int  request_id;
+} ViewerLoadReq;
+
+typedef struct {
+    HWND     hwnd;
+    int      request_id;
+    HBITMAP  bmp;
+    int      w, h;
+    char     date_taken[64];
+} ViewerLoadResult;
+
+static CRITICAL_SECTION g_vload_cs;
+static HANDLE           g_vload_event   = NULL;
+static HANDLE           g_vload_thread  = NULL;
+static int              g_vload_init    = 0;
+static ViewerLoadReq    g_vload_q[VLOAD_Q_CAP];
+static int              g_vload_q_head  = 0, g_vload_q_tail = 0;
+
+static int is_image_ext(const char* name) {
+    const char* dot = strrchr(name, '.');
+    if (!dot) return 0;
+    char ext[8] = {0};
+    for (int i = 0; i < 7 && dot[i+1]; i++) {
+        char c = dot[i+1];
+        ext[i] = (c >= 'A' && c <= 'Z') ? c + 32 : c;
+    }
+    static const char* exts[] = {
+        "jpg","jpeg","png","gif","bmp","webp","tif","tiff",
+        "heic","heif","avif","jfif","ico", NULL
+    };
+    for (int i = 0; exts[i]; i++) if (strcmp(ext, exts[i]) == 0) return 1;
+    return 0;
+}
+
+#define VIEWER_MAX_SIBLINGS 4096
+typedef struct {
+    HWND   hwnd;
+    HBITMAP bmp;
+    int    img_w, img_h;
+    char   date_taken[64];
+    char   dir[MAX_PATH];
+    char (*siblings)[MAX_PATH];
+    int    sibling_count;
+    int    cur_index;
+    float  zoom;
+    float  pan_x, pan_y;
+    int    dragging;
+    int    drag_x0, drag_y0;
+    float  pan_x0, pan_y0;
+    int    client_w, client_h;
+    HWND   edit_hwnd;       /* rename overlay */
+    int    hover_btn;       /* 0=none, 1=rename, 2=delete */
+    int    next_request_id; /* monotonic; result discarded if != latest */
+    int    loading;         /* 1 while async decode in flight */
+} ViewerState;
+
+static void viewer_collect_siblings(ViewerState* v, const char* startname) {
+    if (v->siblings) { free(v->siblings); v->siblings = NULL; }
+    v->sibling_count = 0;
+    v->cur_index = 0;
+    v->siblings = (char(*)[MAX_PATH])calloc(VIEWER_MAX_SIBLINGS, MAX_PATH);
+    if (!v->siblings) return;
+    char pattern[MAX_PATH+4];
+    _snprintf(pattern, sizeof(pattern), "%s\\*", v->dir);
+    WCHAR wpat[MAX_PATH+4];
+    u8_to_w(pattern, wpat, MAX_PATH+4);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wpat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        char u8name[MAX_PATH];
+        w_to_u8(fd.cFileName, u8name, MAX_PATH);
+        if (!is_image_ext(u8name)) continue;
+        if (v->sibling_count >= VIEWER_MAX_SIBLINGS) break;
+        strncpy(v->siblings[v->sibling_count], u8name, MAX_PATH-1);
+        v->sibling_count++;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    /* Insertion sort case-insensitively — matches typical Details default. */
+    for (int i = 1; i < v->sibling_count; i++) {
+        char tmp[MAX_PATH];
+        strcpy(tmp, v->siblings[i]);
+        int j = i;
+        while (j > 0 && _stricmp(v->siblings[j-1], tmp) > 0) {
+            strcpy(v->siblings[j], v->siblings[j-1]);
+            j--;
+        }
+        strcpy(v->siblings[j], tmp);
+    }
+    for (int i = 0; i < v->sibling_count; i++) {
+        if (_stricmp(v->siblings[i], startname) == 0) { v->cur_index = i; break; }
+    }
+}
+
+static void viewer_update_title(ViewerState* v);
+static void viewer_rename_cancel(ViewerState* v);
+
+static DWORD WINAPI viewer_load_worker(LPVOID arg) {
+    (void)arg;
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    while (1) {
+        WaitForSingleObject(g_vload_event, INFINITE);
+        for (;;) {
+            ViewerLoadReq req;
+            int superseded = 0;
+            EnterCriticalSection(&g_vload_cs);
+            if (g_vload_q_head == g_vload_q_tail) {
+                LeaveCriticalSection(&g_vload_cs); break;
+            }
+            req = g_vload_q[g_vload_q_head];
+            g_vload_q_head = (g_vload_q_head + 1) % VLOAD_Q_CAP;
+            /* If a newer request for the same viewer is already queued, skip
+               this one — user clicked Next several times while we were still
+               decoding the first. */
+            for (int i = g_vload_q_head; i != g_vload_q_tail; i = (i + 1) % VLOAD_Q_CAP) {
+                if (g_vload_q[i].hwnd == req.hwnd) { superseded = 1; break; }
+            }
+            LeaveCriticalSection(&g_vload_cs);
+            if (superseded) continue;
+
+            HBITMAP hbmp = NULL;
+            int w = 0, h = 0;
+            char date_taken[64] = {0};
+            WCHAR wp[MAX_PATH];
+            u8_to_w(req.path, wp, MAX_PATH);
+
+            IShellItem* item = NULL;
+            if (SUCCEEDED(SHCreateItemFromParsingName(wp, NULL, &IID_IShellItem, (void**)&item)) && item) {
+                IShellItemImageFactory* fac = NULL;
+                if (SUCCEEDED(item->lpVtbl->QueryInterface(item, &IID_IShellItemImageFactory, (void**)&fac)) && fac) {
+                    SIZE sz = { 2048, 2048 };
+                    if (SUCCEEDED(fac->lpVtbl->GetImage(fac, sz, SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK, &hbmp)) && hbmp) {
+                        DIBSECTION ds = {0};
+                        GetObject(hbmp, sizeof(ds), &ds);
+                        w = ds.dsBm.bmWidth;
+                        h = abs(ds.dsBm.bmHeight);
+                    }
+                    fac->lpVtbl->Release(fac);
+                }
+                item->lpVtbl->Release(item);
+            }
+
+            IPropertyStore* ps = NULL;
+            if (SUCCEEDED(SHGetPropertyStoreFromParsingName(wp, NULL, GPS_DEFAULT,
+                                                            &IID_IPropertyStore, (void**)&ps)) && ps) {
+                PROPERTYKEY pkey;
+                pkey.fmtid.Data1 = 0x14B81DA1;
+                pkey.fmtid.Data2 = 0x0135; pkey.fmtid.Data3 = 0x4D31;
+                pkey.fmtid.Data4[0]=0x96; pkey.fmtid.Data4[1]=0xD9;
+                pkey.fmtid.Data4[2]=0x6C; pkey.fmtid.Data4[3]=0xBF;
+                pkey.fmtid.Data4[4]=0xC9; pkey.fmtid.Data4[5]=0x67;
+                pkey.fmtid.Data4[6]=0x1A; pkey.fmtid.Data4[7]=0x99;
+                pkey.pid = 36867;
+                PROPVARIANT pv;
+                PropVariantInit(&pv);
+                if (SUCCEEDED(ps->lpVtbl->GetValue(ps, &pkey, &pv)) && pv.vt == VT_FILETIME) {
+                    SYSTEMTIME st_utc, st_local;
+                    FileTimeToSystemTime(&pv.filetime, &st_utc);
+                    SystemTimeToTzSpecificLocalTime(NULL, &st_utc, &st_local);
+                    _snprintf(date_taken, sizeof(date_taken),
+                              "%04d-%02d-%02d %02d:%02d:%02d",
+                              st_local.wYear, st_local.wMonth, st_local.wDay,
+                              st_local.wHour, st_local.wMinute, st_local.wSecond);
+                }
+                PropVariantClear(&pv);
+                ps->lpVtbl->Release(ps);
+            }
+
+            ViewerLoadResult* res = (ViewerLoadResult*)calloc(1, sizeof(ViewerLoadResult));
+            if (res) {
+                res->hwnd       = req.hwnd;
+                res->request_id = req.request_id;
+                res->bmp        = hbmp;
+                res->w          = w;
+                res->h          = h;
+                memcpy(res->date_taken, date_taken, sizeof(date_taken));
+                if (!PostMessageW(req.hwnd, WM_VIEWER_LOADED, 0, (LPARAM)res)) {
+                    /* Window already gone */
+                    if (hbmp) DeleteObject(hbmp);
+                    free(res);
+                }
+            } else if (hbmp) {
+                DeleteObject(hbmp);
+            }
+        }
+    }
+    return 0;
+}
+
+static void viewer_async_init(void) {
+    if (g_vload_init) return;
+    InitializeCriticalSection(&g_vload_cs);
+    g_vload_event  = CreateEventW(NULL, FALSE, FALSE, NULL);
+    g_vload_thread = CreateThread(NULL, 0, viewer_load_worker, NULL, 0, NULL);
+    g_vload_init   = 1;
+}
+
+static void viewer_async_request(HWND hwnd, const char* path, int req_id) {
+    viewer_async_init();
+    EnterCriticalSection(&g_vload_cs);
+    int next = (g_vload_q_tail + 1) % VLOAD_Q_CAP;
+    if (next != g_vload_q_head) {
+        ViewerLoadReq* r = &g_vload_q[g_vload_q_tail];
+        r->hwnd = hwnd;
+        strncpy(r->path, path, MAX_PATH-1);
+        r->path[MAX_PATH-1] = 0;
+        r->request_id = req_id;
+        g_vload_q_tail = next;
+        SetEvent(g_vload_event);
+    }
+    LeaveCriticalSection(&g_vload_cs);
+}
+
+static void viewer_load_current(ViewerState* v) {
+    /* Drop the current bitmap immediately so the UI can show "Loading…" with
+       the new index. The actual decode happens on the worker thread; the
+       result message bumps v->bmp + v->img_w/h once it arrives. */
+    if (v->bmp) { DeleteObject(v->bmp); v->bmp = NULL; }
+    v->img_w = v->img_h = 0;
+    v->zoom  = 1.0f; v->pan_x = v->pan_y = 0;
+    v->date_taken[0] = 0;
+    v->loading = 0;
+    if (v->cur_index < 0 || v->cur_index >= v->sibling_count) {
+        viewer_update_title(v);
+        InvalidateRect(v->hwnd, NULL, FALSE);
+        return;
+    }
+    char fullp[MAX_PATH];
+    _snprintf(fullp, MAX_PATH, "%s\\%s", v->dir, v->siblings[v->cur_index]);
+    v->next_request_id++;
+    v->loading = 1;
+    viewer_update_title(v);
+    InvalidateRect(v->hwnd, NULL, FALSE);
+    viewer_async_request(v->hwnd, fullp, v->next_request_id);
+}
+
+static void viewer_update_title(ViewerState* v) {
+    if (v->cur_index < 0 || v->cur_index >= v->sibling_count) return;
+    WCHAR title[MAX_PATH+128];
+    WCHAR wname[MAX_PATH];
+    u8_to_w(v->siblings[v->cur_index], wname, MAX_PATH);
+    if (v->loading) {
+        _snwprintf(title, MAX_PATH+128,
+                   L"%ls  —  Loading…  —  FilePathX Viewer", wname);
+    } else if (v->date_taken[0]) {
+        WCHAR wdate[64]; u8_to_w(v->date_taken, wdate, 64);
+        _snwprintf(title, MAX_PATH+128,
+                   L"%ls  (%d × %d)  —  Taken %ls  —  FilePathX Viewer",
+                   wname, v->img_w, v->img_h, wdate);
+    } else {
+        _snwprintf(title, MAX_PATH+128,
+                   L"%ls  (%d × %d)  —  FilePathX Viewer",
+                   wname, v->img_w, v->img_h);
+    }
+    SetWindowTextW(v->hwnd, title);
+}
+
+static void viewer_next(ViewerState* v, int dir) {
+    if (v->sibling_count == 0) return;
+    int n = v->sibling_count;
+    v->cur_index = (v->cur_index + dir + n) % n;
+    viewer_load_current(v);
+}
+
+/* ---- Rename overlay ---- */
+static void viewer_rename_commit(ViewerState* v);
+
+static LRESULT CALLBACK viewer_edit_subclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_KEYDOWN) {
+        HWND parent = GetParent(hwnd);
+        ViewerState* v = (ViewerState*)GetWindowLongPtrW(parent, GWLP_USERDATA);
+        if (wp == VK_RETURN) { if (v) viewer_rename_commit(v); return 0; }
+        if (wp == VK_ESCAPE) { if (v) viewer_rename_cancel(v); return 0; }
+    }
+    return CallWindowProcW(g_viewer_edit_orig_proc, hwnd, msg, wp, lp);
+}
+
+static void viewer_rename_cancel(ViewerState* v) {
+    if (v->edit_hwnd) {
+        DestroyWindow(v->edit_hwnd);
+        v->edit_hwnd = NULL;
+        SetFocus(v->hwnd);
+        InvalidateRect(v->hwnd, NULL, FALSE);
+    }
+}
+
+static void viewer_rename_commit(ViewerState* v) {
+    if (!v->edit_hwnd) return;
+    if (v->cur_index < 0 || v->cur_index >= v->sibling_count) {
+        viewer_rename_cancel(v); return;
+    }
+    WCHAR wnew[MAX_PATH] = {0};
+    GetWindowTextW(v->edit_hwnd, wnew, MAX_PATH);
+    char new_stem[MAX_PATH] = {0};
+    w_to_u8(wnew, new_stem, MAX_PATH);
+    if (!new_stem[0]) { viewer_rename_cancel(v); return; }
+
+    const char* old = v->siblings[v->cur_index];
+    const char* dot = strrchr(old, '.');
+    char new_name[MAX_PATH];
+    if (dot) _snprintf(new_name, MAX_PATH, "%s%s", new_stem, dot);
+    else { strncpy(new_name, new_stem, MAX_PATH-1); new_name[MAX_PATH-1] = 0; }
+    if (strcmp(new_name, old) == 0) { viewer_rename_cancel(v); return; }
+
+    char old_full[MAX_PATH], new_full[MAX_PATH];
+    _snprintf(old_full, MAX_PATH, "%s\\%s", v->dir, old);
+    _snprintf(new_full, MAX_PATH, "%s\\%s", v->dir, new_name);
+    WCHAR wold[MAX_PATH], wnewf[MAX_PATH];
+    u8_to_w(old_full, wold, MAX_PATH);
+    u8_to_w(new_full, wnewf, MAX_PATH);
+    if (MoveFileW(wold, wnewf)) {
+        strncpy(v->siblings[v->cur_index], new_name, MAX_PATH-1);
+        v->siblings[v->cur_index][MAX_PATH-1] = 0;
+        viewer_update_title(v);
+    }
+    viewer_rename_cancel(v);
+}
+
+static void viewer_rename_start(ViewerState* v) {
+    if (v->edit_hwnd) return;
+    if (v->cur_index < 0 || v->cur_index >= v->sibling_count) return;
+    const char* name = v->siblings[v->cur_index];
+    char stem[MAX_PATH];
+    strncpy(stem, name, MAX_PATH-1); stem[MAX_PATH-1] = 0;
+    char* dot = strrchr(stem, '.');
+    if (dot && dot != stem) *dot = 0;
+    WCHAR wstem[MAX_PATH];
+    u8_to_w(stem, wstem, MAX_PATH);
+
+    RECT rc; GetClientRect(v->hwnd, &rc);
+    int ew = 480, eh = 30;
+    int ex = (rc.right - ew) / 2;
+    int ey = rc.bottom - 90;
+    v->edit_hwnd = CreateWindowExW(0, L"EDIT", wstem,
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | WS_BORDER,
+        ex, ey, ew, eh, v->hwnd, NULL, GetModuleHandleW(NULL), NULL);
+    if (!v->edit_hwnd) return;
+    HFONT font = (HFONT)SendMessageW(v->hwnd, WM_GETFONT, 0, 0);
+    if (!font) font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    SendMessageW(v->edit_hwnd, WM_SETFONT, (WPARAM)font, TRUE);
+    WNDPROC prev = (WNDPROC)SetWindowLongPtrW(v->edit_hwnd, GWLP_WNDPROC,
+                                              (LONG_PTR)viewer_edit_subclass);
+    if (!g_viewer_edit_orig_proc) g_viewer_edit_orig_proc = prev;
+    SendMessageW(v->edit_hwnd, EM_SETSEL, 0, -1);
+    SetFocus(v->edit_hwnd);
+}
+
+/* ---- Delete with optional skip-warning checkbox ---- */
+static void viewer_delete(ViewerState* v) {
+    if (v->cur_index < 0 || v->cur_index >= v->sibling_count) return;
+
+    WCHAR wname[MAX_PATH];
+    u8_to_w(v->siblings[v->cur_index], wname, MAX_PATH);
+
+    if (!g_viewer_skip_delete_warn) {
+        TASKDIALOGCONFIG cfg = {0};
+        cfg.cbSize = sizeof(cfg);
+        cfg.hwndParent = v->hwnd;
+        cfg.hInstance = GetModuleHandleW(NULL);
+        cfg.dwFlags = TDF_POSITION_RELATIVE_TO_WINDOW;
+        cfg.dwCommonButtons = TDCBF_YES_BUTTON | TDCBF_NO_BUTTON;
+        cfg.pszWindowTitle      = L"Move to Recycle Bin";
+        cfg.pszMainIcon         = TD_WARNING_ICON;
+        cfg.pszMainInstruction  = L"Move this image to the Recycle Bin?";
+        cfg.pszContent          = wname;
+        cfg.pszVerificationText = L"Don't ask again this session";
+        int btn = 0;
+        BOOL skip = FALSE;
+        HRESULT hr = TaskDialogIndirect(&cfg, &btn, NULL, &skip);
+        if (FAILED(hr)) {
+            int r = MessageBoxW(v->hwnd, wname,
+                                L"Move to Recycle Bin?",
+                                MB_YESNO | MB_ICONQUESTION);
+            if (r != IDYES) return;
+        } else {
+            if (btn != IDYES) return;
+            if (skip) g_viewer_skip_delete_warn = 1;
+        }
+    }
+
+    char fullp[MAX_PATH];
+    _snprintf(fullp, MAX_PATH, "%s\\%s", v->dir, v->siblings[v->cur_index]);
+    /* SHFileOperation needs double-null-terminated; over-allocate and zero it. */
+    WCHAR wpath[MAX_PATH + 2] = {0};
+    u8_to_w(fullp, wpath, MAX_PATH);
+
+    SHFILEOPSTRUCTW op = {0};
+    op.hwnd   = v->hwnd;
+    op.wFunc  = FO_DELETE;
+    op.pFrom  = wpath;
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT;
+    if (SHFileOperationW(&op) != 0 || op.fAnyOperationsAborted) return;
+
+    int idx = v->cur_index;
+    for (int i = idx; i < v->sibling_count - 1; i++)
+        strcpy(v->siblings[i], v->siblings[i+1]);
+    v->sibling_count--;
+    if (v->sibling_count == 0) { DestroyWindow(v->hwnd); return; }
+    if (v->cur_index >= v->sibling_count) v->cur_index = v->sibling_count - 1;
+    viewer_load_current(v);
+}
+
+/* ---- Toolbar button hit-test helper ---- */
+static void viewer_btn_rects(int cw, int* rx, int* dx, int* btn_w, int* btn_h, int* by) {
+    *btn_w = 86; *btn_h = 28; *by = 12;
+    *dx = cw - *btn_w - 12;
+    *rx = *dx - *btn_w - 8;
+}
+
+static int viewer_hit_btn(ViewerState* v, int x, int y) {
+    int rx, dx, bw, bh, by;
+    viewer_btn_rects(v->client_w, &rx, &dx, &bw, &bh, &by);
+    if (y < by || y >= by + bh) return 0;
+    if (x >= rx && x < rx + bw) return 1;
+    if (x >= dx && x < dx + bw) return 2;
+    return 0;
+}
+
+static void viewer_paint(ViewerState* v, HDC hdc) {
+    RECT rc; GetClientRect(v->hwnd, &rc);
+    int cw = rc.right, ch = rc.bottom;
+    v->client_w = cw; v->client_h = ch;
+    /* Double-buffer to avoid flicker on resize / zoom updates */
+    HDC mem = CreateCompatibleDC(hdc);
+    HBITMAP back = CreateCompatibleBitmap(hdc, cw, ch);
+    HBITMAP oldb = (HBITMAP)SelectObject(mem, back);
+    HBRUSH bg = CreateSolidBrush(RGB(0x1E, 0x20, 0x25));
+    FillRect(mem, &rc, bg);
+    DeleteObject(bg);
+
+    if (!v->bmp || v->img_w <= 0 || v->img_h <= 0) {
+        SetTextColor(mem, RGB(0xAA, 0xAA, 0xAA));
+        SetBkMode(mem, TRANSPARENT);
+        if (v->loading) {
+            WCHAR buf[128];
+            if (v->sibling_count > 0) {
+                _snwprintf(buf, 128, L"Loading…   %d / %d",
+                           v->cur_index + 1, v->sibling_count);
+            } else {
+                _snwprintf(buf, 128, L"Loading…");
+            }
+            DrawTextW(mem, buf, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        } else {
+            DrawTextW(mem, L"(no image)", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+    } else {
+        float sx = (float)cw / v->img_w;
+        float sy = (float)ch / v->img_h;
+        float fit = sx < sy ? sx : sy;
+        if (fit > 1.0f) fit = 1.0f;
+        float scale = fit * v->zoom;
+        int dw = (int)(v->img_w * scale + 0.5f);
+        int dh = (int)(v->img_h * scale + 0.5f);
+        int dx = (cw - dw) / 2 + (int)v->pan_x;
+        int dy = (ch - dh) / 2 + (int)v->pan_y;
+
+        HDC src = CreateCompatibleDC(hdc);
+        HBITMAP olds = (HBITMAP)SelectObject(src, v->bmp);
+        SetStretchBltMode(mem, HALFTONE);
+        SetBrushOrgEx(mem, 0, 0, NULL);
+        StretchBlt(mem, dx, dy, dw, dh, src, 0, 0, v->img_w, v->img_h, SRCCOPY);
+        SelectObject(src, olds);
+        DeleteDC(src);
+
+        if (v->sibling_count > 1) {
+            WCHAR buf[64];
+            _snwprintf(buf, 64, L"%d / %d", v->cur_index + 1, v->sibling_count);
+            SetTextColor(mem, RGB(0xCC, 0xCC, 0xCC));
+            SetBkMode(mem, TRANSPARENT);
+            RECT rc2 = { 0, ch - 30, cw, ch - 6 };
+            DrawTextW(mem, buf, -1, &rc2, DT_CENTER | DT_SINGLELINE);
+        }
+    }
+
+    /* ---- Toolbar buttons (top-right) ---- */
+    {
+        int rx, dx, bw, bh, by;
+        viewer_btn_rects(cw, &rx, &dx, &bw, &bh, &by);
+        struct { int x; int hover; COLORREF accent; const WCHAR* label; } btns[] = {
+            { rx, v->hover_btn == 1, RGB(0x35, 0xBC, 0xFE), L"Rename" },
+            { dx, v->hover_btn == 2, RGB(0xE0, 0x4F, 0x4F), L"Delete" },
+        };
+        SetBkMode(mem, TRANSPARENT);
+        for (int i = 0; i < 2; i++) {
+            RECT br = { btns[i].x, by, btns[i].x + bw, by + bh };
+            HBRUSH bb = CreateSolidBrush(btns[i].hover
+                ? RGB(0x40, 0x44, 0x50) : RGB(0x2A, 0x2D, 0x35));
+            FillRect(mem, &br, bb);
+            DeleteObject(bb);
+            HPEN border = CreatePen(PS_SOLID, 1, btns[i].hover ? btns[i].accent : RGB(0x50, 0x55, 0x60));
+            HGDIOBJ oldp = SelectObject(mem, border);
+            HGDIOBJ oldb = SelectObject(mem, GetStockObject(NULL_BRUSH));
+            Rectangle(mem, br.left, br.top, br.right, br.bottom);
+            SelectObject(mem, oldp); SelectObject(mem, oldb);
+            DeleteObject(border);
+            SetTextColor(mem, btns[i].hover ? btns[i].accent : RGB(0xCC, 0xCC, 0xCC));
+            DrawTextW(mem, btns[i].label, -1, &br,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+    }
+
+    BitBlt(hdc, 0, 0, cw, ch, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, oldb);
+    DeleteObject(back);
+    DeleteDC(mem);
+}
+
+static LRESULT CALLBACK viewer_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    ViewerState* v = (ViewerState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        if (v) viewer_paint(v, hdc);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_SIZE:
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_KEYDOWN:
+        if (!v) break;
+        if (wp == VK_LEFT)  { viewer_next(v, -1); return 0; }
+        if (wp == VK_RIGHT || wp == VK_SPACE) { viewer_next(v, +1); return 0; }
+        if (wp == VK_HOME)  { v->cur_index = 0; viewer_load_current(v); return 0; }
+        if (wp == VK_END)   { v->cur_index = v->sibling_count - 1; viewer_load_current(v); return 0; }
+        if (wp == VK_ESCAPE){ DestroyWindow(hwnd); return 0; }
+        if (wp == '0')      { v->zoom = 1.0f; v->pan_x = v->pan_y = 0;
+                              InvalidateRect(hwnd, NULL, FALSE); return 0; }
+        if (wp == VK_F2)    { viewer_rename_start(v); return 0; }
+        if (wp == VK_DELETE){ viewer_delete(v); return 0; }
+        break;
+    case WM_MOUSEWHEEL: {
+        if (!v) break;
+        short delta = GET_WHEEL_DELTA_WPARAM(wp);
+        float factor = (delta > 0) ? 1.2f : (1.0f / 1.2f);
+        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        ScreenToClient(hwnd, &pt);
+        float cx = pt.x - v->client_w * 0.5f - v->pan_x;
+        float cy = pt.y - v->client_h * 0.5f - v->pan_y;
+        v->zoom *= factor;
+        if (v->zoom < 0.05f) v->zoom = 0.05f;
+        if (v->zoom > 40.0f) v->zoom = 40.0f;
+        v->pan_x -= cx * (factor - 1.0f);
+        v->pan_y -= cy * (factor - 1.0f);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+    case WM_LBUTTONDOWN:
+        if (!v) break;
+        {
+            int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+            int bhit = viewer_hit_btn(v, x, y);
+            if (bhit == 1) { viewer_rename_start(v); return 0; }
+            if (bhit == 2) { viewer_delete(v); return 0; }
+            int edge = v->client_w / 6;
+            if (x < edge)                 { viewer_next(v, -1); return 0; }
+            if (x > v->client_w - edge)   { viewer_next(v, +1); return 0; }
+        }
+        SetCapture(hwnd);
+        v->dragging = 1;
+        v->drag_x0 = GET_X_LPARAM(lp);
+        v->drag_y0 = GET_Y_LPARAM(lp);
+        v->pan_x0 = v->pan_x; v->pan_y0 = v->pan_y;
+        return 0;
+    case WM_MOUSEMOVE:
+        if (!v) return 0;
+        if (v->dragging) {
+            v->pan_x = v->pan_x0 + (GET_X_LPARAM(lp) - v->drag_x0);
+            v->pan_y = v->pan_y0 + (GET_Y_LPARAM(lp) - v->drag_y0);
+            InvalidateRect(hwnd, NULL, FALSE);
+        } else {
+            int new_hover = viewer_hit_btn(v, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+            if (new_hover != v->hover_btn) {
+                v->hover_btn = new_hover;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        if (v) { v->dragging = 0; ReleaseCapture(); }
+        return 0;
+    case WM_LBUTTONDBLCLK:
+        if (v) {
+            v->zoom = 1.0f; v->pan_x = v->pan_y = 0;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+    case WM_VIEWER_LOADED: {
+        ViewerLoadResult* res = (ViewerLoadResult*)lp;
+        if (!res) return 0;
+        if (!v || res->request_id != v->next_request_id) {
+            /* Stale result — user already navigated past this image. */
+            if (res->bmp) DeleteObject(res->bmp);
+            free(res);
+            return 0;
+        }
+        if (v->bmp) DeleteObject(v->bmp);
+        v->bmp     = res->bmp;
+        v->img_w   = res->w;
+        v->img_h   = res->h;
+        memcpy(v->date_taken, res->date_taken, sizeof(v->date_taken));
+        v->loading = 0;
+        free(res);
+        viewer_update_title(v);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+    case WM_DESTROY:
+        if (v) {
+            /* Bump the request id so any in-flight result is treated as stale
+               and freed in WM_VIEWER_LOADED. (Posted messages still arrive
+               briefly after the window goes away if SetWindowLongPtrW=0 hasn't
+               happened yet; freeing in the worker via PostMessage-failure
+               check covers the rest.) */
+            v->next_request_id++;
+            if (v->bmp) DeleteObject(v->bmp);
+            if (v->siblings) free(v->siblings);
+            free(v);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        }
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void open_image_viewer(const char* path) {
+    HINSTANCE hi = GetModuleHandleW(NULL);
+    static int registered = 0;
+    if (!registered) {
+        WNDCLASSEXW wc = {0};
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+        wc.lpfnWndProc = viewer_proc;
+        wc.hInstance = hi;
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.lpszClassName = L"FilePathXViewerClass";
+        wc.hIcon = LoadIconW(hi, L"IDI_APPICON");
+        wc.hIconSm = LoadIconW(hi, L"IDI_APPICON");
+        if (!wc.hIcon) wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+        RegisterClassExW(&wc);
+        registered = 1;
+    }
+    ViewerState* v = (ViewerState*)calloc(1, sizeof(ViewerState));
+    if (!v) return;
+    v->zoom = 1.0f;
+    const char* slash = strrchr(path, '\\');
+    if (!slash) { free(v); return; }
+    int dlen = (int)(slash - path);
+    if (dlen >= MAX_PATH) dlen = MAX_PATH-1;
+    memcpy(v->dir, path, dlen); v->dir[dlen] = 0;
+    char startname[MAX_PATH];
+    strncpy(startname, slash + 1, MAX_PATH-1); startname[MAX_PATH-1] = 0;
+    viewer_collect_siblings(v, startname);
+
+    int sx = GetSystemMetrics(SM_CXSCREEN), sy = GetSystemMetrics(SM_CYSCREEN);
+    int w = sx * 3 / 4, h = sy * 3 / 4;
+    HWND vh = CreateWindowExW(0, L"FilePathXViewerClass", L"FilePathX Viewer",
+        WS_OVERLAPPEDWINDOW,
+        (sx - w) / 2, (sy - h) / 2, w, h,
+        NULL, NULL, hi, NULL);
+    if (!vh) { if (v->siblings) free(v->siblings); free(v); return; }
+    v->hwnd = vh;
+    SetWindowLongPtrW(vh, GWLP_USERDATA, (LONG_PTR)v);
+    BOOL dark = TRUE;
+    DwmSetWindowAttribute(vh, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+    ShowWindow(vh, SW_SHOW);
+    viewer_load_current(v);
+}
+
 static void do_open_entry(Tab* t, int idx) {
     if (idx < 0 || idx >= t->entry_count) return;
     FileEntry* e = &t->entries[idx];
@@ -2201,9 +2908,15 @@ static void do_open_entry(Tab* t, int idx) {
             tab_navigate(t, p, 1);
         }
     } else {
-        WCHAR wp[MAX_PATH];
-        path_join_w(t->path, e->name, wp, MAX_PATH);
-        open_file_async(wp);
+        if (is_image_ext(e->name)) {
+            char fullp[MAX_PATH];
+            _snprintf(fullp, MAX_PATH, "%s\\%s", t->path, e->name);
+            open_image_viewer(fullp);
+        } else {
+            WCHAR wp[MAX_PATH];
+            path_join_w(t->path, e->name, wp, MAX_PATH);
+            open_file_async(wp);
+        }
     }
 }
 
@@ -2643,10 +3356,29 @@ static void invoke_shell_command(HWND hwnd, IContextMenu* ctx, Tab* t, UINT cmd_
 }
 
 static void show_context_menu(HWND hwnd, int mx, int my) {
+    /* Focus follows right-click: in split mode, right-clicking on the inactive
+       panel needs to switch the active panel BEFORE we resolve active_tab(),
+       otherwise the hit-test would index the wrong panel's entries. */
+    float split_x_full = SIDEBAR_W + g_app.split_ratio * (g_width - SIDEBAR_W);
+    if (g_app.split_active && mx >= SIDEBAR_W && my >= TAB_BAR_H) {
+        g_app.active_panel = (mx < split_x_full) ? 0 : 1;
+    }
     Tab* t = active_tab();
-    float lx = SIDEBAR_W, ly = CONTENT_TOP + COL_HDR_H;
+    /* Per-panel file-list bounds */
+    float lx = SIDEBAR_W;
     float lw = (float)g_width - SIDEBAR_W;
-    float lh = (float)g_height - CONTENT_TOP - COL_HDR_H;
+    if (g_app.split_active) {
+        if (g_app.active_panel == 0) { lw = split_x_full - SIDEBAR_W; }
+        else                         { lx = split_x_full; lw = g_width - split_x_full; }
+    }
+    float ly = CONTENT_TOP + COL_HDR_H;
+    float lh = (float)g_height - CONTENT_TOP - COL_HDR_H - STATUS_BAR_H;
+    /* In icon view modes there's no column header — the file list starts at
+       CONTENT_TOP directly. */
+    if (t->view_mode != VM_DETAILS) {
+        ly = CONTENT_TOP;
+        lh = (float)g_height - CONTENT_TOP - STATUS_BAR_H;
+    }
 
     /* Sidebar bookmark right-click */
     int bm_idx = -1;
@@ -2668,9 +3400,27 @@ static void show_context_menu(HWND hwnd, int mx, int my) {
     if (mx < lx || my < ly || mx >= lx + lw || my >= ly + lh) return;
 
     int on_item = -1;
-    {
+    if (t->view_mode == VM_DETAILS) {
         int row = (int)((my - ly + t->scroll_y) / ROW_H);
         on_item = row_to_entry(t, row);
+    } else {
+        /* Icon grid hit-test — mirror build_file_list layout. ".." is hidden
+           in icon views so we count over visible entries only. */
+        int item_w = (t->view_mode == VM_SMALL_ICONS) ? 90  : 180;
+        int item_h = (t->view_mode == VM_SMALL_ICONS) ? 100 : 180;
+        float rw = lw - 8;
+        int cols = (int)(rw / item_w); if (cols < 1) cols = 1;
+        int col = (int)((mx - lx - 4) / item_w);
+        int row = (int)((my - ly - 4 + t->scroll_y) / item_h);
+        if (col >= 0 && col < cols && row >= 0) {
+            int target_slot = row * cols + col;
+            int slot = 0;
+            for (int i = 0; i < t->entry_count; i++) {
+                if (strcmp(t->entries[i].name, "..") == 0) continue;
+                if (slot == target_slot) { on_item = i; break; }
+                slot++;
+            }
+        }
     }
     /* If right-clicked on an unselected item, make it the only selection */
     if (on_item >= 0 && !t->sel_mask[on_item]) sel_only(t, on_item);
@@ -3274,8 +4024,14 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
         t->scroll_y += (t->target_scroll - t->scroll_y) * 0.3f;
         if (t->scroll_y < 0) t->scroll_y = 0;
         if (t->scroll_y > max_scroll) t->scroll_y = max_scroll;
-        if (t->target_scroll - t->scroll_y > 0.5f || t->target_scroll - t->scroll_y < -0.5f)
-            g_needs_redraw = 1;
+        float scroll_gap = t->target_scroll - t->scroll_y;
+        if (scroll_gap < 0) scroll_gap = -scroll_gap;
+        if (scroll_gap > 0.5f) g_needs_redraw = 1;
+        /* When the user is mid-scroll, don't enqueue thumbnail decodes for
+           items they're about to scroll past — the queue would fill with
+           stale work and the items currently under their finger would wait.
+           Threshold = 2 rows: small overshoot is fine, big throws are not. */
+        int scrolling_fast = (scroll_gap > (float)(item_h * 2));
 
         int slot = 0;
         for (int i = 0; i < t->entry_count; i++) {
@@ -3306,7 +4062,7 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
                         tw_img = g_thumb_cache[tci].w;
                         th_img = g_thumb_cache[tci].h;
                         g_thumb_cache[tci].last_used = g_thumb_frame;
-                    } else {
+                    } else if (!scrolling_fast) {
                         thumb_request(fullp);
                     }
                 }

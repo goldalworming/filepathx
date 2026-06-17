@@ -20,7 +20,7 @@ cl /nologo /O2 /W3 /WX- ^
     /Fo:build\ ^
     /link /SUBSYSTEM:WINDOWS ^
     build\resource.res ^
-    user32.lib gdi32.lib opengl32.lib shell32.lib shlwapi.lib dwmapi.lib ole32.lib uuid.lib uxtheme.lib
+    user32.lib gdi32.lib opengl32.lib shell32.lib shlwapi.lib dwmapi.lib ole32.lib uuid.lib uxtheme.lib propsys.lib comctl32.lib
 
 if %errorlevel% equ 0 (
     echo Build successful: build\FilePathX.exe
