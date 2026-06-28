@@ -74,7 +74,7 @@ typedef BOOL  (WINAPI *PFN_wglSwapIntervalEXT)(int);
 
 /* ---- Data ---- */
 #define MAX_ENTRIES 2048
-#define MAX_TABS    8
+#define MAX_TABS    32
 #define MAX_HIST    32
 
 /* View modes (VM_* to avoid clash with commctrl.h VM_DETAILS) */
@@ -519,6 +519,7 @@ static HFONT    g_edit_font;
 
 /* ---- Address bar edit ---- */
 static HWND     g_addr_hwnd;
+static int      g_addr_panel = -1;   /* which panel owns the path-edit overlay */
 static WNDPROC  g_addr_oldproc;
 static HBRUSH   g_addr_bg_brush;
 static int      g_addr_x, g_addr_y, g_addr_w, g_addr_h;
@@ -1723,6 +1724,7 @@ static LRESULT CALLBACK edit_subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARA
 
 static void addr_edit_cancel(void) {
     if (g_addr_hwnd) { DestroyWindow(g_addr_hwnd); g_addr_hwnd = NULL; }
+    g_addr_panel = -1;
     g_needs_redraw = 1;
     SetFocus(g_hwnd);
 }
@@ -1791,6 +1793,7 @@ static void addr_edit_start(float x, float y, float w, float h) {
     if (g_addr_hwnd) addr_edit_cancel();
     if (g_edit_hwnd) inline_rename_cancel();
     Tab* t = active_tab();
+    g_addr_panel = g_app.active_panel;
 
     g_addr_x = (int)x; g_addr_y = (int)y; g_addr_w = (int)w; g_addr_h = (int)h;
     WCHAR wpath[MAX_PATH];
@@ -3613,8 +3616,14 @@ static void build_tab_bar(float tabs_xmin, float tabs_xmax) {
 
         int is_partial_right = (tx + tab_w > tabs_x1);
         int saved_mx = 0, mx_was_masked = 0;
-        if ((drag_here && g_tab_drag_active) ||
-            (is_partial_right && g_ui.input.mouse_x >= (int)tabs_x1)) {
+        int mx_actual = g_ui.input.mouse_x;
+
+        /* For partial tabs, suppress ui_tab's own hit-test entirely (mask
+           the cursor for the duration of the call) and then run a single
+           clipped ui_clicked below. This way the close-X — visually clipped
+           past tabs_x1 — can never fire, and the visible part of the tab
+           strictly maps to "switch tab". */
+        if ((drag_here && g_tab_drag_active) || is_partial_right) {
             saved_mx = g_ui.input.mouse_x;
             g_ui.input.mouse_x = -10000;
             mx_was_masked = 1;
@@ -3626,6 +3635,17 @@ static void build_tab_bar(float tabs_xmin, float tabs_xmax) {
                          get_file_icon("folder", 1),
                          accent);
         if (mx_was_masked) g_ui.input.mouse_x = saved_mx;
+
+        /* Clipped click for partial tabs: only the visible body
+           [tx, tabs_x1) counts. Cursor in chevron/+ area passes through to
+           those buttons (they run after the loop). */
+        if (is_partial_right && !(drag_here && g_tab_drag_active)) {
+            float vis_w = (float)((int)tabs_x1 - (int)tx);
+            if (vis_w > 0 && ui_clicked(&g_ui, UIID(100 + i),
+                                        tx, 2, vis_w, TAB_BAR_H - 2)) {
+                res = 1;
+            }
+        }
 
         if (res == 1) {
             g_app.panels[g_app.active_panel].active_tab = i;
@@ -3640,7 +3660,16 @@ static void build_tab_bar(float tabs_xmin, float tabs_xmax) {
             g_needs_redraw = 1;
         }
         if (res == 2) { render_scissor_reset(r); close_tab(i); return; }
-        if (tx + tab_w <= tabs_x1) last_tab_right = (int)(tx + tab_w);
+        /* Track rightmost edge of any rendered tab body, clamped to the
+           clip boundary. WM_NCHITTEST uses this to decide HTCLIENT vs
+           HTCAPTION — without this, the visible portion of a partial tab
+           was treated as title bar (clicks ignored, double-click maximised
+           the window). */
+        {
+            int r_end = (int)(tx + tab_w);
+            if (r_end > (int)tabs_x1) r_end = (int)tabs_x1;
+            if (r_end > last_tab_right) last_tab_right = r_end;
+        }
 
         int hov = ui_hover(&g_ui, tx, 2, tab_w, TAB_BAR_H - 2);
         if (hov && g_ui.input.mouse_clicked && g_tab_drag_idx < 0 && !mx_was_masked) {
@@ -3792,7 +3821,8 @@ static void build_toolbar(float x0, float x1) {
     /* Breadcrumb */
     float crumb_x0 = bx;
     float crumb_w  = x1 - bx - 4;
-    if (g_addr_hwnd) {
+    int addr_here = (g_addr_hwnd && g_addr_panel == g_app.active_panel);
+    if (addr_here) {
         int nx = (int)crumb_x0, ny = (int)(y+3);
         int nw = (int)crumb_w,  nh = TOOLBAR_H-6;
         if (nx != g_addr_x || ny != g_addr_y || nw != g_addr_w || nh != g_addr_h) {
