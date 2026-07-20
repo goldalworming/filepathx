@@ -40,7 +40,9 @@ typedef BOOL  (WINAPI *PFN_wglSwapIntervalEXT)(int);
 #define TAB_BAR_H    28
 #define TOOLBAR_H    26
 #define COL_HDR_H    22
-#define ROW_H        20
+/* Runtime-tunable via Settings modal — g_row_h persisted in settings.ini */
+static int g_row_h = 20;
+#define ROW_H        g_row_h
 #define STATUS_BAR_H 26
 #define SIDEBAR_W    185
 #define CONTENT_TOP  (TAB_BAR_H + TOOLBAR_H)
@@ -416,6 +418,62 @@ static int   g_splitter_dragging = 0;
 
 /* Sync scroll between panels (default off) */
 static int   g_sync_scroll = 0;
+
+/* ---- Settings modal ---- */
+static int g_settings_open      = 0;
+static int g_pref_font_size     = 11;   /* applied on next launch */
+static int g_pref_row_h         = 20;   /* applied immediately    */
+/* Session-scoped feedback for "font size will change on next launch" */
+static int g_pref_font_needs_restart = 0;
+
+/* Forward decls (defined later in this file) */
+static void app_data_file(const char* name, char* out, int n);
+static FILE* u8_fopen(const char* path, const char* mode);
+
+static void settings_save(void) {
+    char fp[MAX_PATH];
+    app_data_file("settings.ini", fp, MAX_PATH);
+    FILE* f = u8_fopen(fp, "wb");
+    if (!f) return;
+    fprintf(f, "font_size = %d\r\n", g_pref_font_size);
+    fprintf(f, "row_h = %d\r\n",     g_pref_row_h);
+    fclose(f);
+}
+
+static void settings_load(void) {
+    char fp[MAX_PATH];
+    app_data_file("settings.ini", fp, MAX_PATH);
+    FILE* f = u8_fopen(fp, "rb");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        int n = (int)strlen(line);
+        while (n > 0 && (line[n-1]=='\n' || line[n-1]=='\r' ||
+                         line[n-1]==' '  || line[n-1]=='\t')) line[--n] = 0;
+        char* p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == 0 || *p == ';' || *p == '#' || *p == '[') continue;
+        char* eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char* val = eq + 1;
+        while (*val == ' ' || *val == '\t') val++;
+        int kl = (int)strlen(p);
+        while (kl > 0 && (p[kl-1]==' ' || p[kl-1]=='\t')) p[--kl] = 0;
+        for (int i = 0; p[i]; i++)
+            if (p[i] >= 'A' && p[i] <= 'Z') p[i] += 32;
+        int v = atoi(val);
+        if (!strcmp(p, "font_size"))    g_pref_font_size = v;
+        else if (!strcmp(p, "row_h"))   g_pref_row_h = v;
+    }
+    fclose(f);
+    /* Clamp */
+    if (g_pref_font_size < 9)  g_pref_font_size = 9;
+    if (g_pref_font_size > 16) g_pref_font_size = 16;
+    if (g_pref_row_h < 14) g_pref_row_h = 14;
+    if (g_pref_row_h > 32) g_pref_row_h = 32;
+    g_row_h = g_pref_row_h;
+}
 
 /* ---- Hover tooltips ---- */
 static char  g_tt_text[128]  = "";
@@ -4831,9 +4889,30 @@ static void build_toolbar(float x0, float x1) {
     render_quad(r, bx, y+6, 1, TOOLBAR_H-12, COL_BORDER);
     bx += 8;
 
-    /* Breadcrumb */
+    /* Kebab (Settings) at the far right of the toolbar — 3 vertical dots */
+    float kb_w = 26;
+    float kb_x = x1 - kb_w - 4;
+    {
+        int hov = ui_hover(&g_ui, kb_x, y+2, kb_w, TOOLBAR_H-4);
+        if (hov) render_quad(r, kb_x, y+2, kb_w, TOOLBAR_H-4, COL_HOVER);
+        uint32_t dot_col = hov ? COL_TEXT : COL_SUBTEXT;
+        float ds = 2;                    /* dot size */
+        float dg = 2;                    /* gap between dots */
+        float dx = kb_x + (kb_w - ds) / 2;
+        float cy = y + TOOLBAR_H / 2;
+        render_quad(r, dx, cy - ds - dg - ds/2, ds, ds, dot_col);
+        render_quad(r, dx, cy - ds/2,           ds, ds, dot_col);
+        render_quad(r, dx, cy + dg + ds/2,      ds, ds, dot_col);
+        if (hov) tt_set("Settings", (int)(kb_x + kb_w/2), (int)(y + 2));
+        if (ui_clicked(&g_ui, UIID(210), kb_x, y+2, kb_w, TOOLBAR_H-4)) {
+            g_settings_open = 1;
+            g_needs_redraw = 1;
+        }
+    }
+
+    /* Breadcrumb (shrunk to leave room for kebab) */
     float crumb_x0 = bx;
-    float crumb_w  = x1 - bx - 4;
+    float crumb_w  = kb_x - bx - 4;
     int addr_here = (g_addr_hwnd && g_addr_panel == g_app.active_panel);
     if (addr_here) {
         int nx = (int)crumb_x0, ny = (int)(y+3);
@@ -4997,60 +5076,7 @@ static void build_sidebar(void) {
     render_scissor_reset(r);
     render_quad(r, SIDEBAR_W-1, CONTENT_TOP, 1, h, COL_BORDER);
 
-    /* ---- Theme selector button at bottom of sidebar ---- */
-    {
-        float btn_h = 28;
-        float btn_x = x + 6;
-        float btn_y = y + h - btn_h - 6;
-        float btn_w = w - 12;
-        int hov = ui_hover(&g_ui, btn_x, btn_y, btn_w, btn_h);
-        render_quad(r, btn_x, btn_y, btn_w, btn_h, hov ? COL_HOVER : COL_BG);
-        render_quad(r, btn_x, btn_y, btn_w, 1, COL_BORDER);
-        render_quad(r, btn_x, btn_y + btn_h - 1, btn_w, 1, COL_BORDER);
-        render_quad(r, btn_x, btn_y, 1, btn_h, COL_BORDER);
-        render_quad(r, btn_x + btn_w - 1, btn_y, 1, btn_h, COL_BORDER);
-        /* Paint chip: current accent color at left */
-        render_quad(r, btn_x + 8, btn_y + (btn_h - 12) / 2, 12, 12, COL_ACCENT);
-        /* Theme label */
-        float lbl_x = btn_x + 26;
-        float lbl_y = floorf(btn_y + (btn_h - r->font_height) / 2);
-        int lbl_max = (int)(btn_w - 44);
-        int nl = (int)strlen(g_theme_current);
-        while (nl > 0 && render_text_width_n(r, g_theme_current, nl) > lbl_max) nl--;
-        render_text_n(r, g_theme_current, nl, lbl_x, lbl_y, COL_TEXT);
-        /* Chevron up (menu opens upward) */
-        render_mdl2(r, ICON_CHEVRON_UP,
-                    btn_x + btn_w - 16, btn_y + (btn_h - 8) / 2, 8, COL_SUBTEXT);
-
-        if (hov && g_ui.input.mouse_clicked) {
-            /* Rescan on every click so newly-dropped .ini files show up */
-            theme_discover();
-            HMENU m = CreatePopupMenu();
-            if (g_theme_count == 0) {
-                AppendMenuA(m, MF_GRAYED, 0, "(no themes/*.ini found)");
-            } else {
-                for (int i = 0; i < g_theme_count; i++) {
-                    UINT flags = MF_STRING;
-                    if (_stricmp(g_theme_current, g_themes[i].display) == 0)
-                        flags |= MF_CHECKED;
-                    AppendMenuA(m, flags, 4000 + i, g_themes[i].display);
-                }
-                AppendMenuA(m, MF_SEPARATOR, 0, NULL);
-                AppendMenuA(m, MF_STRING, 4999, "Reload current  (Ctrl+Shift+T)");
-            }
-            POINT pt = { (int)btn_x, (int)btn_y };
-            ClientToScreen(g_hwnd, &pt);
-            int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_BOTTOMALIGN,
-                                     pt.x, pt.y, 0, g_hwnd, NULL);
-            DestroyMenu(m);
-            if (cmd >= 4000 && cmd < 4000 + g_theme_count) {
-                theme_apply_file(g_themes[cmd - 4000].path);
-            } else if (cmd == 4999) {
-                theme_load();
-                g_needs_redraw = 1;
-            }
-        }
-    }
+    /* Theme picker moved to Settings modal (open with kebab in toolbar). */
 }
 
 static void build_column_headers(float lx, float ly, float lw) {
@@ -5956,6 +5982,144 @@ static void build_fuzzy_finder(void) {
     g_needs_redraw = 1;
 }
 
+/* ---- Settings modal ---- */
+static int settings_row_button(Renderer* r, float x, float y, float w, float h,
+                               const char* label, int selected, int id)
+{
+    int hov = ui_hover(&g_ui, x, y, w, h);
+    uint32_t bg = selected ? COL_ACCENT : (hov ? COL_HOVER : COL_HEADER);
+    uint32_t fg = selected ? COL_MANTLE : COL_TEXT;
+    render_quad(r, x, y, w, h, bg);
+    render_quad(r, x, y, w, 1, COL_BORDER);
+    render_quad(r, x, y + h - 1, w, 1, COL_BORDER);
+    render_quad(r, x, y, 1, h, COL_BORDER);
+    render_quad(r, x + w - 1, y, 1, h, COL_BORDER);
+    int tw = render_text_width(r, label);
+    render_text(r, label,
+                floorf(x + (w - tw) / 2),
+                floorf(y + (h - r->font_height) / 2),
+                fg);
+    return (hov && ui_clicked(&g_ui, id, x, y, w, h));
+}
+
+static void build_settings_modal(void) {
+    if (!g_settings_open) return;
+    Renderer* r = &g_renderer;
+
+    /* Backdrop */
+    render_quad(r, 0, 0, (float)g_width, (float)g_height, 0xAA000000);
+
+    /* Panel */
+    float pw = 520, ph = 380;
+    if (pw > g_width - 40) pw = g_width - 40;
+    if (ph > g_height - 40) ph = g_height - 40;
+    float px = floorf((g_width  - pw) / 2);
+    float py = floorf((g_height - ph) / 2);
+
+    render_quad(r, px - 1, py - 1, pw + 2, ph + 2, COL_BORDER);
+    render_quad(r, px, py, pw, ph, COL_HEADER);
+
+    /* Header */
+    render_text(r, "Settings", px + 20, py + 16, COL_TEXT);
+    /* Close X */
+    float cx = px + pw - 32, cy = py + 12;
+    int chov = ui_hover(&g_ui, cx, cy, 24, 24);
+    if (chov) render_quad(r, cx, cy, 24, 24, COL_HOVER);
+    render_mdl2(r, ICON_CLOSE, cx + 7, cy + 7, 10, chov ? COL_RED : COL_SUBTEXT);
+    /* Click-outside-panel closes the modal. Direct hit-test — avoids
+       ui_clicked's active_id race with the theme buttons below. */
+    int mx = g_ui.input.mouse_x, my = g_ui.input.mouse_y;
+    int inside_panel = (mx >= px && mx < px + pw && my >= py && my < py + ph);
+    if (g_ui.input.mouse_clicked && !inside_panel) {
+        g_settings_open = 0;
+        g_needs_redraw = 1;
+        return;
+    }
+    /* Close X (draws on top of panel) */
+    if (ui_clicked(&g_ui, UIID(700), cx, cy, 24, 24)) {
+        g_settings_open = 0;
+        g_needs_redraw = 1;
+        return;
+    }
+    render_quad(r, px, py + 48, pw, 1, COL_BORDER);
+
+    /* Content */
+    float cy2 = py + 68;
+    float lx  = px + 24;
+    float rx2 = px + pw - 24;
+
+    /* --- Theme --- */
+    render_text(r, "Theme", lx, cy2, COL_SUBTEXT);
+    cy2 += 22;
+    /* Rescan themes each frame — cheap & keeps drop-ins live */
+    theme_discover();
+    float chip_h = 32;
+    float chip_gap = 6;
+    for (int i = 0; i < g_theme_count; i++) {
+        float chip_w = (pw - 48 - chip_gap * 2) / 3;
+        int col_i = i % 3;
+        int row_i = i / 3;
+        float bx = lx + col_i * (chip_w + chip_gap);
+        float by = cy2 + row_i * (chip_h + chip_gap);
+        int selected = (_stricmp(g_theme_current, g_themes[i].display) == 0);
+        if (settings_row_button(r, bx, by, chip_w, chip_h,
+                                g_themes[i].display, selected, UIID(710 + i))) {
+            theme_apply_file(g_themes[i].path);
+        }
+    }
+    int rows_used = (g_theme_count + 2) / 3;
+    cy2 += rows_used * (chip_h + chip_gap) + 10;
+
+    /* --- Row density --- */
+    render_text(r, "Row density", lx, cy2, COL_SUBTEXT);
+    cy2 += 22;
+    {
+        struct { const char* label; int rh; } opts[3] = {
+            { "Compact", 17 }, { "Normal", 20 }, { "Roomy", 24 }
+        };
+        float ow = (pw - 48 - chip_gap * 2) / 3;
+        for (int i = 0; i < 3; i++) {
+            int selected = (g_pref_row_h == opts[i].rh);
+            if (settings_row_button(r, lx + i * (ow + chip_gap), cy2,
+                                    ow, chip_h,
+                                    opts[i].label, selected, UIID(720 + i))) {
+                g_pref_row_h = opts[i].rh;
+                g_row_h      = opts[i].rh;
+                settings_save();
+            }
+        }
+        cy2 += chip_h + 10;
+    }
+
+    /* --- Font size --- */
+    render_text(r, "Font size (applies on next launch)", lx, cy2, COL_SUBTEXT);
+    cy2 += 22;
+    {
+        float bw = 34, bh = chip_h;
+        /* [ − ]  N pt  [ + ] */
+        if (settings_row_button(r, lx, cy2, bw, bh, "-", 0, UIID(730))) {
+            if (g_pref_font_size > 9) { g_pref_font_size--; g_pref_font_needs_restart = 1; settings_save(); }
+        }
+        char pt[16];
+        _snprintf(pt, sizeof(pt), "%d pt", g_pref_font_size);
+        render_text(r, pt, lx + bw + 20,
+                    floorf(cy2 + (bh - r->font_height) / 2), COL_TEXT);
+        if (settings_row_button(r, lx + bw + 90, cy2, bw, bh, "+", 0, UIID(731))) {
+            if (g_pref_font_size < 16) { g_pref_font_size++; g_pref_font_needs_restart = 1; settings_save(); }
+        }
+        if (g_pref_font_needs_restart)
+            render_text_small(r, "Restart to apply new font size",
+                              lx + bw + 90 + bw + 20,
+                              floorf(cy2 + (bh - r->fonts[1].font_height) / 2),
+                              COL_ACCENT);
+        cy2 += bh + 10;
+    }
+
+    /* --- Footer hint --- */
+    render_text_small(r, "Press Esc to close  ·  Ctrl+Shift+T reloads theme from disk",
+                      lx, py + ph - 22, COL_DIM);
+}
+
 static void build_status_bar(void) {
     Renderer* r = &g_renderer;
     float y = (float)g_height - STATUS_BAR_H;
@@ -5984,6 +6148,24 @@ static void build_ui(void) {
     ui_begin(&g_ui, input);
     /* Reset tooltip; each hovered icon widget refreshes it during render. */
     g_tt_text[0] = 0;
+
+    /* Modal input capture — while Settings is open, hide all mouse events
+       from the widgets below so a click on a chip doesn't also trigger a
+       click on the file / tab / button under it. Real input is restored
+       right before the modal renders (bottom of build_ui). */
+    int  saved_mx = g_ui.input.mouse_x, saved_my = g_ui.input.mouse_y;
+    int  saved_clk = g_ui.input.mouse_clicked, saved_rel = g_ui.input.mouse_released;
+    int  saved_dbl = g_ui.input.mouse_dblclick, saved_dn = g_ui.input.mouse_down;
+    if (g_settings_open) {
+        /* Push mouse far off-screen and clear click flags so nothing hovers
+           or triggers underneath the modal. */
+        g_ui.input.mouse_x = -30000;
+        g_ui.input.mouse_y = -30000;
+        g_ui.input.mouse_clicked = 0;
+        g_ui.input.mouse_released = 0;
+        g_ui.input.mouse_dblclick = 0;
+        g_ui.input.mouse_down = 0;
+    }
 
     /* Focus follows click: in split mode, clicking in either panel makes it active */
     if (g_app.split_active && g_mouse_clicked && g_mouse_x >= SIDEBAR_W &&
@@ -6072,6 +6254,15 @@ static void build_ui(void) {
 
     build_status_bar();
     build_fuzzy_finder();
+    if (g_settings_open) {
+        g_ui.input.mouse_x = saved_mx;
+        g_ui.input.mouse_y = saved_my;
+        g_ui.input.mouse_clicked  = saved_clk;
+        g_ui.input.mouse_released = saved_rel;
+        g_ui.input.mouse_dblclick = saved_dbl;
+        g_ui.input.mouse_down     = saved_dn;
+    }
+    build_settings_modal();
     tt_draw();
     ui_end(&g_ui);
 }
@@ -6453,7 +6644,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
-        if (wp == VK_ESCAPE) { g_typeahead_len = 0; g_needs_redraw = 1; return 0; }
+        if (wp == VK_ESCAPE) {
+            if (g_settings_open) { g_settings_open = 0; g_needs_redraw = 1; return 0; }
+            g_typeahead_len = 0; g_needs_redraw = 1; return 0;
+        }
         if (wp == VK_BACK) { tab_go_up(t); g_needs_redraw = 1; }
         else if (wp == VK_F5) { thumb_cache_clear(); scan_directory(t); }
         else if (wp == VK_F2 && t->selected >= 0) { do_rename(t, t->selected); }
@@ -6675,6 +6869,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int cmdShow)
     strncpy(g_user_profile, prof ? prof : "C:\\Users\\user", MAX_PATH);
     _snprintf(g_downloads_path, MAX_PATH, "%s\\Downloads", g_user_profile);
     g_cf_drop_effect = RegisterClipboardFormatA("Preferred DropEffect");
+    /* Preferences must load before font creation so font_size applies. */
+    settings_load();
 
     WNDCLASSEXW wc = {0};
     wc.cbSize = sizeof(wc);
@@ -6733,10 +6929,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int cmdShow)
         "functions could not be resolved. Update your GPU driver.";
     else if (!render_init(&g_renderer)) fail =
         "OpenGL shader / VBO setup failed.";
-    else if (!render_create_font(&g_renderer, "Segoe UI", 11)) fail =
+    else if (!render_create_font(&g_renderer, "Segoe UI", g_pref_font_size)) fail =
         "Could not create the primary font 'Segoe UI'.\n"
         "Install the Segoe UI font family.";
-    else if (!render_create_font_small(&g_renderer, "Segoe UI", 10)) fail =
+    else if (!render_create_font_small(&g_renderer, "Segoe UI", g_pref_font_size - 1)) fail =
         "Could not create the small font 'Segoe UI'.";
     else if (!render_create_icons(&g_renderer, 16)) fail =
         "Could not load the MDL2 icon font 'Segoe MDL2 Assets'.\n"
