@@ -440,6 +440,10 @@ static IContextMenu3* g_shell_ctx3 = NULL;
 
 /* ---- Batch rename ---- */
 static int  g_batch_active = 0;
+static int  g_batch_focus  = 0;   /* 0 = suffix side, 1 = prefix side */
+static char g_batch_prefix[MAX_PATH];
+static int  g_batch_prefix_len = 0;
+static int  g_batch_chop_left  = 0;   /* stem chars trimmed from start */
 static int  g_batch_panel  = -1;
 static char g_batch_typed[MAX_PATH];
 static int  g_batch_typed_len = 0;
@@ -2130,6 +2134,10 @@ static void batch_rename_start(Tab* t) {
     g_batch_typed_len = 0;
     g_batch_typed[0] = 0;
     g_batch_chop = 0;
+    g_batch_prefix_len = 0;
+    g_batch_prefix[0] = 0;
+    g_batch_chop_left = 0;
+    g_batch_focus = 0;      /* suffix side by default (original behaviour) */
     g_needs_redraw = 1;
 }
 
@@ -2139,6 +2147,10 @@ static void batch_rename_cancel(void) {
     g_batch_typed_len = 0;
     g_batch_typed[0] = 0;
     g_batch_chop = 0;
+    g_batch_prefix_len = 0;
+    g_batch_prefix[0] = 0;
+    g_batch_chop_left = 0;
+    g_batch_focus = 0;
     g_needs_redraw = 1;
 }
 
@@ -2146,17 +2158,24 @@ static void batch_rename_commit(void) {
     if (!g_batch_active) return;
     Panel* P = &g_app.panels[g_batch_panel >= 0 ? g_batch_panel : g_app.active_panel];
     Tab* t = &P->tabs[P->active_tab];
-    if (g_batch_typed_len > 0 || g_batch_chop > 0) {
+    int any_change = (g_batch_typed_len > 0 || g_batch_chop > 0 ||
+                      g_batch_prefix_len > 0 || g_batch_chop_left > 0);
+    if (any_change) {
         for (int i = 0; i < t->entry_count; i++) {
             if (!t->sel_mask[i]) continue;
             if (strcmp(t->entries[i].name, "..") == 0) continue;
             char stem[MAX_PATH], ext[MAX_PATH];
             split_stem_ext(t->entries[i].name, stem, ext, MAX_PATH);
-            int keep = (int)strlen(stem) - g_batch_chop;
-            if (keep < 0) keep = 0;
-            stem[keep] = 0;
+            int slen = (int)strlen(stem);
+            int cl = g_batch_chop_left;  if (cl > slen) cl = slen;
+            int cr = g_batch_chop;       if (cr > slen - cl) cr = slen - cl;
+            int keep = slen - cl - cr;
+            char middle[MAX_PATH];
+            if (keep > 0) memcpy(middle, stem + cl, keep);
+            middle[keep] = 0;
             char new_name[MAX_PATH];
-            _snprintf(new_name, MAX_PATH, "%s%s%s", stem, g_batch_typed, ext);
+            _snprintf(new_name, MAX_PATH, "%s%s%s%s",
+                      g_batch_prefix, middle, g_batch_typed, ext);
             if (new_name[0] == 0) continue;
             WCHAR wold[MAX_PATH], wnew[MAX_PATH];
             path_join_w(t->path, t->entries[i].name, wold, MAX_PATH);
@@ -4124,16 +4143,27 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
                 if (is_batch_here) {
                     char stem[MAX_PATH], extp[MAX_PATH];
                     split_stem_ext(e->name, stem, extp, MAX_PATH);
-                    int show_len = (int)strlen(stem) - g_batch_chop;
-                    if (show_len < 0) show_len = 0;
-                    int stem_w  = render_text_width_n(r, stem, show_len);
-                    int typed_w = (g_batch_typed_len > 0) ? render_text_width(r, g_batch_typed) : 0;
-                    int ext_w   = extp[0] ? render_text_width(r, extp) : 0;
-                    int total   = stem_w + typed_w + 1 + (ext_w ? ext_w + 3 : 0);
+                    int slen = (int)strlen(stem);
+                    int cl = g_batch_chop_left;  if (cl > slen) cl = slen;
+                    int cr = g_batch_chop;       if (cr > slen - cl) cr = slen - cl;
+                    int mid_len = slen - cl - cr;
+                    int pfx_w  = (g_batch_prefix_len > 0) ? render_text_width(r, g_batch_prefix) : 0;
+                    int mid_w  = (mid_len > 0) ? render_text_width_n(r, stem + cl, mid_len) : 0;
+                    int sfx_w  = (g_batch_typed_len > 0)  ? render_text_width(r, g_batch_typed) : 0;
+                    int ext_w  = extp[0] ? render_text_width(r, extp) : 0;
+                    int total  = pfx_w + mid_w + sfx_w + 2 + (ext_w ? ext_w + 3 : 0);
                     float nx = ix + (iw - total) / 2;
-                    if (show_len > 0) nx += render_text_n(r, stem, show_len, nx, ty, COL_TEXT);
+                    if (g_batch_prefix_len > 0) nx += render_text(r, g_batch_prefix, nx, ty, COL_GREEN);
+                    if (g_batch_focus == 1) {
+                        render_quad(r, nx + 1, ty - 2, 1, r->font_height + 4, COL_TEXT);
+                        nx += 2;
+                    }
+                    if (mid_len > 0) nx += render_text_n(r, stem + cl, mid_len, nx, ty, COL_TEXT);
+                    if (g_batch_focus == 0) {
+                        render_quad(r, nx + 1, ty - 2, 1, r->font_height + 4, COL_TEXT);
+                        nx += 2;
+                    }
                     if (g_batch_typed_len > 0) nx += render_text(r, g_batch_typed, nx, ty, COL_GREEN);
-                    render_quad(r, nx + 1, ty - 2, 1, r->font_height + 4, COL_TEXT);
                     if (extp[0]) render_text(r, extp, nx + 3, ty, COL_DIM);
                 } else if (!is_edit_here) {
                     int nl = (int)strlen(e->name);
@@ -4397,18 +4427,22 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
             t->sel_mask[i] && strcmp(e->name, "..") != 0) {
             char stem[MAX_PATH], ext[MAX_PATH];
             split_stem_ext(e->name, stem, ext, MAX_PATH);
-            int show_len = (int)strlen(stem) - g_batch_chop;
-            if (show_len < 0) show_len = 0;
+            int slen = (int)strlen(stem);
+            int cl = g_batch_chop_left;  if (cl > slen) cl = slen;
+            int cr = g_batch_chop;       if (cr > slen - cl) cr = slen - cl;
+            int mid_len = slen - cl - cr;
             float nx = item_x + 24;
-            if (show_len > 0) {
-                int tw1 = render_text_n(r, stem, show_len, nx, ty, COL_TEXT);
-                nx += tw1;
+            if (g_batch_prefix_len > 0) nx += render_text(r, g_batch_prefix, nx, ty, COL_GREEN);
+            if (g_batch_focus == 1) {
+                render_quad(r, nx + 1, ry + 3, 1, ROW_H - 6, COL_TEXT);
+                nx += 2;
             }
-            if (g_batch_typed_len > 0) {
-                int tw2 = render_text(r, g_batch_typed, nx, ty, COL_GREEN);
-                nx += tw2;
+            if (mid_len > 0) nx += render_text_n(r, stem + cl, mid_len, nx, ty, COL_TEXT);
+            if (g_batch_focus == 0) {
+                render_quad(r, nx + 1, ry + 3, 1, ROW_H - 6, COL_TEXT);
+                nx += 2;
             }
-            render_quad(r, nx + 1, ry + 3, 1, ROW_H - 6, COL_TEXT);
+            if (g_batch_typed_len > 0) nx += render_text(r, g_batch_typed, nx, ty, COL_GREEN);
             if (ext[0]) render_text(r, ext, nx + 3, ty, COL_DIM);
         } else if (!(g_edit_idx == i && g_edit_panel == g_app.active_panel)) {
             float nmw = type_x - item_x - 28;
@@ -4920,12 +4954,24 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             enc_len = 3;
         }
         if (g_batch_active) {
-            if (wp >= 32 && wp != 127 &&
-                g_batch_typed_len + enc_len < (int)sizeof(g_batch_typed)) {
-                memcpy(g_batch_typed + g_batch_typed_len, enc, enc_len);
-                g_batch_typed_len += enc_len;
-                g_batch_typed[g_batch_typed_len] = 0;
-                g_needs_redraw = 1;
+            if (wp >= 32 && wp != 127) {
+                if (g_batch_focus == 1) {
+                    /* Prefix side */
+                    if (g_batch_prefix_len + enc_len < (int)sizeof(g_batch_prefix)) {
+                        memcpy(g_batch_prefix + g_batch_prefix_len, enc, enc_len);
+                        g_batch_prefix_len += enc_len;
+                        g_batch_prefix[g_batch_prefix_len] = 0;
+                        g_needs_redraw = 1;
+                    }
+                } else {
+                    /* Suffix side */
+                    if (g_batch_typed_len + enc_len < (int)sizeof(g_batch_typed)) {
+                        memcpy(g_batch_typed + g_batch_typed_len, enc, enc_len);
+                        g_batch_typed_len += enc_len;
+                        g_batch_typed[g_batch_typed_len] = 0;
+                        g_needs_redraw = 1;
+                    }
+                }
             }
             return 0;
         }
@@ -4968,16 +5014,43 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_batch_active) {
             if (wp == VK_RETURN) { batch_rename_commit(); return 0; }
             if (wp == VK_ESCAPE) { batch_rename_cancel(); return 0; }
+            if (wp == VK_LEFT || wp == VK_HOME) {
+                g_batch_focus = 1;   /* prefix side */
+                g_needs_redraw = 1;
+                return 0;
+            }
+            if (wp == VK_RIGHT || wp == VK_END) {
+                g_batch_focus = 0;   /* suffix side */
+                g_needs_redraw = 1;
+                return 0;
+            }
             if (wp == VK_BACK) {
-                if (g_batch_typed_len > 0) {
-                    /* Strip one UTF-8 codepoint from the end */
-                    int p = g_batch_typed_len - 1;
-                    while (p > 0 && (g_batch_typed[p] & 0xC0) == 0x80) p--;
-                    g_batch_typed_len = p;
-                    g_batch_typed[p] = 0;
+                if (g_batch_focus == 1) {
+                    if (g_batch_prefix_len > 0) {
+                        int p = g_batch_prefix_len - 1;
+                        while (p > 0 && (g_batch_prefix[p] & 0xC0) == 0x80) p--;
+                        g_batch_prefix_len = p;
+                        g_batch_prefix[p] = 0;
+                    } else {
+                        g_batch_chop_left++;
+                    }
                 } else {
-                    g_batch_chop++;
+                    if (g_batch_typed_len > 0) {
+                        int p = g_batch_typed_len - 1;
+                        while (p > 0 && (g_batch_typed[p] & 0xC0) == 0x80) p--;
+                        g_batch_typed_len = p;
+                        g_batch_typed[p] = 0;
+                    } else {
+                        g_batch_chop++;
+                    }
                 }
+                g_needs_redraw = 1;
+                return 0;
+            }
+            if (wp == VK_DELETE) {
+                /* Forward-delete: eat one stem char on the opposite side */
+                if (g_batch_focus == 1) g_batch_chop_left++;
+                else                    g_batch_chop++;
                 g_needs_redraw = 1;
                 return 0;
             }
