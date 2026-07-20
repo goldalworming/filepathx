@@ -68,6 +68,7 @@ typedef BOOL  (WINAPI *PFN_wglSwapIntervalEXT)(int);
 #define IDM_OPEN_TERMINAL 1013
 #define IDM_ADD_BOOKMARK    1014
 #define IDM_REMOVE_BOOKMARK 1015
+#define IDM_OPEN_WITH       1016
 #define IDM_VIEW_DETAILS    1020
 #define IDM_VIEW_SMALL      1021
 #define IDM_VIEW_LARGE      1022
@@ -788,6 +789,45 @@ static GLuint hbmp_to_gl(HBITMAP hbmp, int* out_w, int* out_h, int flip_v) {
             if (a == 0 && (b | g | r) != 0) a = 255;
             dr[0] = r; dr[1] = g; dr[2] = b; dr[3] = a;
             sr += 4; dr += 4;
+        }
+    }
+    /* Rounded corners: for content thumbnails (flip_v==0, i.e. real
+       photo/video/pdf previews from Windows) fade the alpha inside a
+       small quarter-circle at each corner. Shell-icon fallbacks
+       (flip_v==1) already sit on a transparent background, so this
+       loop is a no-op for them and their outlines stay intact. */
+    if (!flip_v) {
+        int radius = (w < h ? w : h) / 20;
+        if (radius < 4)  radius = 4;
+        if (radius > 12) radius = 12;
+        for (int cy = 0; cy < radius; cy++) {
+            for (int cx = 0; cx < radius; cx++) {
+                float dx = (float)(radius - cx) - 0.5f;
+                float dy = (float)(radius - cy) - 0.5f;
+                float d  = dx*dx + dy*dy;
+                float r_out = (float)(radius * radius);
+                float r_in  = (float)((radius - 1) * (radius - 1));
+                unsigned char am;
+                if (d >= r_out)      am = 0;
+                else if (d <= r_in)  continue;   /* fully inside — keep alpha */
+                else {
+                    /* Anti-alias band between r_in and r_out */
+                    float t = (r_out - d) / (r_out - r_in);
+                    am = (unsigned char)(t * 255.0f + 0.5f);
+                }
+                int px[4][2] = {
+                    { cx,           cy           },
+                    { w - 1 - cx,   cy           },
+                    { cx,           h - 1 - cy   },
+                    { w - 1 - cx,   h - 1 - cy   },
+                };
+                for (int k = 0; k < 4; k++) {
+                    unsigned char* p = tmp + (px[k][1] * w + px[k][0]) * 4;
+                    /* Multiply existing alpha by mask so pixels outside
+                       the radius vanish and edge pixels blend. */
+                    p[3] = (unsigned char)((p[3] * am + 127) / 255);
+                }
+            }
         }
     }
     GLuint tex;
@@ -3441,6 +3481,21 @@ static void handle_context_cmd(int cmd, int item_idx) {
             clipboard_copy_text(p);
         }
         break;
+    case IDM_OPEN_WITH:
+        if (item_idx >= 0) {
+            WCHAR wp[MAX_PATH];
+            path_join_w(t->path, t->entries[item_idx].name, wp, MAX_PATH);
+            /* Windows "Open with" chooser dialog */
+            SHELLEXECUTEINFOW sei = {0};
+            sei.cbSize = sizeof(sei);
+            sei.hwnd   = g_hwnd;
+            sei.lpVerb = L"openas";
+            sei.lpFile = wp;
+            sei.nShow  = SW_SHOWNORMAL;
+            sei.fMask  = SEE_MASK_INVOKEIDLIST;
+            ShellExecuteExW(&sei);
+        }
+        break;
     case IDM_PROPERTIES: {
         char p[MAX_PATH];
         if (item_idx >= 0)
@@ -3688,7 +3743,7 @@ cleanup:
 static int shell_item_unwanted(const char* text) {
     /* Skip duplicates of our own menu + clutter from common shell extensions */
     static const char* bl[] = {
-        "Open", "Cut", "Copy", "Paste", "Delete", "Rename", "Properties",
+        "Open", "Open with", "Cut", "Copy", "Paste", "Delete", "Rename", "Properties",
         "Copy as path", "Share", "Create shortcut",
         "Open in File Pilot", "Add to Favorites", "Pin to Quick access",
         "Include in library", "Pin to Start", "Restore previous versions",
@@ -3884,18 +3939,22 @@ static void show_context_menu(HWND hwnd, int mx, int my) {
     HMENU menu = CreatePopupMenu();
     if (on_item >= 0) {
         FileEntry* e = &t->entries[on_item];
+        /* --- Open group (top) --- */
         AppendMenuA(menu, MF_STRING, IDM_OPEN, "Open");
         if (e->is_dir)
             AppendMenuA(menu, MF_STRING, IDM_OPEN_TAB, "Open in New Tab");
+        if (!e->is_dir && !is_dotdot)
+            AppendMenuA(menu, MF_STRING, IDM_OPEN_WITH, "Open with...");
+        AppendMenuA(menu, is_dotdot ? MF_GRAYED : MF_STRING, IDM_COPY_PATH, "Copy Path");
         AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+        /* --- Clipboard --- */
         AppendMenuA(menu, is_dotdot ? MF_GRAYED : MF_STRING, IDM_CUT, "Cut\tCtrl+X");
         AppendMenuA(menu, is_dotdot ? MF_GRAYED : MF_STRING, IDM_COPY, "Copy\tCtrl+C");
         AppendMenuA(menu, has_clip ? MF_STRING : MF_GRAYED, IDM_PASTE, "Paste\tCtrl+V");
         AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+        /* --- File ops --- */
         AppendMenuA(menu, is_dotdot ? MF_GRAYED : MF_STRING, IDM_RENAME, "Rename\tF2");
         AppendMenuA(menu, is_dotdot ? MF_GRAYED : MF_STRING, IDM_DELETE, "Delete\tDel");
-        AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
-        AppendMenuA(menu, MF_STRING, IDM_COPY_PATH, "Copy Path");
         if (e->is_dir && !is_dotdot) {
             char fp[MAX_PATH];
             _snprintf(fp, MAX_PATH, "%s\\%s", t->path, e->name);
@@ -3904,6 +3963,7 @@ static void show_context_menu(HWND hwnd, int mx, int my) {
                         already ? "Add to bookmarks (already added)" : "Add to bookmarks");
         }
         AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+        /* --- Misc --- */
         AppendMenuA(menu, MF_STRING, IDM_OPEN_TERMINAL, "Open Terminal\tCtrl+D");
         AppendMenuA(menu, MF_STRING, IDM_PROPERTIES, "Properties");
     } else {
