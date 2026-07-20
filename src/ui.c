@@ -140,11 +140,13 @@ float ui_scrollbar(UI* ui, int id, float x, float y, float w, float h,
     float track_h   = h - thumb_h;
     float thumb_y   = y + (scroll_y / max_scroll) * track_h;
 
-    /* Wider hit area than visual thumb for easier grabbing */
-    int track_hov = ui_hover(ui, sb_x - 4, y, sb_w + 8, h);
+    /* Much wider hit area than the visible thumb so grabbing is forgiving
+       — extend 10 px into the content area and past the right edge. Also
+       give the thumb a Y overshoot so a slightly-off click still counts. */
+    int track_hov = ui_hover(ui, sb_x - 10, y, sb_w + 16, h);
     int thumb_hov = (track_hov &&
-                     ui->input.mouse_y >= thumb_y &&
-                     ui->input.mouse_y < thumb_y + thumb_h);
+                     ui->input.mouse_y >= thumb_y - 3 &&
+                     ui->input.mouse_y < thumb_y + thumb_h + 3);
 
     /* Grab the thumb */
     if (thumb_hov && ui->input.mouse_clicked && ui->active_id == 0) {
