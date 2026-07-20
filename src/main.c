@@ -417,6 +417,43 @@ static int   g_splitter_dragging = 0;
 /* Sync scroll between panels (default off) */
 static int   g_sync_scroll = 0;
 
+/* ---- Hover tooltips ---- */
+static char  g_tt_text[128]  = "";
+static int   g_tt_ax = 0, g_tt_ay = 0;   /* anchor point (usually button top-centre) */
+static DWORD g_tt_since       = 0;       /* when this tooltip text was first set */
+static char  g_tt_last_text[128] = "";
+
+static void tt_set(const char* text, int anchor_x, int anchor_y) {
+    strncpy(g_tt_text, text, sizeof(g_tt_text)-1);
+    g_tt_text[sizeof(g_tt_text)-1] = 0;
+    g_tt_ax = anchor_x;
+    g_tt_ay = anchor_y;
+    if (strcmp(g_tt_text, g_tt_last_text) != 0) {
+        strncpy(g_tt_last_text, g_tt_text, sizeof(g_tt_last_text)-1);
+        g_tt_last_text[sizeof(g_tt_last_text)-1] = 0;
+        g_tt_since = GetTickCount();
+    }
+}
+
+static void tt_draw(void) {
+    if (!g_tt_text[0]) { g_tt_last_text[0] = 0; return; }
+    DWORD elapsed = GetTickCount() - g_tt_since;
+    if (elapsed < 400) { g_needs_redraw = 1; return; }
+    Renderer* r = &g_renderer;
+    int tw  = render_text_width(r, g_tt_text);
+    int pad = 8;
+    int bw  = tw + pad * 2;
+    int bh  = r->font_height + 8;
+    int tx  = g_tt_ax - bw / 2;
+    int ty  = g_tt_ay - bh - 6;         /* above anchor */
+    if (tx < 4) tx = 4;
+    if (tx + bw > g_width - 4) tx = g_width - bw - 4;
+    if (ty < 4) ty = g_tt_ay + 20;      /* below if no room above */
+    render_quad(r, tx - 1, ty - 1, bw + 2, bh + 2, COL_BORDER);
+    render_quad(r, tx,     ty,     bw,     bh,     COL_HEADER);
+    render_text(r, g_tt_text, tx + pad, ty + (bh - r->font_height) / 2, COL_TEXT);
+}
+
 /* Tab bar hit-test zones written by build_tab_bar each frame. */
 static int   g_tab_bar_tabs_end_x  = 0;
 static int   g_tab_bar_btns_start_x = 0;
@@ -4667,6 +4704,8 @@ static void build_tab_bar(float tabs_xmin, float tabs_xmax) {
             if (g_app.panels[g_app.active_panel].tab_scroll_target < 0) g_app.panels[g_app.active_panel].tab_scroll_target = 0;
             g_needs_redraw = 1;
         }
+        if (ui_hover(&g_ui, bx, 5, btn_w, TAB_BAR_H - 10))
+            tt_set("Scroll tabs left", (int)(bx + btn_w/2), 5);
         bx += btn_w;
         if (ui_mdl2_btn(&g_ui, UIID(198), bx, 5, btn_w, TAB_BAR_H - 10, ICON_CHEVRON_RIGHT, 10,
                         g_app.panels[g_app.active_panel].tab_scroll_target < max_scroll)) {
@@ -4674,10 +4713,14 @@ static void build_tab_bar(float tabs_xmin, float tabs_xmax) {
             if (g_app.panels[g_app.active_panel].tab_scroll_target > max_scroll) g_app.panels[g_app.active_panel].tab_scroll_target = max_scroll;
             g_needs_redraw = 1;
         }
+        if (ui_hover(&g_ui, bx, 5, btn_w, TAB_BAR_H - 10))
+            tt_set("Scroll tabs right", (int)(bx + btn_w/2), 5);
         bx += btn_w + 4;
     }
     if (ui_mdl2_btn(&g_ui, UIID(199), bx, 5, 24, TAB_BAR_H - 10, ICON_ADD, 10, 1))
         new_tab(active_tab()->path);
+    if (ui_hover(&g_ui, bx, 5, 24, TAB_BAR_H - 10))
+        tt_set("New tab in current folder  (Ctrl+T)", (int)(bx + 12), 5);
     g_tab_bar_btn_end_x = (int)(bx + 24);
 
     /* Wheel over tab area scrolls horizontally */
@@ -4746,12 +4789,18 @@ static void build_toolbar(float x0, float x1) {
     float bx = x0 + 4;
     if (ui_mdl2_btn(&g_ui, UIID(200), bx, y+2, 26, TOOLBAR_H-4, ICON_ARROW_BACK, 12, t->hist_pos > 0))
         tab_go_back(t);
+    if (ui_hover(&g_ui, bx, y+2, 26, TOOLBAR_H-4))
+        tt_set("Back  (Alt+Left)", (int)(bx + 13), (int)(y + 2));
     bx += 28;
     if (ui_mdl2_btn(&g_ui, UIID(201), bx, y+2, 26, TOOLBAR_H-4, ICON_ARROW_FWD, 12, t->hist_pos < t->hist_count-1))
         tab_go_forward(t);
+    if (ui_hover(&g_ui, bx, y+2, 26, TOOLBAR_H-4))
+        tt_set("Forward  (Alt+Right)", (int)(bx + 13), (int)(y + 2));
     bx += 28;
     if (ui_mdl2_btn(&g_ui, UIID(202), bx, y+2, 26, TOOLBAR_H-4, ICON_ARROW_UP, 12, strlen(t->path) > 3))
         tab_go_up(t);
+    if (ui_hover(&g_ui, bx, y+2, 26, TOOLBAR_H-4))
+        tt_set("Up  (Backspace)", (int)(bx + 13), (int)(y + 2));
     bx += 30;
 
     /* Separator after navigation buttons */
@@ -4767,6 +4816,9 @@ static void build_toolbar(float x0, float x1) {
         float iw = 10, ih = 14;
         draw_bookmark(r, bx + (bm_w - iw) / 2, y + (TOOLBAR_H - ih) / 2, iw, ih,
                       bm_idx >= 0 ? COL_YELLOW : COL_SUBTEXT);
+        if (bm_hov) tt_set(bm_idx >= 0 ? "Remove this folder from bookmarks"
+                                       : "Add this folder to bookmarks",
+                           (int)(bx + bm_w / 2), (int)(y + 2));
         if (ui_clicked(&g_ui, UIID(203), bx, y+2, bm_w, bm_h)) {
             if (bm_idx >= 0) bookmark_remove_at(bm_idx);
             else bookmark_add(t->path);
@@ -5541,33 +5593,57 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
 }
 
 /* Draw simple view-mode icons */
+/* Minimalist icons — thin 1-px strokes, rounded feel via corner nips, wide
+   whitespace. Designed for 14 px canvas. */
+
+static void _pip(Renderer* r, float x, float y, uint32_t col) {
+    /* Rounded 2×2 pip (dot) used as a "bullet". */
+    render_quad(r, x, y, 2, 2, col);
+}
+
+static void _round_stroke(Renderer* r, float x, float y, float w, float h, uint32_t col) {
+    /* 1-px rounded outline (radius 1) — 4 sides with corner nips clipped. */
+    render_quad(r, x + 1, y,           w - 2, 1,     col);  /* top   */
+    render_quad(r, x + 1, y + h - 1,   w - 2, 1,     col);  /* bot   */
+    render_quad(r, x,     y + 1,       1,     h - 2, col);  /* left  */
+    render_quad(r, x + w - 1, y + 1,   1,     h - 2, col);  /* right */
+}
+
+static void _round_fill(Renderer* r, float x, float y, float w, float h, uint32_t col) {
+    /* 1-px rounded filled block (radius 1). */
+    render_quad(r, x + 1, y,         w - 2, 1,     col);
+    render_quad(r, x,     y + 1,     w,     h - 2, col);
+    render_quad(r, x + 1, y + h - 1, w - 2, 1,     col);
+}
+
 static void draw_view_icon(Renderer* r, int mode, float x, float y, float sz, uint32_t col, uint32_t bg) {
+    (void)bg;
     if (mode == VM_DETAILS) {
-        float lh_ = 2;
-        render_quad(r, x, y + sz*0.25f - 1, sz, lh_, col);
-        render_quad(r, x, y + sz*0.5f  - 1, sz, lh_, col);
-        render_quad(r, x, y + sz*0.75f - 1, sz, lh_, col);
+        /* Three list rows — small bullet on the left + horizontal line. */
+        float rows[3] = { y + 1, y + sz * 0.5f - 1, y + sz - 3 };
+        for (int i = 0; i < 3; i++) {
+            _pip(r, x, rows[i], col);
+            render_quad(r, x + 4, rows[i] + 1, sz - 4, 1, col);   /* single-pixel line */
+        }
     } else if (mode == VM_SMALL_ICONS) {
-        float ss = (sz - 2) / 2;
-        render_quad(r, x,         y,         ss, ss, col);
-        render_quad(r, x + ss + 2, y,         ss, ss, col);
-        render_quad(r, x,         y + ss + 2, ss, ss, col);
-        render_quad(r, x + ss + 2, y + ss + 2, ss, ss, col);
+        /* 2×2 grid of small rounded blocks. */
+        float ss = (sz - 3) / 2;
+        _round_fill(r, x,             y,             ss, ss, col);
+        _round_fill(r, x + ss + 3,    y,             ss, ss, col);
+        _round_fill(r, x,             y + ss + 3,    ss, ss, col);
+        _round_fill(r, x + ss + 3,    y + ss + 3,    ss, ss, col);
     } else { /* LARGE */
-        render_quad(r, x, y, sz, sz, col);
-        render_quad(r, x + 1, y + 1, sz - 2, sz - 2, bg);
+        _round_stroke(r, x, y, sz, sz, col);
     }
 }
 
-/* Draw VS-Code-style split icon: outlined left rect + filled right rect */
+/* Minimalist split-view indicator: two thin rounded outlines side by side. */
 static void draw_split_icon(Renderer* r, float x, float y, float sz, uint32_t color, uint32_t bg) {
+    (void)bg;
     float gap = 2;
-    float rw = (sz - gap) / 2;
-    /* Left rect: outline */
-    render_quad(r, x, y, rw, sz, color);
-    render_quad(r, x + 1, y + 1, rw - 2, sz - 2, bg);
-    /* Right rect: filled */
-    render_quad(r, x + rw + gap, y, rw, sz, color);
+    float rw  = (sz - gap) / 2;
+    _round_stroke(r, x,             y, rw, sz, color);   /* left  */
+    _round_stroke(r, x + rw + gap,  y, rw, sz, color);   /* right */
 }
 
 /* Render one panel's status section: counts on left + [view] [split or sync]
@@ -5601,6 +5677,9 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
         if (hov) render_quad(r, btn_x, btn_y, btn_w, btn_h, COL_HOVER);
         uint32_t col = g_app.split_active ? COL_ACCENT : (hov ? COL_TEXT : COL_SUBTEXT);
         draw_split_icon(r, btn_x + btn_pad, btn_y + (btn_h - btn_sz) / 2, btn_sz, col, COL_HEADER);
+        if (hov) tt_set(g_app.split_active ? "Close split view  (Ctrl+\\)"
+                                           : "Split view  (Ctrl+\\)",
+                        (int)(btn_x + btn_w / 2), (int)btn_y);
         if (ui_clicked(&g_ui, 600, btn_x, btn_y, btn_w, btn_h)) {
             g_app.split_active = !g_app.split_active;
             if (g_app.split_active && g_app.panels[1].tab_count == 0) {
@@ -5617,6 +5696,9 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
         if (hov) render_quad(r, btn_x, btn_y, btn_w, btn_h, COL_HOVER);
         uint32_t col = g_sync_scroll ? COL_ACCENT : (hov ? COL_TEXT : COL_SUBTEXT);
         render_mdl2(r, ICON_LINK, btn_x + btn_pad, btn_y + (btn_h - btn_sz) / 2, btn_sz, col);
+        if (hov) tt_set(g_sync_scroll ? "Sync scroll: on (both panels scroll together)"
+                                      : "Sync scroll: off",
+                        (int)(btn_x + btn_w / 2), (int)btn_y);
         if (ui_clicked(&g_ui, 601, btn_x, btn_y, btn_w, btn_h)) {
             g_sync_scroll = !g_sync_scroll;
             g_needs_redraw = 1;
@@ -5630,6 +5712,13 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
     uint32_t vcol = vhov ? COL_TEXT : COL_SUBTEXT;
     draw_view_icon(r, t->view_mode, vx + btn_pad, btn_y + (btn_h - btn_sz) / 2,
                    btn_sz, vcol, COL_HEADER);
+    if (vhov) {
+        const char* label =
+            (t->view_mode == VM_DETAILS)     ? "View: Details  (click to change)" :
+            (t->view_mode == VM_SMALL_ICONS) ? "View: Small Icons  (click to change)" :
+                                               "View: Large Icons  (click to change)";
+        tt_set(label, (int)(vx + btn_w / 2), (int)btn_y);
+    }
     if (ui_clicked(&g_ui, 602 + panel_idx * 100, vx, btn_y, btn_w, btn_h)) {
         HMENU vm = CreatePopupMenu();
         AppendMenuA(vm, MF_STRING | (t->view_mode == VM_LARGE_ICONS ? MF_CHECKED : 0),
@@ -5893,6 +5982,8 @@ static void build_ui(void) {
     input.mouse_dblclick = g_mouse_dblclick;
     input.scroll_delta = g_scroll_delta;
     ui_begin(&g_ui, input);
+    /* Reset tooltip; each hovered icon widget refreshes it during render. */
+    g_tt_text[0] = 0;
 
     /* Focus follows click: in split mode, clicking in either panel makes it active */
     if (g_app.split_active && g_mouse_clicked && g_mouse_x >= SIDEBAR_W &&
@@ -5981,6 +6072,7 @@ static void build_ui(void) {
 
     build_status_bar();
     build_fuzzy_finder();
+    tt_draw();
     ui_end(&g_ui);
 }
 
