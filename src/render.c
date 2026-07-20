@@ -3,6 +3,47 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* Dual-source blend enum values (GL 3.3 / ARB_blend_func_extended)
+   — not exposed by the ancient <GL/gl.h> that ships with MinGW. */
+#ifndef GL_SRC1_COLOR
+#define GL_SRC1_COLOR           0x88F9
+#define GL_ONE_MINUS_SRC1_COLOR 0x88FA
+#define GL_SRC1_ALPHA           0x8589
+#define GL_ONE_MINUS_SRC1_ALPHA 0x88FB
+#endif
+
+/* ---- Theme (runtime colour palette) ---- */
+Theme g_theme = {
+    .bg        = 0xFF1E1E2E,
+    .surface   = 0xFF313244,
+    .overlay   = 0xFF45475A,
+    .text      = 0xFFFFFFFF,
+    .subtext   = 0xFFA6ADC8,
+    .dim       = 0xFF6C7086,
+    .accent    = 0xFF89B4FA,
+    .yellow    = 0xFFF9E2AF,
+    .green     = 0xFFA6E3A1,
+    .red       = 0xFFF38BA8,
+    .peach     = 0xFFFAB387,
+    .header    = 0xFF181825,
+    .mantle    = 0xFF11111B,
+    .hover     = 0xFF2A2A3C,
+    .selected  = 0xFF364060,
+    .scrollbar = 0xFF6C7086,
+    .border    = 0xFF313244,
+};
+void theme_reset_defaults(void) {
+    Theme d = {
+        .bg=0xFF1E1E2E, .surface=0xFF313244, .overlay=0xFF45475A,
+        .text=0xFFFFFFFF, .subtext=0xFFA6ADC8, .dim=0xFF6C7086,
+        .accent=0xFF89B4FA, .yellow=0xFFF9E2AF, .green=0xFFA6E3A1,
+        .red=0xFFF38BA8, .peach=0xFFFAB387, .header=0xFF181825,
+        .mantle=0xFF11111B, .hover=0xFF2A2A3C, .selected=0xFF364060,
+        .scrollbar=0xFF6C7086, .border=0xFF313244,
+    };
+    g_theme = d;
+}
+
 /* ---- GL function pointer storage ---- */
 #define X(ret, name, ...) PFN_gl##name gl##name##_ = NULL;
 GL_FUNCS
@@ -62,15 +103,36 @@ static const char* VS_SRC =
     "  gl_Position = vec4(ndc,0.0,1.0); vUV=aUV; vColor=aColor;\n"
     "}\n";
 
+/* Fragment shader supports LCD-subpixel text via dual-source blending.
+   The atlas stores per-subpixel coverage in R, G, B channels (from
+   Windows CLEARTYPE_QUALITY GDI output). Text is drawn with:
+     FragColor  = text_color              (source)
+     FragColor1 = coverage * text_alpha   (per-channel mask, index 1)
+   and the pipeline blends with SRC1_COLOR / (1-SRC1_COLOR) so each
+   sub-stripe of the destination pixel is composited independently —
+   sharpening horizontal stem edges the same way Windows ClearType does. */
 static const char* FS_SRC =
     "#version 330 core\n"
+    "#extension GL_ARB_blend_func_extended : enable\n"
     "in vec2 vUV; in vec4 vColor;\n"
     "uniform sampler2D uTexture; uniform int uTextMode;\n"
-    "out vec4 FragColor;\n"
+    "layout(location=0, index=0) out vec4 FragColor;\n"
+    "layout(location=0, index=1) out vec4 FragColor1;\n"
     "void main() {\n"
-    "  if(uTextMode==1) { float a=texture(uTexture,vUV).r; FragColor=vec4(vColor.rgb,vColor.a*a); }\n"
-    "  else if(uTextMode==2) { FragColor=texture(uTexture,vUV); }\n"
-    "  else { FragColor=vColor; }\n"
+    "  if (uTextMode == 1) {\n"
+    "    vec3 rgb = texture(uTexture, vUV).rgb;\n"
+    /* Small stem-darkening (γ ≈ 0.85) for a bit more density on light bg. */
+    "    rgb = pow(rgb, vec3(0.85));\n"
+    "    FragColor  = vec4(vColor.rgb, 1.0);\n"
+    "    FragColor1 = vec4(rgb * vColor.a, max(max(rgb.r, rgb.g), rgb.b) * vColor.a);\n"
+    "  } else if (uTextMode == 2) {\n"
+    "    vec4 c = texture(uTexture, vUV);\n"
+    "    FragColor  = c;\n"
+    "    FragColor1 = vec4(c.a, c.a, c.a, c.a);\n"
+    "  } else {\n"
+    "    FragColor  = vColor;\n"
+    "    FragColor1 = vec4(vColor.a, vColor.a, vColor.a, vColor.a);\n"
+    "  }\n"
     "}\n";
 
 int render_init(Renderer* r) {
@@ -126,9 +188,9 @@ static int atlas_init(FontAtlas* a, Renderer* r, const char* font_name, int font
 
     WCHAR wfont[64] = {0};
     MultiByteToWideChar(CP_UTF8, 0, font_name, -1, wfont, 64);
-    a->atlas_font = CreateFontW(-font_size, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0,
+    a->atlas_font = CreateFontW(-font_size, 0, 0, 0, FW_NORMAL, 0, 0, 0,
         DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-        ANTIALIASED_QUALITY, DEFAULT_PITCH|FF_DONTCARE, wfont);
+        CLEARTYPE_QUALITY, DEFAULT_PITCH|FF_DONTCARE, wfont);
     SelectObject(a->atlas_dc, a->atlas_font);
     SetBkMode(a->atlas_dc, OPAQUE);
     SetBkColor(a->atlas_dc, RGB(0,0,0));
@@ -142,15 +204,22 @@ static int atlas_init(FontAtlas* a, Renderer* r, const char* font_name, int font
     a->atlas_cur_x = 1;
     a->atlas_cur_y = 1;
 
-    a->atlas_alpha = (unsigned char*)calloc((size_t)a->atlas_w * a->atlas_h, 1);
+    /* Atlas now stores RGB subpixel coverage (from ClearType). 3 bytes per
+       glyph pixel: R, G, B correspond to left/middle/right LCD sub-stripes. */
+    a->atlas_alpha = (unsigned char*)calloc((size_t)a->atlas_w * a->atlas_h * 3, 1);
 
     glGenTextures(1, &a->texture);
     glBindTexture(GL_TEXTURE_2D, a->texture);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, a->atlas_w, a->atlas_h, 0,
-                 GL_RED, GL_UNSIGNED_BYTE, a->atlas_alpha);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, a->atlas_w, a->atlas_h, 0,
+                 GL_RGB, GL_UNSIGNED_BYTE, a->atlas_alpha);
+    /* Text is drawn 1:1 (glyph pixel ↔ screen pixel) at integer positions,
+       so LINEAR sampling only smudges the edge into the neighbouring atlas
+       pixel — visible as soft-shadow ghosting on light themes where the
+       dark-text/light-bg contrast is high. NEAREST keeps every glyph pixel
+       exact. */
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
@@ -203,13 +272,18 @@ static int atlas_create_glyph(FontAtlas* a, Renderer* r, unsigned int cp) {
     ExtTextOutW(a->atlas_dc, gx, gy, 0, NULL, w, wlen, NULL);
     GdiFlush();
 
+    /* Copy the DIB's BGRA subpixel coverage into our RGB atlas — each
+       glyph pixel stores three separate coverage values, one per LCD
+       sub-stripe. */
     unsigned char* src = (unsigned char*)a->atlas_bits;
     for (int y = 0; y < gh; y++) {
         for (int x = 0; x < gw; x++) {
             int si = ((gy + y) * a->atlas_w + (gx + x)) * 4;
+            int di = ((gy + y) * a->atlas_w + (gx + x)) * 3;
             unsigned char b = src[si+0], gc = src[si+1], rv = src[si+2];
-            unsigned char av = b > gc ? (b > rv ? b : rv) : (gc > rv ? gc : rv);
-            a->atlas_alpha[(gy + y) * a->atlas_w + (gx + x)] = av;
+            a->atlas_alpha[di+0] = rv;
+            a->atlas_alpha[di+1] = gc;
+            a->atlas_alpha[di+2] = b;
         }
     }
 
@@ -217,8 +291,8 @@ static int atlas_create_glyph(FontAtlas* a, Renderer* r, unsigned int cp) {
     glBindTexture(GL_TEXTURE_2D, a->texture);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, a->atlas_w);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, gx, gy, gw, gh, GL_RED, GL_UNSIGNED_BYTE,
-                    a->atlas_alpha + gy * a->atlas_w + gx);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, gx, gy, gw, gh, GL_RGB, GL_UNSIGNED_BYTE,
+                    a->atlas_alpha + (gy * a->atlas_w + gx) * 3);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     if (prev_tex) glBindTexture(GL_TEXTURE_2D, prev_tex);
 
@@ -419,17 +493,20 @@ int render_create_icons(Renderer* r, int size) {
         r->icon_glyphs[i].gh = size;
     }
     GdiFlush();
-    uint8_t* iatlas = (uint8_t*)malloc(atlas_w * atlas_h);
+    /* MDL2 icon atlas — replicate coverage to all 3 channels so it works
+       with the same subpixel-blend fragment shader as text glyphs. */
+    uint8_t* iatlas = (uint8_t*)malloc(atlas_w * atlas_h * 3);
     uint8_t* isrc = (uint8_t*)bits2;
     for (int i = 0; i < atlas_w * atlas_h; i++) {
         uint8_t b=isrc[i*4], g2=isrc[i*4+1], rv=isrc[i*4+2];
-        iatlas[i] = b>g2 ? (b>rv?b:rv) : (g2>rv?g2:rv);
+        uint8_t av = b>g2 ? (b>rv?b:rv) : (g2>rv?g2:rv);
+        iatlas[i*3+0] = av; iatlas[i*3+1] = av; iatlas[i*3+2] = av;
     }
     glGenTextures(1, &r->icon_texture);
     glBindTexture(GL_TEXTURE_2D, r->icon_texture);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, atlas_w, atlas_h, 0,
-                 GL_RED, GL_UNSIGNED_BYTE, iatlas);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, atlas_w, atlas_h, 0,
+                 GL_RGB, GL_UNSIGNED_BYTE, iatlas);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -473,7 +550,12 @@ void render_begin(Renderer* r, int w, int h) {
     glClearColor(br, bg, bb, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    /* Dual-source blend: destination factor is (1 - FragColor1), letting
+       the text path apply per-channel LCD subpixel coverage while
+       non-text quads/icons emit FragColor1 = alpha and behave like
+       standard SRC_ALPHA / ONE_MINUS_SRC_ALPHA blending. */
+    gl_BlendFuncSeparate(GL_SRC1_COLOR, GL_ONE_MINUS_SRC1_COLOR,
+                         GL_SRC1_ALPHA, GL_ONE_MINUS_SRC1_ALPHA);
     glDisable(GL_DEPTH_TEST);
     gl_UseProgram(r->program);
     gl_Uniform2f(r->loc_screen_size, (float)w, (float)h);

@@ -1,5 +1,6 @@
 #include "ui.h"
 #include <string.h>
+#include <math.h>
 
 void ui_init(UI* ui, Renderer* r) { memset(ui, 0, sizeof(*ui)); ui->renderer = r; }
 
@@ -44,7 +45,7 @@ int ui_tab(UI* ui, int id, float x, float y, float w, float h,
     if (active) render_quad(r, x, y + h - 2, w, 2, accent_col);
 
     /* Folder icon */
-    float ty = y + (h - r->font_height) / 2.0f;
+    float ty = floorf(y + (h - r->font_height) / 2.0f);
     if (icon_tex)
         render_icon(r, icon_tex, x + 6, y + (h - 16) / 2, 16, 16);
     else
@@ -77,7 +78,7 @@ int ui_icon_btn(UI* ui, int id, float x, float y, float w, float h,
     uint32_t col = enabled ? (hov ? COL_TEXT : COL_SUBTEXT) : COL_DIM;
     if (hov) render_quad(r, x, y, w, h, COL_HOVER);
     int tw = render_text_width(r, label);
-    float tx = x + (w - tw) / 2, ty = y + (h - r->font_height) / 2;
+    float tx = floorf(x + (w - tw) / 2), ty = floorf(y + (h - r->font_height) / 2);
     render_text(r, label, tx, ty, col);
     return (hov && ui_clicked(ui, id, x, y, w, h));
 }
@@ -102,7 +103,7 @@ int ui_section(UI* ui, int id, float x, float y, float w, float h,
     Renderer* r = ui->renderer;
     int hov = ui_hover(ui, x, y, w, h);
     if (hov) render_quad(r, x, y, w, h, COL_HOVER);
-    float ty = y + (h - r->font_height) / 2;
+    float ty = floorf(y + (h - r->font_height) / 2);
 
     /* Chevron (MDL2) */
     float csz = 8;
@@ -131,7 +132,7 @@ float ui_scrollbar(UI* ui, int id, float x, float y, float w, float h,
         if (ui->active_id == id) ui->active_id = 0;
         return 0;
     }
-    float sb_w = 6, sb_x = x + w - sb_w - 1;
+    float sb_w = 10, sb_x = x + w - sb_w - 2;
     float ratio = h / content_h;
     float thumb_h = h * ratio;
     if (thumb_h < 20) thumb_h = 20;
@@ -171,6 +172,9 @@ float ui_scrollbar(UI* ui, int id, float x, float y, float w, float h,
     thumb_y = y + (scroll_y / max_scroll) * track_h;
     int active = (ui->active_id == id);
     uint32_t col = (active || thumb_hov) ? COL_ACCENT : COL_SCROLLBAR;
-    render_quad(r, sb_x, thumb_y, sb_w, thumb_h, col);
+    /* Slightly-rounded thumb (radius 1 via 2 stacked slabs at each end) */
+    render_quad(r, sb_x + 1, thumb_y,               sb_w - 2, 1,           col);
+    render_quad(r, sb_x,     thumb_y + 1,           sb_w,     thumb_h - 2, col);
+    render_quad(r, sb_x + 1, thumb_y + thumb_h - 1, sb_w - 2, 1,           col);
     return scroll_y;
 }

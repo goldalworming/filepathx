@@ -49,7 +49,8 @@ typedef ptrdiff_t GLintptr;
     X(void,    DeleteBuffers,           GLsizei n, const GLuint* buffers) \
     X(void,    VertexAttribPointer,     GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const void* pointer) \
     X(void,    EnableVertexAttribArray, GLuint index) \
-    X(void,    ActiveTexture,           GLenum texture)
+    X(void,    ActiveTexture,           GLenum texture) \
+    X(void,    BlendFuncSeparate,       GLenum sfactorRGB, GLenum dfactorRGB, GLenum sfactorAlpha, GLenum dfactorAlpha)
 
 #define X(ret, name, ...) typedef ret (APIENTRY *PFN_gl##name)(__VA_ARGS__); extern PFN_gl##name gl##name##_;
 GL_FUNCS
@@ -82,25 +83,33 @@ GL_FUNCS
 #define gl_VertexAttribPointer     glVertexAttribPointer_
 #define gl_EnableVertexAttribArray glEnableVertexAttribArray_
 #define gl_ActiveTexture           glActiveTexture_
+#define gl_BlendFuncSeparate       glBlendFuncSeparate_
 
-/* ---- Colors (0xAARRGGBB) ---- */
-#define COL_BG         0xFF1E1E2E
-#define COL_SURFACE    0xFF313244
-#define COL_OVERLAY    0xFF45475A
-#define COL_TEXT       0xFFFFFFFF
-#define COL_SUBTEXT    0xFFA6ADC8
-#define COL_DIM        0xFF6C7086
-#define COL_ACCENT     0xFF89B4FA
-#define COL_YELLOW     0xFFF9E2AF
-#define COL_GREEN      0xFFA6E3A1
-#define COL_RED        0xFFF38BA8
-#define COL_PEACH      0xFFFAB387
-#define COL_HEADER     0xFF181825
-#define COL_MANTLE     0xFF11111B
-#define COL_HOVER      0xFF2A2A3C
-#define COL_SELECTED   0xFF364060
-#define COL_SCROLLBAR  0xFF6C7086
-#define COL_BORDER     0xFF313244
+/* ---- Colors (0xAARRGGBB, runtime-swappable via theme.ini) ---- */
+typedef struct {
+    uint32_t bg, surface, overlay, text, subtext, dim, accent,
+             yellow, green, red, peach, header, mantle, hover,
+             selected, scrollbar, border;
+} Theme;
+extern Theme g_theme;
+#define COL_BG         (g_theme.bg)
+#define COL_SURFACE    (g_theme.surface)
+#define COL_OVERLAY    (g_theme.overlay)
+#define COL_TEXT       (g_theme.text)
+#define COL_SUBTEXT    (g_theme.subtext)
+#define COL_DIM        (g_theme.dim)
+#define COL_ACCENT     (g_theme.accent)
+#define COL_YELLOW     (g_theme.yellow)
+#define COL_GREEN      (g_theme.green)
+#define COL_RED        (g_theme.red)
+#define COL_PEACH      (g_theme.peach)
+#define COL_HEADER     (g_theme.header)
+#define COL_MANTLE     (g_theme.mantle)
+#define COL_HOVER      (g_theme.hover)
+#define COL_SELECTED   (g_theme.selected)
+#define COL_SCROLLBAR  (g_theme.scrollbar)
+#define COL_BORDER     (g_theme.border)
+void theme_reset_defaults(void);
 
 /* ---- MDL2 Icons ---- */
 #define ICON_CHEVRON_RIGHT  0

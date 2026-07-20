@@ -37,11 +37,11 @@ typedef BOOL  (WINAPI *PFN_wglSwapIntervalEXT)(int);
 /* MARGINS is defined in uxtheme.h, included by dwmapi.h in MinGW */
 
 /* ---- Layout ---- */
-#define TAB_BAR_H    32
-#define TOOLBAR_H    30
-#define COL_HDR_H    24
-#define ROW_H        22
-#define STATUS_BAR_H 29
+#define TAB_BAR_H    28
+#define TOOLBAR_H    26
+#define COL_HDR_H    22
+#define ROW_H        20
+#define STATUS_BAR_H 26
 #define SIDEBAR_W    185
 #define CONTENT_TOP  (TAB_BAR_H + TOOLBAR_H)
 #define RESIZE_BORDER 6
@@ -1479,6 +1479,193 @@ static void sort_prefs_load(void) {
         strncpy(sp->path, p2 + 1, MAX_PATH-1); sp->path[MAX_PATH-1] = 0;
     }
     fclose(f);
+}
+
+/* ---- Theme (INI-style, key=6- or 8-hex value) ---- */
+static uint32_t parse_hex_color(const char* s) {
+    /* Accept "RGB", "RRGGBB", or "AARRGGBB". Ignore leading #. */
+    if (*s == '#') s++;
+    int len = 0;
+    while (s[len] && ((s[len] >= '0' && s[len] <= '9') ||
+                      (s[len] >= 'a' && s[len] <= 'f') ||
+                      (s[len] >= 'A' && s[len] <= 'F'))) len++;
+    unsigned int v = 0;
+    for (int i = 0; i < len; i++) {
+        char c = s[i];
+        int d = (c <= '9') ? c - '0' : ((c & ~0x20) - 'A' + 10);
+        v = (v << 4) | (unsigned)d;
+    }
+    if (len == 3) {
+        unsigned int r = (v >> 8) & 0xF, g = (v >> 4) & 0xF, b = v & 0xF;
+        return 0xFF000000 | ((r*17) << 16) | ((g*17) << 8) | (b*17);
+    }
+    if (len == 6) return 0xFF000000 | (v & 0xFFFFFF);
+    if (len == 8) return v;
+    return 0xFFFF00FF;   /* obvious magenta for parse errors */
+}
+
+/* ---- Theme discovery ---- */
+static void theme_load(void);   /* forward decl for theme_apply_file below */
+#define MAX_THEMES  32
+typedef struct {
+    char display[64];    /* human-readable name from `name=` line, or filename */
+    char path[MAX_PATH]; /* absolute path to .ini */
+} ThemeEntry;
+static ThemeEntry g_themes[MAX_THEMES];
+static int g_theme_count = 0;
+static char g_theme_current[64] = "Catppuccin Mocha";
+
+static void theme_read_display_name(const char* path, char* out, int n) {
+    out[0] = 0;
+    FILE* f = u8_fopen(path, "rb");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        int len = (int)strlen(line);
+        while (len > 0 && (line[len-1]=='\n' || line[len-1]=='\r' ||
+                           line[len-1]==' '  || line[len-1]=='\t')) line[--len] = 0;
+        char* p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == 0 || *p == ';' || *p == '#') continue;
+        /* case-insensitive match "name" */
+        if ((p[0]=='n'||p[0]=='N') && (p[1]=='a'||p[1]=='A') &&
+            (p[2]=='m'||p[2]=='M') && (p[3]=='e'||p[3]=='E')) {
+            char* eq = strchr(p, '=');
+            if (eq) {
+                eq++; while (*eq==' '||*eq=='\t') eq++;
+                strncpy(out, eq, n-1); out[n-1] = 0;
+                break;
+            }
+        }
+    }
+    fclose(f);
+}
+
+static void theme_discover(void) {
+    g_theme_count = 0;
+    WCHAR wexe[MAX_PATH];
+    if (GetModuleFileNameW(NULL, wexe, MAX_PATH) == 0) return;
+    /* Strip filename */
+    for (int i = (int)wcslen(wexe) - 1; i >= 0; i--) {
+        if (wexe[i] == L'\\' || wexe[i] == L'/') { wexe[i] = 0; break; }
+    }
+    WCHAR wpat[MAX_PATH];
+    _snwprintf(wpat, MAX_PATH, L"%ls\\themes\\*.ini", wexe);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wpat, &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        /* Try one level up (source-tree layout: build\FilePathX.exe → repo\themes) */
+        _snwprintf(wpat, MAX_PATH, L"%ls\\..\\themes\\*.ini", wexe);
+        h = FindFirstFileW(wpat, &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        /* update base to parent for the loop below */
+        for (int i = (int)wcslen(wexe) - 1; i >= 0; i--) {
+            if (wexe[i] == L'\\' || wexe[i] == L'/') { wexe[i] = 0; break; }
+        }
+    }
+    do {
+        if (g_theme_count >= MAX_THEMES) break;
+        WCHAR wfull[MAX_PATH];
+        _snwprintf(wfull, MAX_PATH, L"%ls\\themes\\%ls", wexe, fd.cFileName);
+        char full[MAX_PATH];
+        w_to_u8(wfull, full, MAX_PATH);
+        char disp[64] = {0};
+        theme_read_display_name(full, disp, sizeof(disp));
+        if (!disp[0]) {
+            /* Fallback: filename without .ini */
+            char fnu8[128];
+            w_to_u8(fd.cFileName, fnu8, sizeof(fnu8));
+            int fl = (int)strlen(fnu8);
+            if (fl > 4 && (fnu8[fl-4]=='.')) fnu8[fl-4] = 0;
+            strncpy(disp, fnu8, sizeof(disp)-1);
+        }
+        ThemeEntry* t = &g_themes[g_theme_count++];
+        strncpy(t->display, disp, sizeof(t->display)-1); t->display[sizeof(t->display)-1] = 0;
+        strncpy(t->path, full, MAX_PATH-1);              t->path[MAX_PATH-1] = 0;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+/* Copy a theme file into %APPDATA%\filepathx\theme.ini, then reload. */
+static void theme_apply_file(const char* src_path) {
+    char dst[MAX_PATH];
+    app_data_file("theme.ini", dst, MAX_PATH);
+    WCHAR wsrc[MAX_PATH], wdst[MAX_PATH];
+    u8_to_w(src_path, wsrc, MAX_PATH);
+    u8_to_w(dst, wdst, MAX_PATH);
+    CopyFileW(wsrc, wdst, FALSE);
+    /* Remember the display name so the sidebar dropdown reflects it */
+    theme_read_display_name(src_path, g_theme_current, sizeof(g_theme_current));
+    theme_load();
+    g_needs_redraw = 1;
+}
+
+static void theme_load(void) {
+    theme_reset_defaults();
+    char fp[MAX_PATH];
+    app_data_file("theme.ini", fp, MAX_PATH);
+    /* Refresh display name from the active file */
+    {
+        char nm[64] = {0};
+        theme_read_display_name(fp, nm, sizeof(nm));
+        if (nm[0]) { strncpy(g_theme_current, nm, sizeof(g_theme_current)-1);
+                     g_theme_current[sizeof(g_theme_current)-1] = 0; }
+        else strcpy(g_theme_current, "Default");
+    }
+    FILE* f = u8_fopen(fp, "rb");
+    if (!f) { strcpy(g_theme_current, "Default"); return; }
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        /* Trim ends and comments */
+        int n = (int)strlen(line);
+        while (n > 0 && (line[n-1]=='\n' || line[n-1]=='\r' ||
+                         line[n-1]==' '  || line[n-1]=='\t')) line[--n] = 0;
+        char* p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == 0 || *p == ';' || *p == '#' || *p == '[') continue;
+        char* eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char* key = p;
+        char* val = eq + 1;
+        while (*val == ' ' || *val == '\t') val++;
+        /* Trim trailing space on key */
+        int kl = (int)strlen(key);
+        while (kl > 0 && (key[kl-1]==' ' || key[kl-1]=='\t')) key[--kl] = 0;
+        /* Case-insensitive key compare */
+        for (int i = 0; key[i]; i++)
+            if (key[i] >= 'A' && key[i] <= 'Z') key[i] += 32;
+
+        uint32_t c = parse_hex_color(val);
+        /* Support tweakcn / shadcn style names AND our internal names. */
+        if      (!strcmp(key, "background") || !strcmp(key, "bg"))        g_theme.bg = c;
+        else if (!strcmp(key, "foreground") || !strcmp(key, "text"))      g_theme.text = c;
+        else if (!strcmp(key, "muted-foreground") || !strcmp(key, "subtext")) g_theme.subtext = c;
+        else if (!strcmp(key, "dim"))                                     g_theme.dim = c;
+        else if (!strcmp(key, "primary") || !strcmp(key, "accent"))       g_theme.accent = c;
+        else if (!strcmp(key, "card") || !strcmp(key, "surface"))         g_theme.surface = c;
+        else if (!strcmp(key, "popover") || !strcmp(key, "header"))       g_theme.header = c;
+        else if (!strcmp(key, "sidebar") || !strcmp(key, "mantle"))       g_theme.mantle = c;
+        else if (!strcmp(key, "muted") || !strcmp(key, "hover"))          g_theme.hover = c;
+        else if (!strcmp(key, "selected") || !strcmp(key, "selection"))   g_theme.selected = c;
+        else if (!strcmp(key, "border") || !strcmp(key, "input"))         g_theme.border = c;
+        else if (!strcmp(key, "ring") || !strcmp(key, "overlay"))         g_theme.overlay = c;
+        else if (!strcmp(key, "scrollbar"))                               g_theme.scrollbar = c;
+        else if (!strcmp(key, "destructive") || !strcmp(key, "red"))      g_theme.red = c;
+        else if (!strcmp(key, "chart-2") || !strcmp(key, "green"))        g_theme.green = c;
+        else if (!strcmp(key, "chart-1") || !strcmp(key, "yellow"))       g_theme.yellow = c;
+        else if (!strcmp(key, "chart-3") || !strcmp(key, "peach"))        g_theme.peach = c;
+        /* unknown keys ignored on purpose so tweakcn exports work as-is */
+    }
+    fclose(f);
+    /* Update DWM title bar brightness so it matches the new theme. */
+    if (g_hwnd) {
+        uint32_t c = COL_BG;
+        int lum = (77 * ((c>>16)&0xFF) + 150 * ((c>>8)&0xFF) + 29 * (c&0xFF)) >> 8;
+        BOOL dark = (lum < 128);
+        DwmSetWindowAttribute(g_hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+    }
+    g_needs_redraw = 1;
 }
 
 /* ---- Per-folder view mode preferences ---- */
@@ -3035,6 +3222,8 @@ static void viewer_rename_commit(ViewerState* v) {
     viewer_rename_cancel(v);
 }
 
+static HFONT g_viewer_edit_font = NULL;
+
 static void viewer_rename_start(ViewerState* v) {
     if (v->edit_hwnd) return;
     if (v->cur_index < 0 || v->cur_index >= v->sibling_count) return;
@@ -3046,17 +3235,27 @@ static void viewer_rename_start(ViewerState* v) {
     WCHAR wstem[MAX_PATH];
     u8_to_w(stem, wstem, MAX_PATH);
 
+    /* Layout: centred panel near bottom, comfortably above the counter.
+       Panel provides the rounded background + label + hint; the EDIT is
+       borderless and lives inside the panel. */
     RECT rc; GetClientRect(v->hwnd, &rc);
-    int ew = 480, eh = 30;
+    int ew = 520;
+    int eh = 34;
     int ex = (rc.right - ew) / 2;
-    int ey = rc.bottom - 90;
+    int ey = rc.bottom - 110;
     v->edit_hwnd = CreateWindowExW(0, L"EDIT", wstem,
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | WS_BORDER,
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
         ex, ey, ew, eh, v->hwnd, NULL, GetModuleHandleW(NULL), NULL);
     if (!v->edit_hwnd) return;
-    HFONT font = (HFONT)SendMessageW(v->hwnd, WM_GETFONT, 0, 0);
-    if (!font) font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-    SendMessageW(v->edit_hwnd, WM_SETFONT, (WPARAM)font, TRUE);
+    if (!g_viewer_edit_font) {
+        g_viewer_edit_font = CreateFontW(-15, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+            DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH|FF_DONTCARE, L"Segoe UI");
+    }
+    SendMessageW(v->edit_hwnd, WM_SETFONT, (WPARAM)g_viewer_edit_font, TRUE);
+    /* Left/right margin inside the EDIT so text isn't glued to the border */
+    SendMessageW(v->edit_hwnd, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                 MAKELPARAM(10, 10));
     WNDPROC prev = (WNDPROC)SetWindowLongPtrW(v->edit_hwnd, GWLP_WNDPROC,
                                               (LONG_PTR)viewer_edit_subclass);
     if (!g_viewer_edit_orig_proc) g_viewer_edit_orig_proc = prev;
@@ -3119,36 +3318,210 @@ static void viewer_delete(ViewerState* v) {
     viewer_load_current(v);
 }
 
-/* ---- Toolbar button hit-test helper ---- */
-static void viewer_btn_rects(int cw, int* rx, int* dx, int* btn_w, int* btn_h, int* by) {
-    *btn_w = 86; *btn_h = 28; *by = 12;
-    *dx = cw - *btn_w - 12;
-    *rx = *dx - *btn_w - 8;
+/* ---- Toolbar layout ---- */
+/* Button IDs (hover_btn values):
+   1=Rename, 2=Delete, 3=Rotate Left, 4=Rotate Right, 5=Flip H, 6=Flip V. */
+typedef struct { int x, y, w, h, id; const WCHAR* label; int accent_kind; } ViewerBtn;
+/* accent_kind: 0=none (neutral text), 1=accent color, 2=red */
+
+static int viewer_layout_buttons(int cw, ViewerBtn* out /* size >= 6 */) {
+    int bh = 28, by = 12;
+    int gap = 6;
+    /* Left cluster (transform actions) — icon-like square-ish buttons */
+    int transform_w = 40;
+    int lx = 12;
+    out[0].x = lx;                            out[0].y = by; out[0].w = transform_w; out[0].h = bh;
+    out[0].id = 3; out[0].label = L"↺";       out[0].accent_kind = 0;
+    out[1].x = lx + transform_w + gap;        out[1].y = by; out[1].w = transform_w; out[1].h = bh;
+    out[1].id = 4; out[1].label = L"↻";       out[1].accent_kind = 0;
+    out[2].x = lx + 2*(transform_w + gap);    out[2].y = by; out[2].w = transform_w; out[2].h = bh;
+    out[2].id = 5; out[2].label = L"⇔";      out[2].accent_kind = 0;
+    out[3].x = lx + 3*(transform_w + gap);    out[3].y = by; out[3].w = transform_w; out[3].h = bh;
+    out[3].id = 6; out[3].label = L"⇕";      out[3].accent_kind = 0;
+    /* Right cluster: Rename, Delete */
+    int rename_w = 86, delete_w = 86;
+    int rx = cw - 12 - delete_w - gap - rename_w;
+    out[4].x = rx;                            out[4].y = by; out[4].w = rename_w; out[4].h = bh;
+    out[4].id = 1; out[4].label = L"Rename";  out[4].accent_kind = 1;
+    out[5].x = rx + rename_w + gap;           out[5].y = by; out[5].w = delete_w; out[5].h = bh;
+    out[5].id = 2; out[5].label = L"Delete";  out[5].accent_kind = 2;
+    return 6;
 }
 
 static int viewer_hit_btn(ViewerState* v, int x, int y) {
-    int rx, dx, bw, bh, by;
-    viewer_btn_rects(v->client_w, &rx, &dx, &bw, &bh, &by);
-    if (y < by || y >= by + bh) return 0;
-    if (x >= rx && x < rx + bw) return 1;
-    if (x >= dx && x < dx + bw) return 2;
+    ViewerBtn btns[6];
+    int n = viewer_layout_buttons(v->client_w, btns);
+    for (int i = 0; i < n; i++) {
+        if (x >= btns[i].x && x < btns[i].x + btns[i].w &&
+            y >= btns[i].y && y < btns[i].y + btns[i].h)
+            return btns[i].id;
+    }
     return 0;
+}
+
+/* Convert an ARGB constant (COL_*) to the BGR-packed COLORREF that GDI
+   wants. Alpha is dropped since GDI ignores it here. */
+static COLORREF col_to_ref(uint32_t c) {
+    return RGB((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+}
+
+/* Transform a 32-bpp DIB into a new one. op:
+     0 = rotate 90° clockwise      (swaps dimensions)
+     1 = rotate 90° counterclockwise (swaps dimensions)
+     2 = flip horizontal
+     3 = flip vertical
+   Returns a fresh HBITMAP (caller deletes the old one). NULL on error. */
+static HBITMAP viewer_bmp_transform(HBITMAP src, int op, int* out_w, int* out_h) {
+    DIBSECTION ds = {0};
+    if (GetObject(src, sizeof(ds), &ds) == 0 || !ds.dsBm.bmBits) return NULL;
+    int sw = ds.dsBm.bmWidth;
+    int sh = (ds.dsBm.bmHeight < 0) ? -ds.dsBm.bmHeight : ds.dsBm.bmHeight;
+    int src_topdown = (ds.dsBmih.biHeight < 0);
+    int stride = ds.dsBm.bmWidthBytes;
+    unsigned char* sbits = (unsigned char*)ds.dsBm.bmBits;
+
+    int dw = sw, dh = sh;
+    if (op == 0 || op == 1) { dw = sh; dh = sw; }
+
+    BITMAPINFO bmi = {0};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = dw;
+    bmi.bmiHeader.biHeight = -dh;   /* top-down */
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* dbits = NULL;
+    HDC dc = CreateCompatibleDC(NULL);
+    HBITMAP dst = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &dbits, NULL, 0);
+    DeleteDC(dc);
+    if (!dst || !dbits) { if (dst) DeleteObject(dst); return NULL; }
+    int dstride = dw * 4;
+
+    for (int y = 0; y < sh; y++) {
+        int src_y = src_topdown ? y : (sh - 1 - y);
+        unsigned char* srow = sbits + src_y * stride;
+        for (int x = 0; x < sw; x++) {
+            unsigned char* sp = srow + x * 4;
+            int dx, dy;
+            switch (op) {
+                case 0: dx = sh - 1 - y; dy = x;             break;
+                case 1: dx = y;          dy = sw - 1 - x;    break;
+                case 2: dx = sw - 1 - x; dy = y;             break;
+                case 3: dx = x;          dy = sh - 1 - y;    break;
+                default: dx = x; dy = y;                     break;
+            }
+            unsigned char* dp = (unsigned char*)dbits + dy * dstride + dx * 4;
+            dp[0] = sp[0]; dp[1] = sp[1]; dp[2] = sp[2]; dp[3] = sp[3];
+        }
+    }
+    if (out_w) *out_w = dw;
+    if (out_h) *out_h = dh;
+    return dst;
+}
+
+/* Session-scoped record of transforms applied per image, so navigating
+   away and coming back preserves rotation / flip until the app exits. */
+#define VIEWER_XFORM_CAP  500
+#define VIEWER_XFORM_OPS  16
+typedef struct {
+    char          path[MAX_PATH];
+    unsigned char ops[VIEWER_XFORM_OPS];
+    int           n_ops;
+} ViewerXform;
+static ViewerXform g_viewer_xforms[VIEWER_XFORM_CAP];
+static int         g_viewer_xform_count = 0;
+
+static ViewerXform* viewer_xform_lookup(const char* path, int create) {
+    for (int i = 0; i < g_viewer_xform_count; i++) {
+        if (_stricmp(g_viewer_xforms[i].path, path) == 0) return &g_viewer_xforms[i];
+    }
+    if (!create) return NULL;
+    if (g_viewer_xform_count >= VIEWER_XFORM_CAP) {
+        /* Evict oldest (simple FIFO) */
+        memmove(&g_viewer_xforms[0], &g_viewer_xforms[1],
+                (VIEWER_XFORM_CAP - 1) * sizeof(ViewerXform));
+        g_viewer_xform_count = VIEWER_XFORM_CAP - 1;
+    }
+    ViewerXform* x = &g_viewer_xforms[g_viewer_xform_count++];
+    strncpy(x->path, path, MAX_PATH-1); x->path[MAX_PATH-1] = 0;
+    x->n_ops = 0;
+    return x;
+}
+
+static void viewer_full_path(ViewerState* v, char* out, int n) {
+    if (v->cur_index < 0 || v->cur_index >= v->sibling_count) { out[0] = 0; return; }
+    _snprintf(out, n, "%s\\%s", v->dir, v->siblings[v->cur_index]);
+}
+
+/* Apply any saved ops to v->bmp; called from the loaded-image handler so
+   navigation restores the rotation state. */
+static void viewer_replay_saved_ops(ViewerState* v) {
+    char full[MAX_PATH];
+    viewer_full_path(v, full, MAX_PATH);
+    if (!full[0] || !v->bmp) return;
+    ViewerXform* x = viewer_xform_lookup(full, 0);
+    if (!x || x->n_ops == 0) return;
+    for (int i = 0; i < x->n_ops; i++) {
+        int nw = 0, nh = 0;
+        HBITMAP nb = viewer_bmp_transform(v->bmp, x->ops[i], &nw, &nh);
+        if (!nb) break;
+        DeleteObject(v->bmp);
+        v->bmp = nb; v->img_w = nw; v->img_h = nh;
+    }
+}
+
+static void viewer_apply_transform(ViewerState* v, int op) {
+    if (!v->bmp) return;
+    int nw = 0, nh = 0;
+    HBITMAP nb = viewer_bmp_transform(v->bmp, op, &nw, &nh);
+    if (!nb) return;
+    DeleteObject(v->bmp);
+    v->bmp = nb;
+    v->img_w = nw; v->img_h = nh;
+    v->zoom = 1.0f; v->pan_x = v->pan_y = 0;
+
+    /* Remember this op so we can replay it after Next/Prev round-trip */
+    char full[MAX_PATH];
+    viewer_full_path(v, full, MAX_PATH);
+    if (full[0]) {
+        ViewerXform* x = viewer_xform_lookup(full, 1);
+        if (x) {
+            if (x->n_ops >= VIEWER_XFORM_OPS) {
+                /* Cap reached — shift left and keep the newest */
+                for (int i = 0; i < VIEWER_XFORM_OPS - 1; i++) x->ops[i] = x->ops[i+1];
+                x->n_ops = VIEWER_XFORM_OPS - 1;
+            }
+            x->ops[x->n_ops++] = (unsigned char)op;
+        }
+    }
+    InvalidateRect(v->hwnd, NULL, FALSE);
 }
 
 static void viewer_paint(ViewerState* v, HDC hdc) {
     RECT rc; GetClientRect(v->hwnd, &rc);
     int cw = rc.right, ch = rc.bottom;
     v->client_w = cw; v->client_h = ch;
+
+    /* Colours from the active theme */
+    COLORREF t_bg      = col_to_ref(COL_BG);
+    COLORREF t_text    = col_to_ref(COL_TEXT);
+    COLORREF t_subtext = col_to_ref(COL_SUBTEXT);
+    COLORREF t_header  = col_to_ref(COL_HEADER);
+    COLORREF t_hover   = col_to_ref(COL_HOVER);
+    COLORREF t_border  = col_to_ref(COL_BORDER);
+    COLORREF t_accent  = col_to_ref(COL_ACCENT);
+    COLORREF t_red     = col_to_ref(COL_RED);
+
     /* Double-buffer to avoid flicker on resize / zoom updates */
     HDC mem = CreateCompatibleDC(hdc);
     HBITMAP back = CreateCompatibleBitmap(hdc, cw, ch);
     HBITMAP oldb = (HBITMAP)SelectObject(mem, back);
-    HBRUSH bg = CreateSolidBrush(RGB(0x1E, 0x20, 0x25));
+    HBRUSH bg = CreateSolidBrush(t_bg);
     FillRect(mem, &rc, bg);
     DeleteObject(bg);
 
     if (!v->bmp || v->img_w <= 0 || v->img_h <= 0) {
-        SetTextColor(mem, RGB(0xAA, 0xAA, 0xAA));
+        SetTextColor(mem, t_subtext);
         SetBkMode(mem, TRANSPARENT);
         if (v->loading) {
             WCHAR buf[128];
@@ -3184,38 +3557,85 @@ static void viewer_paint(ViewerState* v, HDC hdc) {
         if (v->sibling_count > 1) {
             WCHAR buf[64];
             _snwprintf(buf, 64, L"%d / %d", v->cur_index + 1, v->sibling_count);
-            SetTextColor(mem, RGB(0xCC, 0xCC, 0xCC));
+            SetTextColor(mem, t_subtext);
             SetBkMode(mem, TRANSPARENT);
             RECT rc2 = { 0, ch - 30, cw, ch - 6 };
             DrawTextW(mem, buf, -1, &rc2, DT_CENTER | DT_SINGLELINE);
         }
     }
 
-    /* ---- Toolbar buttons (top-right) ---- */
-    {
-        int rx, dx, bw, bh, by;
-        viewer_btn_rects(cw, &rx, &dx, &bw, &bh, &by);
-        struct { int x; int hover; COLORREF accent; const WCHAR* label; } btns[] = {
-            { rx, v->hover_btn == 1, RGB(0x35, 0xBC, 0xFE), L"Rename" },
-            { dx, v->hover_btn == 2, RGB(0xE0, 0x4F, 0x4F), L"Delete" },
-        };
+    /* ---- Rename panel (when EDIT is active) ---- */
+    if (v->edit_hwnd) {
+        RECT er;
+        GetWindowRect(v->edit_hwnd, &er);
+        POINT tl = { er.left, er.top }, br = { er.right, er.bottom };
+        ScreenToClient(v->hwnd, &tl);
+        ScreenToClient(v->hwnd, &br);
+        int px = tl.x - 16;
+        int py = tl.y - 44;
+        int pw = (br.x - tl.x) + 32;
+        int ph = (br.y - tl.y) + 82;   /* label top + edit + hint below */
+
+        /* Drop shadow (2 offset copies for soft feel) */
+        HBRUSH sh1 = CreateSolidBrush(RGB(0, 0, 0));
+        RECT sr1 = { px + 3, py + 4, px + pw + 3, py + ph + 4 };
+        int old_mode = SetROP2(mem, R2_MASKPEN);
+        FillRect(mem, &sr1, sh1);
+        SetROP2(mem, old_mode);
+        DeleteObject(sh1);
+
+        /* Panel bg + border */
+        HBRUSH pb = CreateSolidBrush(t_header);
+        HPEN   pp = CreatePen(PS_SOLID, 1, t_border);
+        HGDIOBJ ob = SelectObject(mem, pb);
+        HGDIOBJ op = SelectObject(mem, pp);
+        RoundRect(mem, px, py, px + pw, py + ph, 12, 12);
+        SelectObject(mem, ob); SelectObject(mem, op);
+        DeleteObject(pb); DeleteObject(pp);
+
+        /* Label */
         SetBkMode(mem, TRANSPARENT);
-        for (int i = 0; i < 2; i++) {
-            RECT br = { btns[i].x, by, btns[i].x + bw, by + bh };
-            HBRUSH bb = CreateSolidBrush(btns[i].hover
-                ? RGB(0x40, 0x44, 0x50) : RGB(0x2A, 0x2D, 0x35));
-            FillRect(mem, &br, bb);
-            DeleteObject(bb);
-            HPEN border = CreatePen(PS_SOLID, 1, btns[i].hover ? btns[i].accent : RGB(0x50, 0x55, 0x60));
-            HGDIOBJ oldp = SelectObject(mem, border);
-            HGDIOBJ oldb = SelectObject(mem, GetStockObject(NULL_BRUSH));
-            Rectangle(mem, br.left, br.top, br.right, br.bottom);
-            SelectObject(mem, oldp); SelectObject(mem, oldb);
-            DeleteObject(border);
-            SetTextColor(mem, btns[i].hover ? btns[i].accent : RGB(0xCC, 0xCC, 0xCC));
+        SetTextColor(mem, t_subtext);
+        RECT lr = { px + 16, py + 10, px + pw - 16, py + 28 };
+        DrawTextW(mem, L"Rename file", -1, &lr, DT_LEFT | DT_SINGLELINE);
+
+        /* Hint below the EDIT */
+        RECT hr = { px + 16, br.y + 10, px + pw - 16, py + ph - 8 };
+        SetTextColor(mem, t_subtext);
+        DrawTextW(mem, L"Enter to save   ·   Esc to cancel", -1, &hr,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    /* ---- Toolbar buttons ---- */
+    {
+        ViewerBtn btns[6];
+        int nb_btns = viewer_layout_buttons(cw, btns);
+        /* Use a slightly larger font for the arrow glyphs so they're not tiny */
+        HFONT bfont = CreateFontW(-15, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+            DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH|FF_DONTCARE, L"Segoe UI Symbol");
+        HGDIOBJ oldfnt = SelectObject(mem, bfont);
+        SetBkMode(mem, TRANSPARENT);
+        for (int i = 0; i < nb_btns; i++) {
+            int hover = (v->hover_btn == btns[i].id);
+            COLORREF accent =
+                (btns[i].accent_kind == 2) ? t_red :
+                (btns[i].accent_kind == 1) ? t_accent : t_accent;
+            RECT br = { btns[i].x, btns[i].y,
+                        btns[i].x + btns[i].w, btns[i].y + btns[i].h };
+            HBRUSH bb = CreateSolidBrush(hover ? t_hover : t_header);
+            HPEN   border = CreatePen(PS_SOLID, 1, hover ? accent : t_border);
+            HGDIOBJ old_b = SelectObject(mem, bb);
+            HGDIOBJ old_p = SelectObject(mem, border);
+            RoundRect(mem, br.left, br.top, br.right, br.bottom, 10, 10);
+            SelectObject(mem, old_b); SelectObject(mem, old_p);
+            DeleteObject(bb); DeleteObject(border);
+            SetTextColor(mem, hover ? accent : t_text);
             DrawTextW(mem, btns[i].label, -1, &br,
                       DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
+        SelectObject(mem, oldfnt);
+        DeleteObject(bfont);
     }
 
     BitBlt(hdc, 0, 0, cw, ch, mem, 0, 0, SRCCOPY);
@@ -3250,6 +3670,10 @@ static LRESULT CALLBACK viewer_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                               InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (wp == VK_F2)    { viewer_rename_start(v); return 0; }
         if (wp == VK_DELETE){ viewer_delete(v); return 0; }
+        if (wp == 'R')      { viewer_apply_transform(v, 0); return 0; }  /* Rotate right */
+        if (wp == 'L')      { viewer_apply_transform(v, 1); return 0; }  /* Rotate left */
+        if (wp == 'H')      { viewer_apply_transform(v, 2); return 0; }  /* Flip horizontal */
+        if (wp == 'V')      { viewer_apply_transform(v, 3); return 0; }  /* Flip vertical */
         break;
     case WM_MOUSEWHEEL: {
         if (!v) break;
@@ -3274,6 +3698,10 @@ static LRESULT CALLBACK viewer_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int bhit = viewer_hit_btn(v, x, y);
             if (bhit == 1) { viewer_rename_start(v); return 0; }
             if (bhit == 2) { viewer_delete(v); return 0; }
+            if (bhit == 3) { viewer_apply_transform(v, 1); return 0; }  /* Rotate Left */
+            if (bhit == 4) { viewer_apply_transform(v, 0); return 0; }  /* Rotate Right */
+            if (bhit == 5) { viewer_apply_transform(v, 2); return 0; }  /* Flip H */
+            if (bhit == 6) { viewer_apply_transform(v, 3); return 0; }  /* Flip V */
             int edge = v->client_w / 6;
             if (x < edge)                 { viewer_next(v, -1); return 0; }
             if (x > v->client_w - edge)   { viewer_next(v, +1); return 0; }
@@ -3323,9 +3751,28 @@ static LRESULT CALLBACK viewer_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         memcpy(v->date_taken, res->date_taken, sizeof(v->date_taken));
         v->loading = 0;
         free(res);
+        /* Replay any rotate / flip ops stashed for this path so
+           navigating away and back preserves the transform. */
+        viewer_replay_saved_ops(v);
         viewer_update_title(v);
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
+    }
+    case WM_CTLCOLOREDIT: {
+        if (!v || (HWND)lp != v->edit_hwnd) break;
+        HDC hdc_e = (HDC)wp;
+        COLORREF fg = col_to_ref(COL_TEXT);
+        COLORREF bg = col_to_ref(COL_BG);
+        SetTextColor(hdc_e, fg);
+        SetBkColor  (hdc_e, bg);
+        static HBRUSH cached = NULL;
+        static COLORREF last_bg = 0;
+        if (!cached || last_bg != bg) {
+            if (cached) DeleteObject(cached);
+            cached = CreateSolidBrush(bg);
+            last_bg = bg;
+        }
+        return (LRESULT)cached;
     }
     case WM_DESTROY:
         if (v) {
@@ -3383,8 +3830,13 @@ static void open_image_viewer(const char* path) {
     if (!vh) { if (v->siblings) free(v->siblings); free(v); return; }
     v->hwnd = vh;
     SetWindowLongPtrW(vh, GWLP_USERDATA, (LONG_PTR)v);
-    BOOL dark = TRUE;
-    DwmSetWindowAttribute(vh, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+    /* Match DWM title bar to theme brightness — luminance > ~50% → light bar. */
+    {
+        uint32_t c = COL_BG;
+        int lum = (77 * ((c>>16)&0xFF) + 150 * ((c>>8)&0xFF) + 29 * (c&0xFF)) >> 8;
+        BOOL dark = (lum < 128);
+        DwmSetWindowAttribute(vh, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+    }
     ShowWindow(vh, SW_SHOW);
     viewer_load_current(v);
 }
@@ -4492,6 +4944,61 @@ static void build_sidebar(void) {
     }
     render_scissor_reset(r);
     render_quad(r, SIDEBAR_W-1, CONTENT_TOP, 1, h, COL_BORDER);
+
+    /* ---- Theme selector button at bottom of sidebar ---- */
+    {
+        float btn_h = 28;
+        float btn_x = x + 6;
+        float btn_y = y + h - btn_h - 6;
+        float btn_w = w - 12;
+        int hov = ui_hover(&g_ui, btn_x, btn_y, btn_w, btn_h);
+        render_quad(r, btn_x, btn_y, btn_w, btn_h, hov ? COL_HOVER : COL_BG);
+        render_quad(r, btn_x, btn_y, btn_w, 1, COL_BORDER);
+        render_quad(r, btn_x, btn_y + btn_h - 1, btn_w, 1, COL_BORDER);
+        render_quad(r, btn_x, btn_y, 1, btn_h, COL_BORDER);
+        render_quad(r, btn_x + btn_w - 1, btn_y, 1, btn_h, COL_BORDER);
+        /* Paint chip: current accent color at left */
+        render_quad(r, btn_x + 8, btn_y + (btn_h - 12) / 2, 12, 12, COL_ACCENT);
+        /* Theme label */
+        float lbl_x = btn_x + 26;
+        float lbl_y = floorf(btn_y + (btn_h - r->font_height) / 2);
+        int lbl_max = (int)(btn_w - 44);
+        int nl = (int)strlen(g_theme_current);
+        while (nl > 0 && render_text_width_n(r, g_theme_current, nl) > lbl_max) nl--;
+        render_text_n(r, g_theme_current, nl, lbl_x, lbl_y, COL_TEXT);
+        /* Chevron up (menu opens upward) */
+        render_mdl2(r, ICON_CHEVRON_UP,
+                    btn_x + btn_w - 16, btn_y + (btn_h - 8) / 2, 8, COL_SUBTEXT);
+
+        if (hov && g_ui.input.mouse_clicked) {
+            /* Rescan on every click so newly-dropped .ini files show up */
+            theme_discover();
+            HMENU m = CreatePopupMenu();
+            if (g_theme_count == 0) {
+                AppendMenuA(m, MF_GRAYED, 0, "(no themes/*.ini found)");
+            } else {
+                for (int i = 0; i < g_theme_count; i++) {
+                    UINT flags = MF_STRING;
+                    if (_stricmp(g_theme_current, g_themes[i].display) == 0)
+                        flags |= MF_CHECKED;
+                    AppendMenuA(m, flags, 4000 + i, g_themes[i].display);
+                }
+                AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+                AppendMenuA(m, MF_STRING, 4999, "Reload current  (Ctrl+Shift+T)");
+            }
+            POINT pt = { (int)btn_x, (int)btn_y };
+            ClientToScreen(g_hwnd, &pt);
+            int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_BOTTOMALIGN,
+                                     pt.x, pt.y, 0, g_hwnd, NULL);
+            DestroyMenu(m);
+            if (cmd >= 4000 && cmd < 4000 + g_theme_count) {
+                theme_apply_file(g_themes[cmd - 4000].path);
+            } else if (cmd == 4999) {
+                theme_load();
+                g_needs_redraw = 1;
+            }
+        }
+    }
 }
 
 static void build_column_headers(float lx, float ly, float lw) {
@@ -4580,7 +5087,7 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
             int row = slot / cols, col = slot % cols;
             slot++;
             float ix = lx + 4 + col * item_w;
-            float iy = ly + 4 + row * item_h - t->scroll_y;
+            float iy = floorf(ly + 4 + row * item_h - t->scroll_y);
             if (iy + item_h < ly || iy > ly + lh) continue;
 
             float iw = item_w - 4, ih = item_h - 4;
@@ -4878,7 +5385,10 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
     if (last > row_count) last = row_count;
 
     for (int ri = first; ri < last; ri++) {
-        float ry = ly + ri * ROW_H - t->scroll_y;
+        /* Snap row Y to integer pixel — otherwise smooth-scroll's fractional
+           scroll_y offsets every glyph a sub-pixel, and the atlas's LINEAR
+           filter turns antialised text into a soft ghost. */
+        float ry = floorf(ly + ri * ROW_H - t->scroll_y);
         float rw = lw - 8;
         int code = rows[ri];
 
@@ -4980,13 +5490,9 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
             int ctrl  = GetKeyState(VK_CONTROL) < 0;
             int shift = GetKeyState(VK_SHIFT) < 0;
             if (g_app.panels[g_app.active_panel].last_click_item == i && (now - g_app.panels[g_app.active_panel].last_click_time) < 400 && !ctrl && !shift) {
-                if (e->is_dir) {
-                    if (strcmp(e->name,"..") == 0) tab_go_up(t);
-                    else { char p[MAX_PATH]; _snprintf(p,MAX_PATH,"%s\\%s",t->path,e->name); tab_navigate(t,p,1); }
-                } else {
-                    WCHAR wp[MAX_PATH]; path_join_w(t->path, e->name, wp, MAX_PATH);
-                    ShellExecuteW(NULL, L"open", wp, NULL, NULL, SW_SHOW);
-                }
+                /* Route through do_open_entry so image files land in the
+                   built-in viewer instead of the system default app. */
+                do_open_entry(t, i);
                 g_app.panels[g_app.active_panel].last_click_item = -1;
             } else {
                 if (shift) {
@@ -5207,12 +5713,12 @@ static void build_fuzzy_finder(void) {
     if (g_ff_scanning) {
         static const char* fr2[] = {"⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧"};
         int fi2 = (GetTickCount() / 80) & 7;
-        render_text(r, fr2[fi2], ff_x + 18, ff_y + 8 + (in_h - r->font_height) / 2, COL_ACCENT);
+        render_text(r, fr2[fi2], ff_x + 18, floorf(ff_y + 8 + (in_h - r->font_height) / 2), COL_ACCENT);
     } else {
         render_mdl2(r, ICON_SEARCH, ff_x + 18, ff_y + 8 + (in_h - 14) / 2, 14, COL_SUBTEXT);
     }
     float tx = ff_x + 40;
-    float ty = ff_y + 8 + (in_h - r->font_height) / 2;
+    float ty = floorf(ff_y + 8 + (in_h - r->font_height) / 2);
     if (g_ff_query_len > 0) render_text_n(r, g_ff_query, g_ff_query_len, tx, ty, COL_TEXT);
     else                    render_text(r, "Type to filter…", tx, ty, COL_DIM);
     /* Blinking cursor at g_ff_cursor position */
@@ -5277,7 +5783,7 @@ static void build_fuzzy_finder(void) {
 
         /* Name with per-char highlight */
         float nx = list_x + 28;
-        float ny = ry + (row_h - r->font_height) / 2;
+        float ny = floorf(ry + (row_h - r->font_height) / 2);
         int mi = 0;
         int nlen = (int)strlen(fe->name);
         int seg_start = 0;
@@ -5887,6 +6393,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else if (wp=='D' && ctrl) { handle_context_cmd(IDM_OPEN_TERMINAL, -1); }
         else if (wp=='N' && ctrl && shift) { do_new_folder(t); }
         else if (wp=='N' && ctrl) { do_new_file(t); }
+        else if (wp=='T' && ctrl && shift) { theme_load(); }
         else if (wp=='T' && ctrl) { new_tab(t->path); g_needs_redraw=1; }
         else if (wp == VK_TAB && (ctrl || shift)) {
             Panel* p = &g_app.panels[g_app.active_panel];
@@ -5993,24 +6500,31 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
-    case WM_CTLCOLOREDIT:
-        if ((HWND)lp == g_edit_hwnd) {
-            HDC hdc_edit = (HDC)wp;
-            SetTextColor(hdc_edit, RGB(0xFF, 0xFF, 0xFF));
-            SetBkColor(hdc_edit, RGB(0x36, 0x40, 0x60));
-            if (!g_edit_bg_brush)
-                g_edit_bg_brush = CreateSolidBrush(RGB(0x36, 0x40, 0x60));
-            return (LRESULT)g_edit_bg_brush;
+    case WM_CTLCOLOREDIT: {
+        if ((HWND)lp != g_edit_hwnd && (HWND)lp != g_addr_hwnd) break;
+        HDC hdc_edit = (HDC)wp;
+        /* Pull colours from the active theme so light themes get dark text
+           on a light background instead of the old hardcoded pair. Cached
+           brushes are dropped and recreated when the colour changes so
+           Ctrl+Shift+T (theme reload) picks up immediately. */
+        COLORREF fg = RGB((COL_TEXT     >> 16) & 0xFF,
+                          (COL_TEXT     >> 8)  & 0xFF,
+                           COL_TEXT             & 0xFF);
+        COLORREF bg = RGB((COL_SELECTED >> 16) & 0xFF,
+                          (COL_SELECTED >> 8)  & 0xFF,
+                           COL_SELECTED         & 0xFF);
+        SetTextColor(hdc_edit, fg);
+        SetBkColor  (hdc_edit, bg);
+        HBRUSH* slot = ((HWND)lp == g_edit_hwnd) ? &g_edit_bg_brush : &g_addr_bg_brush;
+        static COLORREF last_edit_bg = 0, last_addr_bg = 0;
+        COLORREF* last = ((HWND)lp == g_edit_hwnd) ? &last_edit_bg : &last_addr_bg;
+        if (!*slot || *last != bg) {
+            if (*slot) DeleteObject(*slot);
+            *slot = CreateSolidBrush(bg);
+            *last = bg;
         }
-        if ((HWND)lp == g_addr_hwnd) {
-            HDC hdc_edit = (HDC)wp;
-            SetTextColor(hdc_edit, RGB(0xFF, 0xFF, 0xFF));
-            SetBkColor(hdc_edit, RGB(0x36, 0x40, 0x60));
-            if (!g_addr_bg_brush)
-                g_addr_bg_brush = CreateSolidBrush(RGB(0x36, 0x40, 0x60));
-            return (LRESULT)g_addr_bg_brush;
-        }
-        break;
+        return (LRESULT)*slot;
+    }
 
     case WM_ERASEBKGND: return 1;
     case WM_CLOSE: PostQuitMessage(0); return 0;
@@ -6089,9 +6603,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int cmdShow)
         (sx-g_width)/2, (sy-g_height)/2, g_width, g_height,
         NULL, NULL, hInst, NULL);
 
-    /* Dark mode */
-    BOOL dark = TRUE;
-    DwmSetWindowAttribute(g_hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+    /* Dark/light title bar based on theme background luminance */
+    {
+        uint32_t c = COL_BG;
+        int lum = (77 * ((c>>16)&0xFF) + 150 * ((c>>8)&0xFF) + 29 * (c&0xFF)) >> 8;
+        BOOL dark = (lum < 128);
+        DwmSetWindowAttribute(g_hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+    }
 
     /* Extend DWM frame for shadow on borderless window */
     MARGINS margins = {0, 0, 0, 1};
@@ -6123,11 +6641,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int cmdShow)
         "functions could not be resolved. Update your GPU driver.";
     else if (!render_init(&g_renderer)) fail =
         "OpenGL shader / VBO setup failed.";
-    else if (!render_create_font(&g_renderer, "Segoe UI Semibold", 12)) fail =
-        "Could not create the primary font 'Segoe UI Semibold'.\n"
+    else if (!render_create_font(&g_renderer, "Segoe UI", 11)) fail =
+        "Could not create the primary font 'Segoe UI'.\n"
         "Install the Segoe UI font family.";
-    else if (!render_create_font_small(&g_renderer, "Segoe UI Semibold", 11)) fail =
-        "Could not create the small font 'Segoe UI Semibold'.";
+    else if (!render_create_font_small(&g_renderer, "Segoe UI", 10)) fail =
+        "Could not create the small font 'Segoe UI'.";
     else if (!render_create_icons(&g_renderer, 16)) fail =
         "Could not load the MDL2 icon font 'Segoe MDL2 Assets'.\n"
         "This font ships with Windows 10 and 11. On older Windows you\n"
@@ -6145,6 +6663,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int cmdShow)
     g_app.panels[1].last_click_item = -1;
     sort_prefs_load();
     view_prefs_load();
+    theme_load();
+    theme_discover();
     init_sidebar();
 
     char cwd[MAX_PATH] = {0};
