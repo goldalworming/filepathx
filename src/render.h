@@ -122,7 +122,9 @@ GL_FUNCS
 #define ICON_CHEVRON_UP    16
 #define ICON_CHEVRON_LEFT  17
 #define ICON_LINK          18
-#define ICON_COUNT         19
+#define ICON_SEARCH        19
+#define ICON_CHECK         20
+#define ICON_COUNT         21
 
 /* ---- Glyph / Font ---- */
 typedef struct {

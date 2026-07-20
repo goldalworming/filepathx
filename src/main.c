@@ -450,8 +450,55 @@ static int  g_batch_typed_len = 0;
 static int  g_batch_chop = 0;
 static UINT     g_cf_drop_effect;
 
+/* ---- Fuzzy finder (Ctrl+F) ---- */
+#define FF_MAX_INDEX     20000
+#define FF_QUERY_MAX     128
+#define FF_RESULT_MAX    200
+#define FF_MATCH_MARKS   32     /* max highlighted char positions per name */
+
+typedef struct {
+    char name[MAX_PATH];    /* file / folder name (leaf) */
+    char rel[MAX_PATH];     /* path relative to root, without leaf */
+    int  is_dir;
+} FFEntry;
+
+typedef struct {
+    int   entry_idx;
+    int   score;
+    int   n_marks;
+    short marks[FF_MATCH_MARKS];   /* byte offsets into name that matched */
+} FFResult;
+
+static int     g_ff_active   = 0;
+static int     g_ff_panel    = -1;
+static char    g_ff_query[FF_QUERY_MAX];
+static int     g_ff_query_len = 0;
+static int     g_ff_cursor    = 0;   /* byte offset into g_ff_query, 0..query_len */
+static int     g_ff_recursive = 0;
+static int     g_ff_selected  = 0;
+static int     g_ff_scroll    = 0;
+static FFEntry g_ff_index[FF_MAX_INDEX];
+static int     g_ff_index_count = 0;
+static FFResult g_ff_results[FF_RESULT_MAX];
+static int     g_ff_result_count = 0;
+static char    g_ff_root[MAX_PATH];   /* root path used to build the index */
+/* Recursive scan runs on a worker so the UI stays live */
+static HANDLE  g_ff_scan_thread = NULL;
+static volatile LONG g_ff_scan_cancel = 0;
+static volatile LONG g_ff_scan_gen    = 0;   /* bumped on each new scan */
+static CRITICAL_SECTION g_ff_cs;
+static int     g_ff_cs_init = 0;
+static volatile int g_ff_scanning = 0;
+
 /* Forward decls */
 static void scroll_to_entry(Tab* t, int idx);
+static void ff_open(void);
+static void ff_close(void);
+static void ff_refresh_results(void);
+static void ff_build_index_from_tab(void);
+static void ff_kick_recursive_scan(void);
+static int  ff_score_match(const char* name, const char* query, int qlen,
+                           short* marks, int* n_marks);
 static void sel_clear(Tab* t);
 static void sel_only(Tab* t, int i);
 static void sel_range(Tab* t, int from, int to);
@@ -1015,8 +1062,8 @@ static void scan_directory(Tab* tab) {
     tab->selected = -1;
     tab->sel_anchor = -1;
     memset(tab->sel_mask, 0, sizeof(tab->sel_mask));
-    tab->use_groups = (g_downloads_path[0] && path_eq_ci(tab->path, g_downloads_path));
-    tab->view_mode  = view_prefs_lookup(tab->path);
+    int is_downloads = (g_downloads_path[0] && path_eq_ci(tab->path, g_downloads_path));
+    tab->view_mode   = view_prefs_lookup(tab->path);
     refresh_today();
     WCHAR wpattern[MAX_PATH + 4];
     {
@@ -1039,16 +1086,25 @@ static void scan_directory(Tab* tab) {
         e->group = compute_group(e->modified);
     } while (FindNextFileW(h, &fd));
     FindClose(h);
-    if (tab->use_groups) {
-        g_sort_col_cmp = 2; g_sort_asc_cmp = 0; g_use_groups_cmp = 1;
-    } else {
+    /* Effective sort — respects the user's per-folder preference for
+       every folder including Downloads. Date-groups only kick in on
+       Downloads when the sort is date-modified descending (the natural
+       "recent activity" arrangement). Any other sort (name, size, or
+       ascending date) turns groups off and behaves like any other
+       folder. */
+    {
         int sc = g_app.sort_col, sa = g_app.sort_asc;
-        sort_prefs_lookup(tab->path, &sc, &sa);
+        if (!sort_prefs_lookup(tab->path, &sc, &sa) && is_downloads) {
+            /* First visit to Downloads: default to date desc so the
+               familiar date-grouped view shows up. */
+            sc = 2; sa = 0;
+        }
         g_app.sort_col = sc;
         g_app.sort_asc = sa;
-        g_sort_col_cmp = sc;
-        g_sort_asc_cmp = sa;
-        g_use_groups_cmp = 0;
+        tab->use_groups = is_downloads && (sc == 2 && sa == 0);
+        g_sort_col_cmp   = sc;
+        g_sort_asc_cmp   = sa;
+        g_use_groups_cmp = tab->use_groups;
     }
     qsort(tab->entries, tab->entry_count, sizeof(FileEntry), compare_entries);
 
@@ -2204,6 +2260,380 @@ static void focus_and_rename(Tab* t, const char* name) {
             return;
         }
     }
+}
+
+/* ---- Fuzzy finder ---- */
+
+/* Case-insensitive char compare */
+static int ff_ceq(char a, char b) {
+    if (a >= 'A' && a <= 'Z') a += 32;
+    if (b >= 'A' && b <= 'Z') b += 32;
+    return a == b;
+}
+
+/* Score one token against `name`. Prefers a contiguous case-insensitive
+   substring hit; falls back to a subsequence match. Appends match
+   positions to `marks[]` in-place. Returns -1 if the token doesn't match. */
+static int ff_score_token(const char* name, const char* tok, int tlen,
+                          short* marks, int* n_marks)
+{
+    int nlen = (int)strlen(name);
+    if (tlen == 0) return 0;
+    /* 1. Try contiguous substring — this is what a user typically means. */
+    int best_pos = -1;
+    for (int i = 0; i + tlen <= nlen; i++) {
+        int ok = 1;
+        for (int k = 0; k < tlen; k++) {
+            if (!ff_ceq(name[i+k], tok[k])) { ok = 0; break; }
+        }
+        if (ok) { best_pos = i; break; }
+    }
+    if (best_pos >= 0) {
+        for (int k = 0; k < tlen && *n_marks < FF_MATCH_MARKS; k++)
+            marks[(*n_marks)++] = (short)(best_pos + k);
+        int score = 40 + tlen * 12;
+        if (best_pos == 0) score += 20;
+        else {
+            char prev = name[best_pos - 1];
+            if (prev == '_' || prev == '-' || prev == '.' ||
+                prev == ' ' || prev == '/' || prev == '\\') score += 10;
+        }
+        return score;
+    }
+    /* 2. Fallback: in-order subsequence match. */
+    int qi = 0, score = 0, consec = 0;
+    int start_marks = *n_marks;
+    for (int i = 0; i < nlen && qi < tlen; i++) {
+        if (ff_ceq(name[i], tok[qi])) {
+            if (*n_marks < FF_MATCH_MARKS) marks[(*n_marks)++] = (short)i;
+            score += 10 + consec * 8;
+            if (i == 0) score += 4;
+            else {
+                char prev = name[i-1];
+                if (prev == '_' || prev == '-' || prev == '.' ||
+                    prev == ' ' || prev == '/' || prev == '\\') score += 3;
+            }
+            consec++;
+            qi++;
+        } else {
+            consec = 0;
+        }
+    }
+    if (qi < tlen) { *n_marks = start_marks; return -1; }
+    return score;
+}
+
+/* Score a whitespace-separated query against `name`. Each token must
+   match independently (order between tokens doesn't matter). Returns -1
+   if any token misses. Marks are the deduplicated & sorted union of the
+   per-token match positions. */
+static int ff_score_match(const char* name, const char* query, int qlen,
+                          short* marks, int* n_marks)
+{
+    if (qlen == 0) { *n_marks = 0; return 1; }
+    int total = 0;
+    int nmarks = 0;
+    int i = 0;
+    int tokens = 0;
+    while (i < qlen) {
+        while (i < qlen && query[i] == ' ') i++;
+        if (i >= qlen) break;
+        int j = i;
+        while (j < qlen && query[j] != ' ') j++;
+        int s = ff_score_token(name, query + i, j - i, marks, &nmarks);
+        if (s < 0) return -1;
+        total += s;
+        tokens++;
+        i = j;
+    }
+    if (tokens == 0) { *n_marks = 0; return 1; }
+    /* Dedup + insertion-sort marks so highlighting walks left-to-right */
+    for (int a = 1; a < nmarks; a++) {
+        short t = marks[a]; int b = a;
+        while (b > 0 && marks[b-1] > t) { marks[b] = marks[b-1]; b--; }
+        marks[b] = t;
+    }
+    int out = 0;
+    for (int a = 0; a < nmarks; a++)
+        if (a == 0 || marks[a] != marks[a-1]) marks[out++] = marks[a];
+    /* Slight bias toward shorter names */
+    total -= (int)strlen(name) / 4;
+    *n_marks = out;
+    return total;
+}
+
+/* Build the flat index from the currently active tab's entries — no
+   recursion, no file-system I/O beyond what scan_directory already did. */
+static void ff_build_index_from_tab(void) {
+    Tab* t = active_tab();
+    g_ff_index_count = 0;
+    strncpy(g_ff_root, t->path, MAX_PATH-1);
+    g_ff_root[MAX_PATH-1] = 0;
+    for (int i = 0; i < t->entry_count && g_ff_index_count < FF_MAX_INDEX; i++) {
+        FileEntry* e = &t->entries[i];
+        if (strcmp(e->name, "..") == 0) continue;
+        FFEntry* fe = &g_ff_index[g_ff_index_count++];
+        strncpy(fe->name, e->name, MAX_PATH-1); fe->name[MAX_PATH-1] = 0;
+        fe->rel[0] = 0;
+        fe->is_dir = e->is_dir;
+    }
+}
+
+/* Recursive BFS scan — runs on a worker; pushes results into g_ff_index
+   under g_ff_cs and bumps g_ff_result_count via ff_refresh_results-like
+   updates each 200 entries so the list feels live. */
+static int ff_should_skip_dir(const char* name) {
+    /* Skip heavy noise directories by default */
+    if (name[0] == '.') return 1;   /* .git, .svn, .venv, ... */
+    if (strcmp(name, "node_modules") == 0) return 1;
+    if (strcmp(name, "__pycache__") == 0) return 1;
+    if (strcmp(name, "target") == 0) return 1;   /* rust / java */
+    return 0;
+}
+
+typedef struct {
+    char full[MAX_PATH];
+    char rel[MAX_PATH];
+} FFScanFrame;
+
+static DWORD WINAPI ff_scan_worker(LPVOID arg) {
+    LONG my_gen = (LONG)(LONG_PTR)arg;
+    /* BFS: two arrays swapped */
+    static FFScanFrame stack_a[512];
+    static FFScanFrame stack_b[512];
+    FFScanFrame* cur  = stack_a;
+    FFScanFrame* next = stack_b;
+    int cur_n = 0, next_n = 0;
+    strncpy(cur[0].full, g_ff_root, MAX_PATH-1); cur[0].full[MAX_PATH-1] = 0;
+    cur[0].rel[0] = 0;
+    cur_n = 1;
+
+    while (cur_n > 0 && !g_ff_scan_cancel && my_gen == g_ff_scan_gen) {
+        next_n = 0;
+        for (int i = 0; i < cur_n && !g_ff_scan_cancel && my_gen == g_ff_scan_gen; i++) {
+            WCHAR wpat[MAX_PATH + 4];
+            {
+                char pat[MAX_PATH + 4];
+                _snprintf(pat, sizeof(pat), "%s\\*", cur[i].full);
+                u8_to_w(pat, wpat, MAX_PATH + 4);
+            }
+            WIN32_FIND_DATAW fd;
+            HANDLE h = FindFirstFileW(wpat, &fd);
+            if (h == INVALID_HANDLE_VALUE) continue;
+            do {
+                if (fd.cFileName[0] == L'.' &&
+                    (fd.cFileName[1] == 0 ||
+                     (fd.cFileName[1] == L'.' && fd.cFileName[2] == 0))) continue;
+                char u8name[MAX_PATH];
+                w_to_u8(fd.cFileName, u8name, MAX_PATH);
+                int is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+                EnterCriticalSection(&g_ff_cs);
+                if (g_ff_index_count < FF_MAX_INDEX) {
+                    FFEntry* fe = &g_ff_index[g_ff_index_count++];
+                    strncpy(fe->name, u8name, MAX_PATH-1); fe->name[MAX_PATH-1] = 0;
+                    strncpy(fe->rel, cur[i].rel, MAX_PATH-1); fe->rel[MAX_PATH-1] = 0;
+                    fe->is_dir = is_dir;
+                }
+                LeaveCriticalSection(&g_ff_cs);
+
+                if (is_dir && !ff_should_skip_dir(u8name) && next_n < 512) {
+                    FFScanFrame* nf = &next[next_n++];
+                    if (cur[i].rel[0])
+                        _snprintf(nf->rel, MAX_PATH, "%s\\%s", cur[i].rel, u8name);
+                    else
+                        _snprintf(nf->rel, MAX_PATH, "%s", u8name);
+                    _snprintf(nf->full, MAX_PATH, "%s\\%s", cur[i].full, u8name);
+                }
+            } while (FindNextFileW(h, &fd) && !g_ff_scan_cancel && my_gen == g_ff_scan_gen);
+            FindClose(h);
+            /* Periodically nudge UI to re-run match with growing index */
+            if ((g_ff_index_count & 0xFF) == 0)
+                PostMessageW(g_hwnd, WM_APP + 20, 0, 0);
+        }
+        /* swap */
+        FFScanFrame* tmp = cur; cur = next; next = tmp;
+        cur_n = next_n;
+    }
+    g_ff_scanning = 0;
+    PostMessageW(g_hwnd, WM_APP + 20, 0, 0);
+    return 0;
+}
+
+static void ff_stop_scan(void) {
+    if (!g_ff_scan_thread) { g_ff_scanning = 0; return; }
+    InterlockedIncrement(&g_ff_scan_gen);
+    g_ff_scan_cancel = 1;
+    /* Non-blocking hint: worker checks g_ff_scan_cancel in its inner
+       loops; give it up to 300 ms to notice, else move on and let the
+       thread finish in the background (it will exit on its own since
+       g_ff_scan_gen changed and PostMessage-fail is safe). */
+    if (WaitForSingleObject(g_ff_scan_thread, 300) == WAIT_OBJECT_0) {
+        CloseHandle(g_ff_scan_thread);
+        g_ff_scan_thread = NULL;
+    } else {
+        /* Detach — worker will finish and self-exit; handle leaks but
+           we won't block the UI further. Bump gen so any later message
+           it posts is treated as stale. */
+        CloseHandle(g_ff_scan_thread);
+        g_ff_scan_thread = NULL;
+    }
+    g_ff_scanning = 0;
+    g_ff_scan_cancel = 0;
+}
+
+static void ff_kick_recursive_scan(void) {
+    if (!g_ff_cs_init) { InitializeCriticalSection(&g_ff_cs); g_ff_cs_init = 1; }
+    ff_stop_scan();
+
+    EnterCriticalSection(&g_ff_cs);
+    g_ff_index_count = 0;
+    strncpy(g_ff_root, active_tab()->path, MAX_PATH-1);
+    g_ff_root[MAX_PATH-1] = 0;
+    LeaveCriticalSection(&g_ff_cs);
+
+    g_ff_scanning = 1;
+    LONG gen = g_ff_scan_gen;
+    g_ff_scan_thread = CreateThread(NULL, 0, ff_scan_worker, (LPVOID)(LONG_PTR)gen, 0, NULL);
+}
+
+static void ff_refresh_results(void) {
+    g_ff_result_count = 0;
+    int min_score = 0;
+    int min_idx   = -1;
+    /* Cap loop under critical section-free read; ok because worker only
+       APPENDS and we read count once — it monotonically grows. */
+    int count = g_ff_index_count;
+    for (int i = 0; i < count; i++) {
+        FFEntry* fe = &g_ff_index[i];
+        short marks[FF_MATCH_MARKS];
+        int n_marks = 0;
+        int s = ff_score_match(fe->name, g_ff_query, g_ff_query_len, marks, &n_marks);
+        if (s < 0) continue;
+        if (fe->is_dir) s += 5;   /* directories rank a bit higher */
+        if (g_ff_result_count < FF_RESULT_MAX) {
+            FFResult* r = &g_ff_results[g_ff_result_count++];
+            r->entry_idx = i;
+            r->score = s;
+            r->n_marks = n_marks;
+            memcpy(r->marks, marks, sizeof(short) * n_marks);
+            if (r->score < min_score || min_idx < 0) { min_score = r->score; min_idx = g_ff_result_count - 1; }
+        } else if (s > min_score) {
+            FFResult* r = &g_ff_results[min_idx];
+            r->entry_idx = i;
+            r->score = s;
+            r->n_marks = n_marks;
+            memcpy(r->marks, marks, sizeof(short) * n_marks);
+            /* recompute min */
+            min_score = g_ff_results[0].score; min_idx = 0;
+            for (int k = 1; k < g_ff_result_count; k++)
+                if (g_ff_results[k].score < min_score) { min_score = g_ff_results[k].score; min_idx = k; }
+        }
+    }
+    /* Simple insertion sort by score desc — result_count <= 200 */
+    for (int i = 1; i < g_ff_result_count; i++) {
+        FFResult tmp = g_ff_results[i];
+        int j = i;
+        while (j > 0 && g_ff_results[j-1].score < tmp.score) {
+            g_ff_results[j] = g_ff_results[j-1];
+            j--;
+        }
+        g_ff_results[j] = tmp;
+    }
+    if (g_ff_selected >= g_ff_result_count) g_ff_selected = g_ff_result_count - 1;
+    if (g_ff_selected < 0) g_ff_selected = 0;
+}
+
+/* UTF-8 helpers: byte offset of previous / next codepoint boundary. */
+static int ff_prev_cp(const char* s, int pos) {
+    if (pos <= 0) return 0;
+    int p = pos - 1;
+    while (p > 0 && (s[p] & 0xC0) == 0x80) p--;
+    return p;
+}
+static int ff_next_cp(const char* s, int len, int pos) {
+    if (pos >= len) return len;
+    int p = pos + 1;
+    while (p < len && (s[p] & 0xC0) == 0x80) p++;
+    return p;
+}
+static int ff_is_word(unsigned char c) {
+    /* Simple word class: letters + digits + underscore */
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_' || c >= 0x80;
+}
+static int ff_prev_word_boundary(const char* s, int pos) {
+    if (pos <= 0) return 0;
+    /* Skip trailing non-word chars, then skip a run of word chars */
+    while (pos > 0 && !ff_is_word((unsigned char)s[pos-1])) pos--;
+    while (pos > 0 && ff_is_word((unsigned char)s[pos-1])) pos--;
+    return pos;
+}
+static int ff_next_word_boundary(const char* s, int len, int pos) {
+    if (pos >= len) return len;
+    while (pos < len && ff_is_word((unsigned char)s[pos])) pos++;
+    while (pos < len && !ff_is_word((unsigned char)s[pos])) pos++;
+    return pos;
+}
+
+static void ff_open(void) {
+    g_ff_active   = 1;
+    g_ff_panel    = g_app.active_panel;
+    g_ff_query[0] = 0;
+    g_ff_query_len = 0;
+    g_ff_cursor   = 0;
+    g_ff_selected = 0;
+    g_ff_scroll   = 0;
+    if (!g_ff_cs_init) { InitializeCriticalSection(&g_ff_cs); g_ff_cs_init = 1; }
+    if (g_ff_recursive) {
+        ff_kick_recursive_scan();
+    } else {
+        ff_build_index_from_tab();
+    }
+    ff_refresh_results();
+    g_needs_redraw = 1;
+}
+
+static void ff_close(void) {
+    g_ff_active = 0;
+    g_ff_panel  = -1;
+    ff_stop_scan();
+    g_ff_index_count = 0;
+    g_ff_result_count = 0;
+    g_needs_redraw = 1;
+}
+
+static void ff_open_selected(void) {
+    if (g_ff_selected < 0 || g_ff_selected >= g_ff_result_count) return;
+    FFResult* r = &g_ff_results[g_ff_selected];
+    FFEntry*  e = &g_ff_index[r->entry_idx];
+    char full[MAX_PATH];
+    if (e->rel[0])
+        _snprintf(full, MAX_PATH, "%s\\%s\\%s", g_ff_root, e->rel, e->name);
+    else
+        _snprintf(full, MAX_PATH, "%s\\%s", g_ff_root, e->name);
+    Tab* t = active_tab();
+    if (e->is_dir) {
+        tab_navigate(t, full, 1);
+    } else {
+        /* Navigate to parent directory and select the file */
+        char parent[MAX_PATH];
+        strncpy(parent, full, MAX_PATH-1); parent[MAX_PATH-1] = 0;
+        char* slash = strrchr(parent, '\\');
+        if (slash) *slash = 0;
+        if (_stricmp(parent, t->path) != 0) tab_navigate(t, parent, 1);
+        /* select the file by name */
+        for (int i = 0; i < t->entry_count; i++) {
+            if (_stricmp(t->entries[i].name, e->name) == 0) {
+                sel_only(t, i);
+                t->selected = i;
+                t->sel_anchor = i;
+                scroll_to_entry(t, i);
+                break;
+            }
+        }
+    }
+    ff_close();
 }
 
 static void do_new_folder(Tab* t) {
@@ -4029,8 +4459,10 @@ static void build_column_headers(float lx, float ly, float lw) {
             if (g_app.sort_col == cols[i].col) g_app.sort_asc = !g_app.sort_asc;
             else { g_app.sort_col = cols[i].col; g_app.sort_asc = 1; }
             Tab* tab = active_tab();
-            if (!tab->use_groups)
-                sort_prefs_set(tab->path, g_app.sort_col, g_app.sort_asc);
+            /* Persist for every folder — Downloads no longer overrides;
+               it simply switches back to date-grouping when the user
+               picks date-desc again. */
+            sort_prefs_set(tab->path, g_app.sort_col, g_app.sort_asc);
             scan_directory(tab);
         }
         if (i > 0) render_quad(r, cols[i].x-1, ly+4, 1, COL_HDR_H-8, COL_BORDER);
@@ -4674,6 +5106,201 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
     }
 }
 
+/* ---- Fuzzy finder overlay render ---- */
+static void build_fuzzy_finder(void) {
+    if (!g_ff_active || g_ff_panel != g_app.active_panel) return;
+    Renderer* r = &g_renderer;
+
+    /* Panel bounds (active panel content area) */
+    float panel_x = SIDEBAR_W;
+    float panel_w = (float)g_width - SIDEBAR_W;
+    if (g_app.split_active) {
+        float split_x = floorf(SIDEBAR_W + g_app.split_ratio * (g_width - SIDEBAR_W));
+        if (g_app.active_panel == 0) { panel_w = split_x - SIDEBAR_W; }
+        else                         { panel_x = split_x; panel_w = g_width - split_x; }
+    }
+    float panel_y = CONTENT_TOP;
+    float panel_h = (float)g_height - CONTENT_TOP - STATUS_BAR_H;
+
+    /* Panel dimensions */
+    float ff_w = panel_w * 0.62f; if (ff_w < 420) ff_w = 420; if (ff_w > 900) ff_w = 900;
+    if (ff_w > panel_w - 24) ff_w = panel_w - 24;
+    float row_h = 28.0f;
+    int   max_rows = (int)((panel_h - 130) / row_h);
+    if (max_rows > 15) max_rows = 15;
+    if (max_rows < 5)  max_rows = 5;
+    float ff_h = 40 + 40 + row_h * max_rows + 26;   /* input + spacer + rows + footer */
+    float ff_x = panel_x + (panel_w - ff_w) / 2;
+    float ff_y = panel_y + 20;
+    if (ff_y + ff_h > panel_y + panel_h - 4) ff_h = panel_h - 24;
+
+    /* Dim the panel underneath */
+    render_quad(r, panel_x, panel_y, panel_w, panel_h, 0x88000000);
+
+    /* Popup background */
+    render_quad(r, ff_x - 1, ff_y - 1, ff_w + 2, ff_h + 2, COL_BORDER);
+    render_quad(r, ff_x, ff_y, ff_w, ff_h, COL_HEADER);
+
+    /* Search input row */
+    float in_h = 36;
+    render_quad(r, ff_x + 8, ff_y + 8, ff_w - 16, in_h, COL_BG);
+    if (g_ff_scanning) {
+        static const char* fr2[] = {"⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧"};
+        int fi2 = (GetTickCount() / 80) & 7;
+        render_text(r, fr2[fi2], ff_x + 18, ff_y + 8 + (in_h - r->font_height) / 2, COL_ACCENT);
+    } else {
+        render_mdl2(r, ICON_SEARCH, ff_x + 18, ff_y + 8 + (in_h - 14) / 2, 14, COL_SUBTEXT);
+    }
+    float tx = ff_x + 40;
+    float ty = ff_y + 8 + (in_h - r->font_height) / 2;
+    if (g_ff_query_len > 0) render_text_n(r, g_ff_query, g_ff_query_len, tx, ty, COL_TEXT);
+    else                    render_text(r, "Type to filter…", tx, ty, COL_DIM);
+    /* Blinking cursor at g_ff_cursor position */
+    int cur_w = (g_ff_cursor > 0)
+        ? render_text_width_n(r, g_ff_query, g_ff_cursor)
+        : 0;
+    if ((GetTickCount() / 500) & 1)
+        render_quad(r, tx + cur_w + 1, ty - 2, 1, r->font_height + 4, COL_TEXT);
+
+    /* Recursive checkbox on the right */
+    float cb_sz = 14;
+    float cb_x  = ff_x + ff_w - 20 - cb_sz - render_text_width(r, "Recursive");
+    float cb_y  = ff_y + 8 + (in_h - cb_sz) / 2;
+    render_quad(r, cb_x - 1, cb_y - 1, cb_sz + 2, cb_sz + 2, COL_BORDER);
+    render_quad(r, cb_x, cb_y, cb_sz, cb_sz, g_ff_recursive ? COL_ACCENT : COL_BG);
+    if (g_ff_recursive)
+        render_mdl2(r, ICON_CHECK, cb_x + 2, cb_y + 2, cb_sz - 4, COL_TEXT);
+    render_text(r, "Recursive", cb_x + cb_sz + 6, ty, COL_SUBTEXT);
+    /* Click checkbox */
+    if (ui_hover(&g_ui, cb_x - 4, cb_y - 4, cb_sz + 8 + render_text_width(r, "Recursive") + 12, cb_sz + 8) &&
+        g_ui.input.mouse_clicked) {
+        g_ff_recursive = !g_ff_recursive;
+        if (g_ff_recursive) ff_kick_recursive_scan();
+        else {
+            ff_stop_scan();
+            ff_build_index_from_tab();
+        }
+        ff_refresh_results();
+        g_needs_redraw = 1;
+    }
+
+    /* Results list */
+    float list_x = ff_x + 8;
+    float list_y = ff_y + 8 + in_h + 8;
+    float list_w = ff_w - 16;
+    /* Clamp scroll so selection stays visible */
+    if (g_ff_selected < g_ff_scroll) g_ff_scroll = g_ff_selected;
+    if (g_ff_selected >= g_ff_scroll + max_rows) g_ff_scroll = g_ff_selected - max_rows + 1;
+    if (g_ff_scroll < 0) g_ff_scroll = 0;
+
+    render_scissor(r, (int)list_x, (int)list_y, (int)list_w, (int)(row_h * max_rows));
+    int shown = 0;
+    for (int i = g_ff_scroll; i < g_ff_result_count && shown < max_rows; i++, shown++) {
+        FFResult* res = &g_ff_results[i];
+        FFEntry*  fe  = &g_ff_index[res->entry_idx];
+        float ry = list_y + shown * row_h;
+        int is_sel = (i == g_ff_selected);
+        if (is_sel) render_quad(r, list_x, ry, list_w, row_h, COL_SELECTED);
+
+        /* Icon — use the same shell-icon path as the file list so .js /
+           .exe / .png etc show their real per-type glyph. */
+        {
+            GLuint ico = get_file_icon(fe->name, fe->is_dir);
+            if (ico)
+                render_icon(r, ico, list_x + 6, ry + (row_h - ICON_SIZE) / 2,
+                            ICON_SIZE, ICON_SIZE);
+            else if (fe->is_dir)
+                render_folder_icon(r, list_x + 8, ry + (row_h - 10) / 2, 11, COL_YELLOW);
+            else
+                render_file_icon(r, list_x + 8, ry + (row_h - 12) / 2, 11, COL_SUBTEXT);
+        }
+
+        /* Name with per-char highlight */
+        float nx = list_x + 28;
+        float ny = ry + (row_h - r->font_height) / 2;
+        int mi = 0;
+        int nlen = (int)strlen(fe->name);
+        int seg_start = 0;
+        for (int p = 0; p <= nlen; p++) {
+            int is_mark = (mi < res->n_marks && res->marks[mi] == p);
+            if (is_mark || p == nlen) {
+                if (p > seg_start) {
+                    nx += render_text_n(r, fe->name + seg_start, p - seg_start,
+                                        nx, ny, is_sel ? COL_TEXT : COL_SUBTEXT);
+                }
+                if (is_mark) {
+                    nx += render_text_n(r, fe->name + p, 1, nx, ny, COL_YELLOW);
+                    mi++;
+                    seg_start = p + 1;
+                } else {
+                    seg_start = p;
+                }
+            }
+        }
+
+        /* Relative path (rel + \) shown dim to the right of the name */
+        if (fe->rel[0]) {
+            float px = nx + 12;
+            /* Truncate rel if it doesn't fit */
+            int rl = (int)strlen(fe->rel);
+            int max_w = (int)(list_x + list_w - 8 - px);
+            while (rl > 0 && render_text_width_n(r, fe->rel, rl) > max_w) rl--;
+            if (rl > 0) render_text_n(r, fe->rel, rl, px, ny, COL_DIM);
+        }
+    }
+    render_scissor_reset(r);
+
+    /* Footer */
+    float footer_y = list_y + row_h * max_rows + 6;
+    render_quad(r, ff_x + 8, footer_y - 2, ff_w - 16, 1, COL_BORDER);
+    float footer_ty = footer_y + (24 - r->fonts[1].font_height) / 2;
+
+    if (g_ff_scanning) {
+        /* Animated spinner: 8-frame braille (renders via dynamic glyph
+           cache — atlas grows on demand). */
+        static const char* frames[] = {"⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧"};
+        int fi = (GetTickCount() / 80) & 7;
+        float sx = ff_x + 12;
+        int sw = render_text(r, frames[fi], sx, footer_ty, COL_ACCENT);
+        sx += sw + 6;
+        char status[128];
+        _snprintf(status, sizeof(status),
+                  "Indexing…  %d files  ·  %d matches",
+                  g_ff_index_count, g_ff_result_count);
+        render_text(r, status, sx, footer_ty, COL_TEXT);
+
+        /* Right-aligned Stop button */
+        const char* stop_lbl = "Stop  (Ctrl+.)";
+        int stop_w = render_text_width(r, stop_lbl) + 20;
+        int stop_h = 22;
+        float stop_x = ff_x + ff_w - 12 - stop_w;
+        float stop_y = footer_y + (24 - stop_h) / 2;
+        int stop_hov = ui_hover(&g_ui, stop_x, stop_y, stop_w, stop_h);
+        render_quad(r, stop_x, stop_y, stop_w, stop_h, stop_hov ? COL_HOVER : COL_HEADER);
+        render_quad(r, stop_x, stop_y, stop_w, 1, COL_BORDER);
+        render_quad(r, stop_x, stop_y + stop_h - 1, stop_w, 1, COL_BORDER);
+        render_quad(r, stop_x, stop_y, 1, stop_h, COL_BORDER);
+        render_quad(r, stop_x + stop_w - 1, stop_y, 1, stop_h, COL_BORDER);
+        float lbl_tw = (float)render_text_width(r, stop_lbl);
+        render_text(r, stop_lbl,
+                    stop_x + (stop_w - lbl_tw) / 2,
+                    stop_y + (stop_h - r->font_height) / 2,
+                    stop_hov ? COL_RED : COL_TEXT);
+        if (stop_hov && g_ui.input.mouse_clicked) {
+            ff_stop_scan();
+            g_needs_redraw = 1;
+        }
+    } else {
+        char footer[192];
+        _snprintf(footer, sizeof(footer),
+                  "%d / %d  ·  ↑↓ navigate  ·  Enter open  ·  Ctrl+R recursive  ·  Esc close",
+                  g_ff_result_count, g_ff_index_count);
+        render_text(r, footer, ff_x + 12, footer_ty, COL_DIM);
+    }
+    /* Repaint continuously for spinner animation and cursor blink */
+    g_needs_redraw = 1;
+}
+
 static void build_status_bar(void) {
     Renderer* r = &g_renderer;
     float y = (float)g_height - STATUS_BAR_H;
@@ -4787,6 +5414,7 @@ static void build_ui(void) {
     }
 
     build_status_bar();
+    build_fuzzy_finder();
     ui_end(&g_ui);
 }
 
@@ -4953,6 +5581,24 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             enc[2] = (char)(0x80 | (wc & 0x3F));
             enc_len = 3;
         }
+        if (g_ff_active) {
+            if (wp >= 32 && wp != 127 &&
+                g_ff_query_len + enc_len < (int)sizeof(g_ff_query)) {
+                /* Insert at cursor position */
+                int tail = g_ff_query_len - g_ff_cursor;
+                memmove(g_ff_query + g_ff_cursor + enc_len,
+                        g_ff_query + g_ff_cursor, tail);
+                memcpy(g_ff_query + g_ff_cursor, enc, enc_len);
+                g_ff_query_len += enc_len;
+                g_ff_cursor    += enc_len;
+                g_ff_query[g_ff_query_len] = 0;
+                g_ff_selected = 0;
+                g_ff_scroll   = 0;
+                ff_refresh_results();
+                g_needs_redraw = 1;
+            }
+            return 0;
+        }
         if (g_batch_active) {
             if (wp >= 32 && wp != 127) {
                 if (g_batch_focus == 1) {
@@ -5011,6 +5657,99 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         Tab* t = active_tab();
         int ctrl  = GetKeyState(VK_CONTROL) < 0;
         int shift = GetKeyState(VK_SHIFT) < 0;
+        if (g_ff_active) {
+            if (wp == VK_ESCAPE) { ff_close(); return 0; }
+            if (wp == VK_RETURN) { ff_open_selected(); return 0; }
+            if (wp == VK_UP) {
+                if (g_ff_selected > 0) g_ff_selected--;
+                g_needs_redraw = 1; return 0;
+            }
+            if (wp == VK_DOWN) {
+                if (g_ff_selected + 1 < g_ff_result_count) g_ff_selected++;
+                g_needs_redraw = 1; return 0;
+            }
+            if (wp == VK_PRIOR) {   /* Page Up */
+                g_ff_selected -= 10;
+                if (g_ff_selected < 0) g_ff_selected = 0;
+                g_needs_redraw = 1; return 0;
+            }
+            if (wp == VK_NEXT) {    /* Page Down */
+                g_ff_selected += 10;
+                if (g_ff_selected >= g_ff_result_count) g_ff_selected = g_ff_result_count - 1;
+                if (g_ff_selected < 0) g_ff_selected = 0;
+                g_needs_redraw = 1; return 0;
+            }
+            if (wp == VK_BACK) {
+                if (g_ff_cursor > 0) {
+                    int new_cur = ctrl
+                        ? ff_prev_word_boundary(g_ff_query, g_ff_cursor)
+                        : ff_prev_cp(g_ff_query, g_ff_cursor);
+                    int del = g_ff_cursor - new_cur;
+                    int tail = g_ff_query_len - g_ff_cursor;
+                    memmove(g_ff_query + new_cur, g_ff_query + g_ff_cursor, tail);
+                    g_ff_query_len -= del;
+                    g_ff_cursor     = new_cur;
+                    g_ff_query[g_ff_query_len] = 0;
+                    g_ff_selected = 0; g_ff_scroll = 0;
+                    ff_refresh_results();
+                    g_needs_redraw = 1;
+                }
+                return 0;
+            }
+            if (wp == VK_DELETE) {
+                if (g_ff_cursor < g_ff_query_len) {
+                    int end = ctrl
+                        ? ff_next_word_boundary(g_ff_query, g_ff_query_len, g_ff_cursor)
+                        : ff_next_cp(g_ff_query, g_ff_query_len, g_ff_cursor);
+                    int del = end - g_ff_cursor;
+                    int tail = g_ff_query_len - end;
+                    memmove(g_ff_query + g_ff_cursor, g_ff_query + end, tail);
+                    g_ff_query_len -= del;
+                    g_ff_query[g_ff_query_len] = 0;
+                    g_ff_selected = 0; g_ff_scroll = 0;
+                    ff_refresh_results();
+                    g_needs_redraw = 1;
+                }
+                return 0;
+            }
+            if (wp == VK_LEFT) {
+                g_ff_cursor = ctrl
+                    ? ff_prev_word_boundary(g_ff_query, g_ff_cursor)
+                    : ff_prev_cp(g_ff_query, g_ff_cursor);
+                g_needs_redraw = 1; return 0;
+            }
+            if (wp == VK_RIGHT) {
+                g_ff_cursor = ctrl
+                    ? ff_next_word_boundary(g_ff_query, g_ff_query_len, g_ff_cursor)
+                    : ff_next_cp(g_ff_query, g_ff_query_len, g_ff_cursor);
+                g_needs_redraw = 1; return 0;
+            }
+            if (wp == VK_HOME) { g_ff_cursor = 0;              g_needs_redraw = 1; return 0; }
+            if (wp == VK_END)  { g_ff_cursor = g_ff_query_len; g_needs_redraw = 1; return 0; }
+            if (wp == 'R' && ctrl) {
+                g_ff_recursive = !g_ff_recursive;
+                if (g_ff_recursive) ff_kick_recursive_scan();
+                else {
+                    ff_stop_scan();
+                    ff_build_index_from_tab();
+                }
+                ff_refresh_results();
+                g_needs_redraw = 1;
+                return 0;
+            }
+            /* Ctrl+.  (or Ctrl+period) → stop the recursive scan without
+               closing the finder. Also VK_OEM_PERIOD. */
+            if (ctrl && (wp == VK_OEM_PERIOD || wp == 0xBE)) {
+                if (g_ff_scanning) {
+                    ff_stop_scan();
+                    g_needs_redraw = 1;
+                }
+                return 0;
+            }
+            /* Swallow all other keys while active */
+            return 0;
+        }
+        if (wp == 'F' && ctrl && !shift) { ff_open(); return 0; }
         if (g_batch_active) {
             if (wp == VK_RETURN) { batch_rename_commit(); return 0; }
             if (wp == VK_ESCAPE) { batch_rename_cancel(); return 0; }
@@ -5159,6 +5898,14 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP + 1:
         /* Deferred inline rename commit (from WM_KILLFOCUS) */
         if (g_edit_hwnd) inline_rename_commit();
+        return 0;
+
+    case WM_APP + 20:
+        /* Recursive scan progress tick — re-run match against grown index */
+        if (g_ff_active) {
+            ff_refresh_results();
+            g_needs_redraw = 1;
+        }
         return 0;
 
     case WM_APP + 2:
