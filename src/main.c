@@ -68,6 +68,7 @@ static int g_row_h = 20;
 #define IDM_PROPERTIES  1011
 #define IDM_COPY_PATH   1012
 #define IDM_OPEN_TERMINAL 1013
+#define IDM_OPEN_TERMINAL_TAB 1017   /* new tab in existing Windows Terminal window */
 #define IDM_ADD_BOOKMARK    1014
 #define IDM_REMOVE_BOOKMARK 1015
 #define IDM_OPEN_WITH       1016
@@ -4014,6 +4015,20 @@ static void handle_context_cmd(int cmd, int item_idx) {
             ShellExecuteW(NULL, L"open", L"cmd.exe", NULL, wtpath, SW_SHOWNORMAL);
         break;
     }
+    case IDM_OPEN_TERMINAL_TAB: {
+        /* Add a new tab in the most-recently-used Windows Terminal window
+           at the current folder. `wt -w 0 nt -d "<path>"` — the `-w 0`
+           targets the MRU window; if none exists, wt spawns a new one. */
+        char args[MAX_PATH + 32];
+        _snprintf(args, sizeof(args), "-w 0 nt -d \"%s\"", t->path);
+        WCHAR wargs[MAX_PATH + 32], wtpath[MAX_PATH];
+        u8_to_w(args, wargs, MAX_PATH + 32);
+        u8_to_w(t->path, wtpath, MAX_PATH);
+        HINSTANCE hi = ShellExecuteW(NULL, L"open", L"wt.exe", wargs, NULL, SW_SHOWNORMAL);
+        if ((INT_PTR)hi <= 32)
+            ShellExecuteW(NULL, L"open", L"cmd.exe", NULL, wtpath, SW_SHOWNORMAL);
+        break;
+    }
     case IDM_ADD_BOOKMARK:
         if (item_idx >= 0 && t->entries[item_idx].is_dir) {
             char fp[MAX_PATH];
@@ -6692,6 +6707,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             clipboard_paste(t->path);
             scan_directory(t);
         }
+        else if (wp=='D' && ctrl && shift) { handle_context_cmd(IDM_OPEN_TERMINAL_TAB, -1); }
         else if (wp=='D' && ctrl) { handle_context_cmd(IDM_OPEN_TERMINAL, -1); }
         else if (wp=='N' && ctrl && shift) { do_new_folder(t); }
         else if (wp=='N' && ctrl) { do_new_file(t); }
