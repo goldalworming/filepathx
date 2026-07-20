@@ -5881,7 +5881,18 @@ static void build_fuzzy_finder(void) {
         FFEntry*  fe  = &g_ff_index[res->entry_idx];
         float ry = list_y + shown * row_h;
         int is_sel = (i == g_ff_selected);
-        if (is_sel) render_quad(r, list_x, ry, list_w, row_h, COL_SELECTED);
+        int hov    = ui_hover(&g_ui, list_x, ry, list_w, row_h);
+        if (is_sel)    render_quad(r, list_x, ry, list_w, row_h, COL_SELECTED);
+        else if (hov)  render_quad(r, list_x, ry, list_w, row_h, COL_HOVER);
+        /* Hover → live-highlight; click → jump-and-open */
+        if (hov && g_ui.input.mouse_clicked) {
+            g_ff_selected = i;
+        }
+        if (ui_clicked(&g_ui, UIID(800 + i), list_x, ry, list_w, row_h)) {
+            g_ff_selected = i;
+            ff_open_selected();
+            return;
+        }
 
         /* Icon — use the same shell-icon path as the file list so .js /
            .exe / .png etc show their real per-type glyph. */
@@ -6149,16 +6160,19 @@ static void build_ui(void) {
     /* Reset tooltip; each hovered icon widget refreshes it during render. */
     g_tt_text[0] = 0;
 
-    /* Modal input capture — while Settings is open, hide all mouse events
-       from the widgets below so a click on a chip doesn't also trigger a
-       click on the file / tab / button under it. Real input is restored
-       right before the modal renders (bottom of build_ui). */
+    /* Modal / overlay input capture — while Settings or fuzzy finder is
+       open, hide all mouse events from the widgets below so a click on a
+       chip / search result doesn't also trigger a click on the file /
+       tab / button under it. Real input is restored right before the
+       overlay renders (bottom of build_ui). */
     int  saved_mx = g_ui.input.mouse_x, saved_my = g_ui.input.mouse_y;
     int  saved_clk = g_ui.input.mouse_clicked, saved_rel = g_ui.input.mouse_released;
     int  saved_dbl = g_ui.input.mouse_dblclick, saved_dn = g_ui.input.mouse_down;
-    if (g_settings_open) {
+    int  overlay_open = (g_settings_open ||
+                         (g_ff_active && g_ff_panel == g_app.active_panel));
+    if (overlay_open) {
         /* Push mouse far off-screen and clear click flags so nothing hovers
-           or triggers underneath the modal. */
+           or triggers underneath the overlay. */
         g_ui.input.mouse_x = -30000;
         g_ui.input.mouse_y = -30000;
         g_ui.input.mouse_clicked = 0;
@@ -6253,8 +6267,9 @@ static void build_ui(void) {
     }
 
     build_status_bar();
-    build_fuzzy_finder();
-    if (g_settings_open) {
+    /* Restore real input BEFORE the overlays render so their own widgets
+       see clicks / hover. */
+    if (overlay_open) {
         g_ui.input.mouse_x = saved_mx;
         g_ui.input.mouse_y = saved_my;
         g_ui.input.mouse_clicked  = saved_clk;
@@ -6262,6 +6277,7 @@ static void build_ui(void) {
         g_ui.input.mouse_dblclick = saved_dbl;
         g_ui.input.mouse_down     = saved_dn;
     }
+    build_fuzzy_finder();
     build_settings_modal();
     tt_draw();
     ui_end(&g_ui);
