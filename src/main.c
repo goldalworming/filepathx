@@ -113,6 +113,7 @@ typedef struct {
     int use_groups;
     int group_collapsed[MAX_GROUPS];
     int view_mode;  /* VM_DETAILS / SMALL_ICONS / LARGE_ICONS */
+    int grid_cols;  /* updated by build_file_list each frame in icon views */
 } Tab;
 
 typedef struct {
@@ -421,7 +422,11 @@ static int   g_splitter_dragging = 0;
 static int   g_sync_scroll = 0;
 
 /* ---- Settings modal ---- */
-static int g_settings_open      = 0;
+static int   g_settings_open      = 0;
+static int   g_settings_tab       = 0;   /* 0 = General, 1 = Shortcuts */
+static float g_settings_scroll    = 0;
+static float g_settings_content_h = 0;
+static float g_settings_view_h    = 0;
 static int g_pref_font_size     = 11;   /* applied on next launch */
 static int g_pref_row_h         = 20;   /* applied immediately    */
 /* Session-scoped feedback for "font size will change on next launch" */
@@ -1379,12 +1384,41 @@ static void new_tab(const char* path) {
     tabs_save();
 }
 
+/* Undo-close stack: last 10 closed tab paths (per app session). */
+#define CLOSED_STACK_CAP 10
+static char g_closed_stack[CLOSED_STACK_CAP][MAX_PATH];
+static int  g_closed_stack_count = 0;
+
+static void closed_stack_push(const char* path) {
+    if (!path || !path[0]) return;
+    if (g_closed_stack_count >= CLOSED_STACK_CAP) {
+        for (int i = 0; i < CLOSED_STACK_CAP - 1; i++)
+            memcpy(g_closed_stack[i], g_closed_stack[i+1], MAX_PATH);
+        g_closed_stack_count = CLOSED_STACK_CAP - 1;
+    }
+    strncpy(g_closed_stack[g_closed_stack_count], path, MAX_PATH - 1);
+    g_closed_stack[g_closed_stack_count][MAX_PATH - 1] = 0;
+    g_closed_stack_count++;
+}
+
+static int closed_stack_pop(char* out, int n) {
+    if (g_closed_stack_count <= 0) return 0;
+    g_closed_stack_count--;
+    strncpy(out, g_closed_stack[g_closed_stack_count], n - 1);
+    out[n - 1] = 0;
+    return 1;
+}
+
 static void close_tab(int idx) {
-    if (g_app.panels[g_app.active_panel].tab_count <= 1) return;
-    for (int i = idx; i < g_app.panels[g_app.active_panel].tab_count - 1; i++)
-        g_app.panels[g_app.active_panel].tabs[i] = g_app.panels[g_app.active_panel].tabs[i+1];
-    g_app.panels[g_app.active_panel].tab_count--;
-    if (g_app.panels[g_app.active_panel].active_tab >= g_app.panels[g_app.active_panel].tab_count) g_app.panels[g_app.active_panel].active_tab = g_app.panels[g_app.active_panel].tab_count - 1;
+    Panel* P = &g_app.panels[g_app.active_panel];
+    if (P->tab_count <= 1) return;
+    /* Remember the closed tab's path so Ctrl+Shift+T can reopen it */
+    if (idx >= 0 && idx < P->tab_count)
+        closed_stack_push(P->tabs[idx].path);
+    for (int i = idx; i < P->tab_count - 1; i++)
+        P->tabs[i] = P->tabs[i+1];
+    P->tab_count--;
+    if (P->active_tab >= P->tab_count) P->active_tab = P->tab_count - 1;
     tabs_save();
     g_needs_redraw = 1;
 }
@@ -5144,6 +5178,7 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
         int icon_sz = (t->view_mode == VM_SMALL_ICONS) ? 48  : 130;
         float rw = lw - 8;
         int cols = (int)(rw / item_w); if (cols < 1) cols = 1;
+        t->grid_cols = cols;   /* remember for arrow-key grid navigation */
         /* Count entries excluding ".." which we hide in icon views */
         int visible_count = 0;
         for (int i = 0; i < t->entry_count; i++) {
@@ -6035,8 +6070,10 @@ static void build_settings_modal(void) {
     /* Backdrop */
     render_quad(r, 0, 0, (float)g_width, (float)g_height, 0xAA000000);
 
-    /* Panel */
-    float pw = 520, ph = 380;
+    /* Panel — cap to available window height and scroll internally */
+    float pw = 560;
+    float ph = (g_settings_tab == 1) ? 640 : 460;
+    if (ph > g_height - 40) ph = g_height - 40;
     if (pw > g_width - 40) pw = g_width - 40;
     if (ph > g_height - 40) ph = g_height - 40;
     float px = floorf((g_width  - pw) / 2);
@@ -6067,39 +6104,59 @@ static void build_settings_modal(void) {
         g_needs_redraw = 1;
         return;
     }
-    render_quad(r, px, py + 48, pw, 1, COL_BORDER);
-
-    /* Content */
-    float cy2 = py + 68;
+    /* Tab bar below header */
+    float tab_y = py + 48;
+    float tab_h = 32;
+    const char* tab_names[2] = { "General", "Shortcuts" };
     float lx  = px + 24;
-    float rx2 = px + pw - 24;
-
-    /* --- Theme --- */
-    render_text(r, "Theme", lx, cy2, COL_SUBTEXT);
-    cy2 += 22;
-    /* Rescan themes each frame — cheap & keeps drop-ins live */
-    theme_discover();
-    float chip_h = 32;
-    float chip_gap = 6;
-    for (int i = 0; i < g_theme_count; i++) {
-        float chip_w = (pw - 48 - chip_gap * 2) / 3;
-        int col_i = i % 3;
-        int row_i = i / 3;
-        float bx = lx + col_i * (chip_w + chip_gap);
-        float by = cy2 + row_i * (chip_h + chip_gap);
-        int selected = (_stricmp(g_theme_current, g_themes[i].display) == 0);
-        if (settings_row_button(r, bx, by, chip_w, chip_h,
-                                g_themes[i].display, selected, UIID(710 + i))) {
-            theme_apply_file(g_themes[i].path);
+    for (int i = 0; i < 2; i++) {
+        int tw = render_text_width(r, tab_names[i]);
+        float bx = lx + i * 110;
+        int active = (g_settings_tab == i);
+        int hov = ui_hover(&g_ui, bx, tab_y, 100, tab_h);
+        if (active) {
+            render_text(r, tab_names[i], floorf(bx + (100 - tw) / 2),
+                        floorf(tab_y + (tab_h - r->font_height) / 2), COL_TEXT);
+            render_quad(r, bx + (100 - tw) / 2 - 4, tab_y + tab_h - 2,
+                        tw + 8, 2, COL_ACCENT);
+        } else {
+            render_text(r, tab_names[i], floorf(bx + (100 - tw) / 2),
+                        floorf(tab_y + (tab_h - r->font_height) / 2),
+                        hov ? COL_TEXT : COL_SUBTEXT);
+        }
+        if (ui_clicked(&g_ui, UIID(702 + i), bx, tab_y, 100, tab_h)) {
+            g_settings_tab = i;
         }
     }
-    int rows_used = (g_theme_count + 2) / 3;
-    cy2 += rows_used * (chip_h + chip_gap) + 10;
+    render_quad(r, px, tab_y + tab_h - 1, pw, 1, COL_BORDER);
 
-    /* --- Row density --- */
-    render_text(r, "Row density", lx, cy2, COL_SUBTEXT);
-    cy2 += 22;
-    {
+    /* Content */
+    float cy2 = tab_y + tab_h + 20;
+
+    if (g_settings_tab == 0) {
+        /* -------- General tab -------- */
+        /* --- Theme --- */
+        render_text(r, "Theme", lx, cy2, COL_SUBTEXT);
+        cy2 += 22;
+        theme_discover();
+        float chip_h = 32, chip_gap = 6;
+        for (int i = 0; i < g_theme_count; i++) {
+            float chip_w = (pw - 48 - chip_gap * 2) / 3;
+            int col_i = i % 3, row_i = i / 3;
+            float bx = lx + col_i * (chip_w + chip_gap);
+            float by = cy2 + row_i * (chip_h + chip_gap);
+            int selected = (_stricmp(g_theme_current, g_themes[i].display) == 0);
+            if (settings_row_button(r, bx, by, chip_w, chip_h,
+                                    g_themes[i].display, selected, UIID(710 + i))) {
+                theme_apply_file(g_themes[i].path);
+            }
+        }
+        int rows_used = (g_theme_count + 2) / 3;
+        cy2 += rows_used * (chip_h + chip_gap) + 10;
+
+        /* --- Row density --- */
+        render_text(r, "Row density", lx, cy2, COL_SUBTEXT);
+        cy2 += 22;
         struct { const char* label; int rh; } opts[3] = {
             { "Compact", 17 }, { "Normal", 20 }, { "Roomy", 24 }
         };
@@ -6107,22 +6164,18 @@ static void build_settings_modal(void) {
         for (int i = 0; i < 3; i++) {
             int selected = (g_pref_row_h == opts[i].rh);
             if (settings_row_button(r, lx + i * (ow + chip_gap), cy2,
-                                    ow, chip_h,
-                                    opts[i].label, selected, UIID(720 + i))) {
+                                    ow, chip_h, opts[i].label, selected, UIID(720 + i))) {
                 g_pref_row_h = opts[i].rh;
                 g_row_h      = opts[i].rh;
                 settings_save();
             }
         }
         cy2 += chip_h + 10;
-    }
 
-    /* --- Font size --- */
-    render_text(r, "Font size (applies on next launch)", lx, cy2, COL_SUBTEXT);
-    cy2 += 22;
-    {
+        /* --- Font size --- */
+        render_text(r, "Font size (applies on next launch)", lx, cy2, COL_SUBTEXT);
+        cy2 += 22;
         float bw = 34, bh = chip_h;
-        /* [ − ]  N pt  [ + ] */
         if (settings_row_button(r, lx, cy2, bw, bh, "-", 0, UIID(730))) {
             if (g_pref_font_size > 9) { g_pref_font_size--; g_pref_font_needs_restart = 1; settings_save(); }
         }
@@ -6134,16 +6187,117 @@ static void build_settings_modal(void) {
             if (g_pref_font_size < 16) { g_pref_font_size++; g_pref_font_needs_restart = 1; settings_save(); }
         }
         if (g_pref_font_needs_restart)
-            render_text_small(r, "Restart to apply new font size",
+            render_text_small(r, "Restart to apply",
                               lx + bw + 90 + bw + 20,
                               floorf(cy2 + (bh - r->fonts[1].font_height) / 2),
                               COL_ACCENT);
-        cy2 += bh + 10;
-    }
+    } else {
+        /* -------- Shortcuts tab -------- */
+        struct { const char* section; const char* key; const char* desc; } rows[] = {
+            { "Tabs",       "Ctrl+T",           "New tab in current folder"        },
+            { NULL,         "Ctrl+W",           "Close current tab"                },
+            { NULL,         "Ctrl+Shift+T",     "Reopen last closed tab"           },
+            { NULL,         "Ctrl+Tab",         "Next tab in panel"                },
+            { NULL,         "Shift+Tab",        "Previous tab in panel"            },
+            { "Navigation", "Enter",            "Open selected file / folder"      },
+            { NULL,         "Backspace",        "Go to parent folder"              },
+            { NULL,         "↑↓",               "Move selection"                   },
+            { NULL,         "Type letters",     "Jump to matching name"            },
+            { NULL,         "Ctrl+L",           "Edit path (breadcrumb)"           },
+            { "File ops",   "F2",               "Rename (single or batch)"         },
+            { NULL,         "Delete",           "Move to Recycle Bin"              },
+            { NULL,         "Shift+Delete",     "Delete permanently (with confirm)"},
+            { NULL,         "Ctrl+C / X / V",   "Copy / Cut / Paste files"         },
+            { NULL,         "Ctrl+A",           "Select all"                       },
+            { NULL,         "Ctrl+N",           "New file"                         },
+            { NULL,         "Ctrl+Shift+N",     "New folder"                       },
+            { NULL,         "F5",               "Refresh + clear thumbnail cache"  },
+            { "Panels",     "Ctrl+\\",          "Toggle split view"                },
+            { NULL,         "Tab (in split)",   "Switch active panel"              },
+            { "Search",     "Ctrl+F",           "Fuzzy find in current folder"     },
+            { NULL,         "Ctrl+R",           "Toggle recursive (in fuzzy)"      },
+            { NULL,         "Ctrl+.",           "Stop recursive scan"              },
+            { "Terminal",   "Ctrl+D",           "Open new terminal at folder"      },
+            { NULL,         "Ctrl+Shift+D",     "New tab in existing terminal"     },
+            { "Viewer",     "← / →",            "Previous / Next image"            },
+            { NULL,         "Wheel",            "Zoom toward cursor"               },
+            { NULL,         "Drag / 0",         "Pan / reset zoom"                 },
+            { NULL,         "R / L",            "Rotate right / left"              },
+            { NULL,         "H / V",            "Flip horizontal / vertical"       },
+            { NULL,         "F2 / Delete",      "Rename / delete image"            },
+            { NULL,         "Esc",              "Close viewer / modal / finder"    },
+        };
+        int n = (int)(sizeof(rows) / sizeof(rows[0]));
 
-    /* --- Footer hint --- */
-    render_text_small(r, "Press Esc to close  ·  Ctrl+Shift+T reloads theme from disk",
-                      lx, py + ph - 22, COL_DIM);
+        /* Scrollable list. Compute content height first, then clamp scroll
+           and render into a scissored area. */
+        float row_yh = 18;
+        float content_h = 0;
+        for (int i = 0; i < n; i++) {
+            if (rows[i].section && i > 0) content_h += 8;
+            content_h += row_yh;
+        }
+        int list_top    = (int)cy2 - 6;
+        int list_bottom = (int)(py + ph - 44);   /* footer strip lives below */
+        float view_h   = (float)(list_bottom - list_top);
+        g_settings_content_h = content_h;
+        g_settings_view_h    = view_h;
+        /* Pad content_h to account for the 6-px inset above cy2 and 8 px
+           breathing space below the last row. Using this SAME padded value
+           for both our wheel-scroll clamp AND the ui_scrollbar call keeps
+           them in agreement, so releasing the thumb doesn't snap back to
+           a clipped position. */
+        float padded_content = content_h + 6 + 8;
+        float max_scroll = (padded_content > view_h) ? (padded_content - view_h) : 0;
+        /* Wheel scroll when cursor is inside the modal panel */
+        int cursor_over_panel = (mx >= px && mx < px + pw && my >= py && my < py + ph);
+        if (cursor_over_panel && g_scroll_delta != 0) {
+            g_settings_scroll -= g_scroll_delta * (row_yh * 3);
+            g_scroll_delta = 0;
+        }
+        if (g_settings_scroll < 0) g_settings_scroll = 0;
+        if (g_settings_scroll > max_scroll) g_settings_scroll = max_scroll;
+
+        render_scissor(r, (int)px + 1, list_top, (int)pw - 2, (int)view_h);
+        float ry = cy2 - g_settings_scroll;
+        for (int i = 0; i < n; i++) {
+            if (rows[i].section && i > 0) ry += 8;
+            /* Skip render if row is above / below viewport (still advance ry) */
+            if (ry + row_yh >= list_top && ry <= list_bottom) {
+                if (rows[i].section) {
+                    render_text_small(r, rows[i].section, lx,
+                                      floorf(ry + (row_yh - r->fonts[1].font_height) / 2),
+                                      COL_ACCENT);
+                }
+                int kw = render_text_width(r, rows[i].key);
+                render_text(r, rows[i].key,
+                            lx + 200 - kw,
+                            floorf(ry + (row_yh - r->font_height) / 2),
+                            COL_TEXT);
+                render_text(r, rows[i].desc,
+                            lx + 220,
+                            floorf(ry + (row_yh - r->font_height) / 2),
+                            COL_SUBTEXT);
+            }
+            ry += row_yh;
+        }
+        render_scissor_reset(r);
+
+        /* Scrollbar — pass padded_content so its internal clamp matches ours */
+        if (max_scroll > 0) {
+            float new_scroll = ui_scrollbar(&g_ui, UIID(770),
+                                            px + pw - 12, (float)list_top,
+                                            10, view_h,
+                                            padded_content, g_settings_scroll);
+            g_settings_scroll = new_scroll;
+        }
+    }
+    if (g_settings_tab != 1) g_settings_scroll = 0;   /* reset when leaving Shortcuts */
+
+    /* Footer strip — separator + centered hint */
+    render_quad(r, px, py + ph - 40, pw, 1, COL_BORDER);
+    render_text_small(r, "Press Esc to close",
+                      lx, py + ph - 28, COL_DIM);
 }
 
 static void build_status_bar(void) {
@@ -6180,20 +6334,24 @@ static void build_ui(void) {
        chip / search result doesn't also trigger a click on the file /
        tab / button under it. Real input is restored right before the
        overlay renders (bottom of build_ui). */
-    int  saved_mx = g_ui.input.mouse_x, saved_my = g_ui.input.mouse_y;
-    int  saved_clk = g_ui.input.mouse_clicked, saved_rel = g_ui.input.mouse_released;
-    int  saved_dbl = g_ui.input.mouse_dblclick, saved_dn = g_ui.input.mouse_down;
-    int  overlay_open = (g_settings_open ||
-                         (g_ff_active && g_ff_panel == g_app.active_panel));
+    int   saved_mx = g_ui.input.mouse_x, saved_my = g_ui.input.mouse_y;
+    int   saved_clk = g_ui.input.mouse_clicked, saved_rel = g_ui.input.mouse_released;
+    int   saved_dbl = g_ui.input.mouse_dblclick, saved_dn = g_ui.input.mouse_down;
+    float saved_scroll = g_scroll_delta;
+    int   overlay_open = (g_settings_open ||
+                          (g_ff_active && g_ff_panel == g_app.active_panel));
     if (overlay_open) {
         /* Push mouse far off-screen and clear click flags so nothing hovers
-           or triggers underneath the overlay. */
+           or triggers underneath the overlay. Also stash the wheel delta so
+           file-list scroll handlers don't consume it — the overlay claims
+           it after restoration. */
         g_ui.input.mouse_x = -30000;
         g_ui.input.mouse_y = -30000;
         g_ui.input.mouse_clicked = 0;
         g_ui.input.mouse_released = 0;
         g_ui.input.mouse_dblclick = 0;
         g_ui.input.mouse_down = 0;
+        g_scroll_delta = 0;
     }
 
     /* Focus follows click: in split mode, clicking in either panel makes it active */
@@ -6291,6 +6449,7 @@ static void build_ui(void) {
         g_ui.input.mouse_released = saved_rel;
         g_ui.input.mouse_dblclick = saved_dbl;
         g_ui.input.mouse_down     = saved_dn;
+        g_scroll_delta            = saved_scroll;
     }
     build_fuzzy_finder();
     build_settings_modal();
@@ -6711,7 +6870,14 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else if (wp=='D' && ctrl) { handle_context_cmd(IDM_OPEN_TERMINAL, -1); }
         else if (wp=='N' && ctrl && shift) { do_new_folder(t); }
         else if (wp=='N' && ctrl) { do_new_file(t); }
-        else if (wp=='T' && ctrl && shift) { theme_load(); }
+        else if (wp=='T' && ctrl && shift) {
+            /* Reopen last closed tab */
+            char reopen_path[MAX_PATH];
+            if (closed_stack_pop(reopen_path, MAX_PATH)) {
+                new_tab(reopen_path);
+                g_needs_redraw = 1;
+            }
+        }
         else if (wp=='T' && ctrl) { new_tab(t->path); g_needs_redraw=1; }
         else if (wp == VK_TAB && (ctrl || shift)) {
             Panel* p = &g_app.panels[g_app.active_panel];
@@ -6741,27 +6907,31 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_needs_redraw = 1;
         }
         else if (wp=='W' && ctrl) { close_tab(g_app.panels[g_app.active_panel].active_tab); g_needs_redraw=1; }
-        else if (wp==VK_UP && t->selected > 0) {
-            t->selected--;
-            if (shift) {
-                int from = (t->sel_anchor >= 0) ? t->sel_anchor : t->selected;
-                sel_range(t, from, t->selected);
-            } else {
-                sel_only(t, t->selected);
+        else if (wp==VK_UP || wp==VK_DOWN || wp==VK_LEFT || wp==VK_RIGHT) {
+            /* Grid views navigate in 2D; Details view is linear. */
+            int step_v = 1;   /* rows step for Up/Down */
+            int is_grid = (t->view_mode == VM_SMALL_ICONS || t->view_mode == VM_LARGE_ICONS);
+            if (is_grid && t->grid_cols > 0) step_v = t->grid_cols;
+            int cur = t->selected;
+            if (cur < 0) cur = (wp == VK_UP || wp == VK_LEFT) ? t->entry_count - 1 : 0;
+            int target = cur;
+            if      (wp == VK_UP)    target = cur - step_v;
+            else if (wp == VK_DOWN)  target = cur + step_v;
+            else if (wp == VK_LEFT)  target = is_grid ? cur - 1 : cur - 1;
+            else if (wp == VK_RIGHT) target = is_grid ? cur + 1 : cur + 1;
+            if (target < 0) target = 0;
+            if (target >= t->entry_count) target = t->entry_count - 1;
+            if (target != t->selected || t->selected < 0) {
+                t->selected = target;
+                if (shift) {
+                    int from = (t->sel_anchor >= 0) ? t->sel_anchor : t->selected;
+                    sel_range(t, from, t->selected);
+                } else {
+                    sel_only(t, t->selected);
+                }
+                scroll_to_entry(t, t->selected);
+                g_needs_redraw = 1;
             }
-            scroll_to_entry(t, t->selected);
-            g_needs_redraw = 1;
-        }
-        else if (wp==VK_DOWN && t->selected < t->entry_count-1) {
-            t->selected++;
-            if (shift) {
-                int from = (t->sel_anchor >= 0) ? t->sel_anchor : t->selected;
-                sel_range(t, from, t->selected);
-            } else {
-                sel_only(t, t->selected);
-            }
-            scroll_to_entry(t, t->selected);
-            g_needs_redraw = 1;
         }
         g_needs_redraw = 1;
         return 0;
