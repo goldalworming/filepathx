@@ -114,6 +114,7 @@ typedef struct {
     int group_collapsed[MAX_GROUPS];
     int view_mode;  /* VM_DETAILS / SMALL_ICONS / LARGE_ICONS */
     int grid_cols;  /* updated by build_file_list each frame in icon views */
+    int truncated;  /* 1 if scan hit MAX_ENTRIES and kept only the newest 2048 */
 } Tab;
 
 typedef struct {
@@ -1215,16 +1216,57 @@ static void scan_directory(Tab* tab) {
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW(wpattern, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
+    /* When the buffer fills, we don't stop — we keep the newest 2048 by
+       replacing the oldest slot whenever a newer entry comes in. This
+       guarantees "today's files always show up" even on folders that
+       overflow the cap. Cost is one linear O(MAX_ENTRIES) rescan per
+       replacement — negligible for typical download-folder sizes. */
+    tab->truncated = 0;
+    int oldest_idx = -1;
+    FILETIME oldest_ft = {0, 0};
     do {
         if (fd.cFileName[0] == L'.' && fd.cFileName[1] == 0) continue;
         if (fd.cFileName[0] == L'.' && fd.cFileName[1] == L'.' && fd.cFileName[2] == 0) continue;
-        if (tab->entry_count >= MAX_ENTRIES) break;
-        FileEntry* e = &tab->entries[tab->entry_count++];
-        w_to_u8(fd.cFileName, e->name, MAX_PATH);
-        e->is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-        e->size = ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-        e->modified = fd.ftLastWriteTime;
-        e->group = compute_group(e->modified);
+
+        if (tab->entry_count < MAX_ENTRIES) {
+            FileEntry* e = &tab->entries[tab->entry_count++];
+            w_to_u8(fd.cFileName, e->name, MAX_PATH);
+            e->is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            e->size = ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            e->modified = fd.ftLastWriteTime;
+            e->group = compute_group(e->modified);
+            /* On the transition to full, cache the oldest entry */
+            if (tab->entry_count == MAX_ENTRIES) {
+                oldest_idx = 0;
+                oldest_ft = tab->entries[0].modified;
+                for (int i = 1; i < MAX_ENTRIES; i++) {
+                    if (CompareFileTime(&tab->entries[i].modified, &oldest_ft) < 0) {
+                        oldest_idx = i;
+                        oldest_ft = tab->entries[i].modified;
+                    }
+                }
+            }
+        } else {
+            tab->truncated = 1;
+            /* Skip if incoming entry is no newer than our oldest */
+            if (CompareFileTime(&fd.ftLastWriteTime, &oldest_ft) <= 0) continue;
+            /* Replace the oldest slot in place */
+            FileEntry* e = &tab->entries[oldest_idx];
+            w_to_u8(fd.cFileName, e->name, MAX_PATH);
+            e->is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            e->size = ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            e->modified = fd.ftLastWriteTime;
+            e->group = compute_group(e->modified);
+            /* Re-find the oldest slot for the next comparison */
+            oldest_idx = 0;
+            oldest_ft = tab->entries[0].modified;
+            for (int i = 1; i < MAX_ENTRIES; i++) {
+                if (CompareFileTime(&tab->entries[i].modified, &oldest_ft) < 0) {
+                    oldest_idx = i;
+                    oldest_ft = tab->entries[i].modified;
+                }
+            }
+        }
     } while (FindNextFileW(h, &fd));
     FindClose(h);
     /* Effective sort — respects the user's per-folder preference for
@@ -1381,6 +1423,14 @@ static void new_tab(const char* path) {
     memset(t, 0, sizeof(Tab));
     g_app.panels[g_app.active_panel].active_tab = g_app.panels[g_app.active_panel].tab_count++;
     tab_navigate(t, path, 0);
+    /* When a fresh tab opens on Downloads, default-collapse the older
+       groups so today's / this-week's files are visible immediately
+       without scrolling past thousands of old entries. User expansions
+       persist for the tab's lifetime (only reset on new_tab). */
+    if (g_downloads_path[0] && path_eq_ci(t->path, g_downloads_path)) {
+        t->group_collapsed[3] = 1;  /* Last month */
+        t->group_collapsed[4] = 1;  /* A long time ago */
+    }
     tabs_save();
 }
 
@@ -5733,11 +5783,12 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
         if (t->entries[i].is_dir) folders++; else files++;
     }
     int sel = sel_count(t);
-    char info[128];
+    char info[160];
+    const char* trunc = t->truncated ? "  (newest 2048 shown)" : "";
     if (sel > 0)
-        _snprintf(info, sizeof(info), "%d folders, %d files  (%d selected)", folders, files, sel);
+        _snprintf(info, sizeof(info), "%d folders, %d files  (%d selected)%s", folders, files, sel, trunc);
     else
-        _snprintf(info, sizeof(info), "%d folders, %d files", folders, files);
+        _snprintf(info, sizeof(info), "%d folders, %d files%s", folders, files, trunc);
     float ty = y + (STATUS_BAR_H - g_renderer.fonts[1].font_height) / 2;
     render_text_small(r, info, x0 + 10, ty, COL_SUBTEXT);
 
