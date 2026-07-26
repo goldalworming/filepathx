@@ -77,8 +77,7 @@ static int g_row_h = 20;
 #define IDM_VIEW_LARGE      1022
 
 /* ---- Data ---- */
-#define ENTRIES_INIT_CAP 512    /* initial entries capacity; grows by 2x on demand */
-#define MAX_ENTRIES 4096         /* kept only as a legacy alias; new code paths grow dynamically */
+#define MAX_ENTRIES 2048
 #define MAX_TABS    32
 #define MAX_HIST    32
 
@@ -103,25 +102,18 @@ typedef struct {
 typedef struct {
     char path[MAX_PATH];
     char title[64];
-    FileEntry* entries;              /* heap; grows dynamically as scan streams entries in */
-    unsigned char* sel_mask;         /* heap; grows in lockstep with entries */
-    int entries_cap;                 /* allocated capacity of entries[] and sel_mask[] */
+    FileEntry entries[MAX_ENTRIES];
     int entry_count;
     int selected;
     int sel_anchor;
+    unsigned char sel_mask[MAX_ENTRIES];
     float scroll_y, target_scroll;
     char history[MAX_HIST][MAX_PATH];
     int hist_count, hist_pos;
     int use_groups;
     int group_collapsed[MAX_GROUPS];
-    int view_mode;                   /* VM_DETAILS / SMALL_ICONS / LARGE_ICONS */
-    int grid_cols;                   /* updated by build_file_list each frame in icon views */
-    /* Async scan state */
-    volatile LONG scan_gen;          /* incremented on each scan_start; worker checks for cancel */
-    int scanning;                    /* 1 while worker is streaming entries into this tab */
-    char pending_select_name[MAX_PATH]; /* drain will select this name once its entry arrives */
-    char (*pending_sel_names)[MAX_PATH]; /* selection to restore after F5/watch refresh */
-    int pending_sel_count;
+    int view_mode;  /* VM_DETAILS / SMALL_ICONS / LARGE_ICONS */
+    int grid_cols;  /* updated by build_file_list each frame in icon views */
 } Tab;
 
 typedef struct {
@@ -221,14 +213,9 @@ static void watch_start(const char* path) {
     }
 }
 
-/* Forward decls used by IDropTarget below and by the async scanner */
+/* Forward decls used by IDropTarget below */
 static void scan_directory(Tab* tab);
 static void make_unique_name(const char* dir, const char* base_name, char* out, int out_n);
-static int  tab_entries_ensure_cap(Tab* t, int needed);
-static int  sort_prefs_lookup(const char* path, int* out_col, int* out_asc);
-static int  view_prefs_lookup(const char* path);
-static void scanner_init(void);
-static void scanner_shutdown(void);
 
 /* ---- IDropTarget: receive drops onto our window (drag between panels) ---- */
 typedef struct { IDropTargetVtbl* lpVtbl; LONG refs; } DT;
@@ -359,43 +346,28 @@ static int   g_marquee_panel  = -1;
 static float g_marquee_x0     = 0;   /* content-space (scroll-adjusted) start */
 static float g_marquee_y0     = 0;
 static int   g_marquee_additive = 0;
-static unsigned char* g_marquee_anchor = NULL;
-static int   g_marquee_anchor_cap = 0;
-
-/* Grow g_marquee_anchor to hold at least `needed` entries. */
-static void marquee_anchor_ensure(int needed) {
-    if (needed <= g_marquee_anchor_cap) return;
-    int new_cap = g_marquee_anchor_cap ? g_marquee_anchor_cap : 512;
-    while (new_cap < needed) new_cap *= 2;
-    unsigned char* nb = (unsigned char*)realloc(g_marquee_anchor, new_cap);
-    if (!nb) return;
-    memset(nb + g_marquee_anchor_cap, 0, new_cap - g_marquee_anchor_cap);
-    g_marquee_anchor     = nb;
-    g_marquee_anchor_cap = new_cap;
-}
+static unsigned char g_marquee_anchor[MAX_ENTRIES];
 
 static void start_drag_out(Tab* t) {
     if (g_dragging) return;
     /* Collect selected non-".." entries */
-    int* idxs = (int*)malloc((size_t)t->entry_count * sizeof(int));
-    if (!idxs) return;
-    int n = 0;
+    int idxs[MAX_ENTRIES], n = 0;
     for (int i = 0; i < t->entry_count; i++) {
         if (t->sel_mask[i] && strcmp(t->entries[i].name, "..") != 0)
             idxs[n++] = i;
     }
-    if (n == 0) { free(idxs); return; }
+    if (n == 0) return;
 
     WCHAR wdir[MAX_PATH];
     u8_to_w(t->path, wdir, MAX_PATH);
     PIDLIST_ABSOLUTE dir_pidl = NULL;
-    if (SHParseDisplayName(wdir, NULL, &dir_pidl, 0, NULL) != S_OK || !dir_pidl) { free(idxs); return; }
+    if (SHParseDisplayName(wdir, NULL, &dir_pidl, 0, NULL) != S_OK || !dir_pidl) return;
     IShellFolder* desktop = NULL;
-    if (SHGetDesktopFolder(&desktop) != S_OK) { CoTaskMemFree(dir_pidl); free(idxs); return; }
+    if (SHGetDesktopFolder(&desktop) != S_OK) { CoTaskMemFree(dir_pidl); return; }
     IShellFolder* folder = NULL;
     HRESULT hr = IShellFolder_BindToObject(desktop, dir_pidl, NULL, &IID_IShellFolder, (void**)&folder);
     IShellFolder_Release(desktop);
-    if (FAILED(hr) || !folder) { CoTaskMemFree(dir_pidl); free(idxs); return; }
+    if (FAILED(hr) || !folder) { CoTaskMemFree(dir_pidl); return; }
 
     LPITEMIDLIST* children = (LPITEMIDLIST*)calloc(n, sizeof(LPITEMIDLIST));
     int got = 0;
@@ -411,7 +383,6 @@ static void start_drag_out(Tab* t) {
         free(children);
         IShellFolder_Release(folder);
         CoTaskMemFree(dir_pidl);
-        free(idxs);
         return;
     }
 
@@ -433,7 +404,6 @@ static void start_drag_out(Tab* t) {
     free(children);
     IShellFolder_Release(folder);
     CoTaskMemFree(dir_pidl);
-    free(idxs);
 }
 
 /* UI ID offset (set per-panel during render to avoid ID collisions) */
@@ -1208,226 +1178,18 @@ static int compare_entries(const void* a, const void* b) {
     return g_sort_asc_cmp ? r : -r;
 }
 
-/* ---- Directory scanning (async worker thread) ----
-
-   Design:
-   - UI thread calls scan_start(tab); this snapshots UI state (selection to
-     restore, view mode, sort prefs), bumps tab->scan_gen (invalidates any
-     in-flight scan for this tab), and posts a request to the worker.
-   - Worker owns a single "current request" slot and a shared inbox buffer.
-     It reads FindFirstFileW/FindNextFileW in a loop, pushing FileEntry
-     items into the inbox under the scanner critical section.
-   - Between entries the worker checks whether a new request has arrived
-     (req_pending) or its generation was invalidated; either way it aborts.
-   - Worker throttles PostMessage(WM_APP_SCAN_BATCH) to ~20 Hz so huge
-     folders don't flood the message queue.
-   - UI drains the inbox on WM_APP_SCAN_BATCH / WM_APP_SCAN_DONE: appends
-     to tab->entries (growing capacity as needed), re-sorts, restores
-     name-based selection, and resolves any pending_select_name (used by
-     tab_go_up to select the leaf once its entry lands). */
-
-#define WM_APP_SCAN_BATCH  (WM_APP + 30)
-#define WM_APP_SCAN_DONE   (WM_APP + 31)
-
-typedef struct {
-    CRITICAL_SECTION cs;
-    HANDLE           event;
-    HANDLE           thread;
-    volatile int     quit;
-    int              initialized;
-
-    /* Request slot — UI writes, worker reads-and-clears */
-    Tab*             req_tab;
-    LONG             req_gen;
-    char             req_path[MAX_PATH];
-    int              req_pending;
-
-    /* Inbox — worker appends, UI drains */
-    Tab*             inbox_tab;
-    LONG             inbox_gen;
-    FileEntry*       inbox;
-    int              inbox_count;
-    int              inbox_cap;
-    int              inbox_done;
-    DWORD            last_post_tick;   /* PostMessage throttling */
-} Scanner;
-
-static Scanner g_scanner;
-
-static DWORD WINAPI scan_worker(LPVOID arg) {
-    (void)arg;
-    while (!g_scanner.quit) {
-        /* Wait for a job */
-        EnterCriticalSection(&g_scanner.cs);
-        int have = g_scanner.req_pending;
-        LeaveCriticalSection(&g_scanner.cs);
-        if (!have) {
-            WaitForSingleObject(g_scanner.event, 200);
-            continue;
-        }
-
-        /* Take the job and reset the inbox for it */
-        char my_path[MAX_PATH];
-        Tab* my_tab;
-        LONG my_gen;
-        EnterCriticalSection(&g_scanner.cs);
-        my_tab = g_scanner.req_tab;
-        my_gen = g_scanner.req_gen;
-        strncpy(my_path, g_scanner.req_path, MAX_PATH - 1);
-        my_path[MAX_PATH - 1] = 0;
-        g_scanner.req_pending = 0;
-        g_scanner.inbox_tab   = my_tab;
-        g_scanner.inbox_gen   = my_gen;
-        g_scanner.inbox_count = 0;
-        g_scanner.inbox_done  = 0;
-        LeaveCriticalSection(&g_scanner.cs);
-
-        /* Scan */
-        WCHAR wpattern[MAX_PATH + 4];
-        {
-            char pattern[MAX_PATH + 4];
-            _snprintf(pattern, sizeof(pattern), "%s\\*", my_path);
-            u8_to_w(pattern, wpattern, MAX_PATH + 4);
-        }
-        WIN32_FIND_DATAW fd;
-        HANDLE h = FindFirstFileW(wpattern, &fd);
-        if (h != INVALID_HANDLE_VALUE) {
-            do {
-                if (fd.cFileName[0] == L'.' && fd.cFileName[1] == 0) continue;
-                if (fd.cFileName[0] == L'.' && fd.cFileName[1] == L'.' && fd.cFileName[2] == 0) continue;
-
-                EnterCriticalSection(&g_scanner.cs);
-                /* Cancel checks: a new request queued, or our gen invalidated */
-                if (g_scanner.req_pending || g_scanner.inbox_gen != my_gen) {
-                    LeaveCriticalSection(&g_scanner.cs);
-                    break;
-                }
-                /* Grow inbox if needed */
-                if (g_scanner.inbox_count >= g_scanner.inbox_cap) {
-                    int new_cap = g_scanner.inbox_cap ? g_scanner.inbox_cap * 2 : 1024;
-                    FileEntry* nb = (FileEntry*)realloc(g_scanner.inbox, new_cap * sizeof(FileEntry));
-                    if (!nb) { LeaveCriticalSection(&g_scanner.cs); break; }
-                    g_scanner.inbox     = nb;
-                    g_scanner.inbox_cap = new_cap;
-                }
-                FileEntry* e = &g_scanner.inbox[g_scanner.inbox_count++];
-                w_to_u8(fd.cFileName, e->name, MAX_PATH);
-                e->is_dir   = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-                e->size     = ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-                e->modified = fd.ftLastWriteTime;
-                e->group    = compute_group(e->modified);
-
-                DWORD now = GetTickCount();
-                int post = (now - g_scanner.last_post_tick >= 50);
-                if (post) g_scanner.last_post_tick = now;
-                LeaveCriticalSection(&g_scanner.cs);
-                if (post && g_hwnd) PostMessageW(g_hwnd, WM_APP_SCAN_BATCH, 0, 0);
-            } while (FindNextFileW(h, &fd));
-            FindClose(h);
-        }
-
-        /* Mark done and notify UI (even on cancel, so drain can clear scanning flag) */
-        EnterCriticalSection(&g_scanner.cs);
-        if (g_scanner.inbox_gen == my_gen) g_scanner.inbox_done = 1;
-        LeaveCriticalSection(&g_scanner.cs);
-        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_SCAN_DONE, 0, 0);
-    }
-    return 0;
-}
-
-static void scanner_init(void) {
-    if (g_scanner.initialized) return;
-    InitializeCriticalSection(&g_scanner.cs);
-    g_scanner.event  = CreateEventW(NULL, FALSE, FALSE, NULL);
-    g_scanner.thread = CreateThread(NULL, 0, scan_worker, NULL, 0, NULL);
-    g_scanner.initialized = 1;
-}
-
-static void scanner_shutdown(void) {
-    if (!g_scanner.initialized) return;
-    g_scanner.quit = 1;
-    SetEvent(g_scanner.event);
-    WaitForSingleObject(g_scanner.thread, 2000);
-    CloseHandle(g_scanner.thread);
-    CloseHandle(g_scanner.event);
-    DeleteCriticalSection(&g_scanner.cs);
-    free(g_scanner.inbox);
-    g_scanner.initialized = 0;
-}
-
-/* Called on WM_APP_SCAN_BATCH / WM_APP_SCAN_DONE. Copies any pending
-   inbox entries into the target Tab, re-sorts, and resolves pending
-   selections. Safe to call at any time — stale batches are dropped. */
-static void scan_drain(void) {
-    EnterCriticalSection(&g_scanner.cs);
-    Tab* t   = g_scanner.inbox_tab;
-    LONG gen = g_scanner.inbox_gen;
-    int done = g_scanner.inbox_done;
-    int  n   = g_scanner.inbox_count;
-
-    /* Drop the inbox contents if they're for a stale tab/gen */
-    if (!t || gen != t->scan_gen) {
-        g_scanner.inbox_count = 0;
-        LeaveCriticalSection(&g_scanner.cs);
-        return;
-    }
-    if (n > 0) {
-        if (!tab_entries_ensure_cap(t, t->entry_count + n)) {
-            g_scanner.inbox_count = 0;
-            LeaveCriticalSection(&g_scanner.cs);
-            return;
-        }
-        memcpy(&t->entries[t->entry_count], g_scanner.inbox, n * sizeof(FileEntry));
-        t->entry_count += n;
-        g_scanner.inbox_count = 0;
-    }
-    LeaveCriticalSection(&g_scanner.cs);
-
-    if (n > 0) {
-        /* Re-sort — comparator globals were set by scan_start */
-        qsort(t->entries, t->entry_count, sizeof(FileEntry), compare_entries);
-        /* Sort shuffled indices, so rebuild sel_mask from pending names */
-        memset(t->sel_mask, 0, t->entries_cap);
-        if (t->pending_sel_names) {
-            for (int k = 0; k < t->pending_sel_count; k++)
-                for (int i = 0; i < t->entry_count; i++)
-                    if (strcmp(t->entries[i].name, t->pending_sel_names[k]) == 0) {
-                        t->sel_mask[i] = 1; break;
-                    }
-        }
-        if (t->pending_select_name[0]) {
-            for (int i = 0; i < t->entry_count; i++)
-                if (strcmp(t->entries[i].name, t->pending_select_name) == 0) {
-                    t->selected   = i;
-                    t->sel_anchor = i;
-                    t->sel_mask[i] = 1;
-                    scroll_to_entry(t, i);
-                    t->pending_select_name[0] = 0;
-                    break;
-                }
-        }
-    }
-
-    if (done) {
-        t->scanning = 0;
-        free(t->pending_sel_names);
-        t->pending_sel_names = NULL;
-        t->pending_sel_count = 0;
-        get_tab_title(t->path, t->title, sizeof(t->title));
-    }
-    g_needs_redraw = 1;
-}
-
+/* ---- Directory scanning ---- */
 static void scan_directory(Tab* tab) {
-    scanner_init();
-
-    /* Snapshot selection by NAME so refresh/watcher-fire don't lose it */
+    /* Save UI state by NAME so refresh/auto-watcher doesn't lose selection */
     char saved_sel_name[MAX_PATH] = {0};
+    char saved_anchor_name[MAX_PATH] = {0};
     if (tab->selected >= 0 && tab->selected < tab->entry_count)
         strncpy(saved_sel_name, tab->entries[tab->selected].name, MAX_PATH-1);
+    if (tab->sel_anchor >= 0 && tab->sel_anchor < tab->entry_count)
+        strncpy(saved_anchor_name, tab->entries[tab->sel_anchor].name, MAX_PATH-1);
     int n_sel = 0;
-    for (int i = 0; i < tab->entry_count; i++) if (tab->sel_mask[i]) n_sel++;
     char (*saved_names)[MAX_PATH] = NULL;
+    for (int i = 0; i < tab->entry_count; i++) if (tab->sel_mask[i]) n_sel++;
     if (n_sel > 0) {
         saved_names = (char(*)[MAX_PATH])calloc(n_sel, MAX_PATH);
         int k = 0;
@@ -1435,51 +1197,80 @@ static void scan_directory(Tab* tab) {
             if (tab->sel_mask[i])
                 strncpy(saved_names[k++], tab->entries[i].name, MAX_PATH-1);
     }
+    float saved_target_scroll = tab->target_scroll;
 
-    /* Reset tab state for new scan */
     tab->entry_count = 0;
-    tab->selected   = -1;
+    tab->selected = -1;
     tab->sel_anchor = -1;
-    if (tab->sel_mask) memset(tab->sel_mask, 0, tab->entries_cap);
-
+    memset(tab->sel_mask, 0, sizeof(tab->sel_mask));
     int is_downloads = (g_downloads_path[0] && path_eq_ci(tab->path, g_downloads_path));
     tab->view_mode   = view_prefs_lookup(tab->path);
     refresh_today();
+    WCHAR wpattern[MAX_PATH + 4];
+    {
+        char pattern[MAX_PATH + 4];
+        _snprintf(pattern, sizeof(pattern), "%s\\*", tab->path);
+        u8_to_w(pattern, wpattern, MAX_PATH + 4);
+    }
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wpattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.cFileName[0] == L'.' && fd.cFileName[1] == 0) continue;
+        if (fd.cFileName[0] == L'.' && fd.cFileName[1] == L'.' && fd.cFileName[2] == 0) continue;
+        if (tab->entry_count >= MAX_ENTRIES) break;
+        FileEntry* e = &tab->entries[tab->entry_count++];
+        w_to_u8(fd.cFileName, e->name, MAX_PATH);
+        e->is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        e->size = ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        e->modified = fd.ftLastWriteTime;
+        e->group = compute_group(e->modified);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    /* Effective sort — respects the user's per-folder preference for
+       every folder including Downloads. Date-groups only kick in on
+       Downloads when the sort is date-modified descending (the natural
+       "recent activity" arrangement). Any other sort (name, size, or
+       ascending date) turns groups off and behaves like any other
+       folder. */
     {
         int sc = g_app.sort_col, sa = g_app.sort_asc;
-        if (!sort_prefs_lookup(tab->path, &sc, &sa) && is_downloads) { sc = 2; sa = 0; }
-        g_app.sort_col   = sc;
-        g_app.sort_asc   = sa;
-        tab->use_groups  = is_downloads && (sc == 2 && sa == 0);
+        if (!sort_prefs_lookup(tab->path, &sc, &sa) && is_downloads) {
+            /* First visit to Downloads: default to date desc so the
+               familiar date-grouped view shows up. */
+            sc = 2; sa = 0;
+        }
+        g_app.sort_col = sc;
+        g_app.sort_asc = sa;
+        tab->use_groups = is_downloads && (sc == 2 && sa == 0);
         g_sort_col_cmp   = sc;
         g_sort_asc_cmp   = sa;
         g_use_groups_cmp = tab->use_groups;
     }
+    qsort(tab->entries, tab->entry_count, sizeof(FileEntry), compare_entries);
 
-    /* Hand pending selection state to the drain */
-    free(tab->pending_sel_names);
-    tab->pending_sel_names = saved_names;
-    tab->pending_sel_count = n_sel;
-    if (saved_sel_name[0]) {
-        strncpy(tab->pending_select_name, saved_sel_name, MAX_PATH-1);
-        tab->pending_select_name[MAX_PATH-1] = 0;
+    /* Restore selection by name match */
+    if (saved_names) {
+        for (int k = 0; k < n_sel; k++)
+            for (int i = 0; i < tab->entry_count; i++)
+                if (strcmp(tab->entries[i].name, saved_names[k]) == 0) {
+                    tab->sel_mask[i] = 1; break;
+                }
+        free(saved_names);
     }
-    /* Note: scroll not touched here — tab_navigate() zeroes it for fresh
-       navigation; F5/watcher fire preserve their existing scroll offset. */
+    if (saved_sel_name[0])
+        for (int i = 0; i < tab->entry_count; i++)
+            if (strcmp(tab->entries[i].name, saved_sel_name) == 0) {
+                tab->selected = i; break;
+            }
+    if (saved_anchor_name[0])
+        for (int i = 0; i < tab->entry_count; i++)
+            if (strcmp(tab->entries[i].name, saved_anchor_name) == 0) {
+                tab->sel_anchor = i; break;
+            }
+    tab->target_scroll = saved_target_scroll;
 
-    /* Bump generation (invalidates any in-flight scan for this tab) and
-       post the new request */
-    InterlockedIncrement(&tab->scan_gen);
-    EnterCriticalSection(&g_scanner.cs);
-    g_scanner.req_tab = tab;
-    g_scanner.req_gen = tab->scan_gen;
-    strncpy(g_scanner.req_path, tab->path, MAX_PATH-1);
-    g_scanner.req_path[MAX_PATH-1] = 0;
-    g_scanner.req_pending = 1;
-    LeaveCriticalSection(&g_scanner.cs);
-    SetEvent(g_scanner.event);
-
-    tab->scanning = 1;
+    get_tab_title(tab->path, tab->title, sizeof(tab->title));
     g_needs_redraw = 1;
 }
 
@@ -1517,12 +1308,11 @@ static void tab_navigate(Tab* tab, const char* path, int add_hist) {
     }
     strncpy(tab->path, norm, MAX_PATH-1);
     tab->path[MAX_PATH-1] = 0;
-    /* Fresh navigation — clear selection and any prior "pick this entry
-       once it arrives" state. scan_directory() handles the async fetch. */
+    /* Navigation: reset UI state so scan_directory's name-preserving logic
+       starts with a clean slate (no leaks from old folder). */
     tab->selected = -1;
     tab->sel_anchor = -1;
-    sel_clear(tab);
-    tab->pending_select_name[0] = 0;
+    memset(tab->sel_mask, 0, sizeof(tab->sel_mask));
     tab->target_scroll = 0;
     tab->scroll_y = 0;
     scan_directory(tab);
@@ -1539,11 +1329,15 @@ static void tab_go_up(Tab* tab) {
     if (strlen(parent) < 2) return;
     tab_navigate(tab, parent, 1);
     if (leaf[0]) {
-        /* Scan is async — hand the leaf name off to the drain, which will
-           select it once its entry lands (may be immediate for small
-           folders or a moment later for large ones). */
-        strncpy(tab->pending_select_name, leaf, MAX_PATH-1);
-        tab->pending_select_name[MAX_PATH-1] = 0;
+        for (int i = 0; i < tab->entry_count; i++) {
+            if (strcmp(tab->entries[i].name, leaf) == 0) {
+                tab->selected = i;
+                tab->sel_anchor = i;
+                tab->sel_mask[i] = 1;
+                scroll_to_entry(tab, i);
+                break;
+            }
+        }
     }
 }
 
@@ -1554,8 +1348,7 @@ static void tab_go_back(Tab* tab) {
         tab->path[MAX_PATH-1] = 0;
         tab->selected = -1;
         tab->sel_anchor = -1;
-        sel_clear(tab);
-        tab->pending_select_name[0] = 0;
+        memset(tab->sel_mask, 0, sizeof(tab->sel_mask));
         tab->target_scroll = 0;
         tab->scroll_y = 0;
         scan_directory(tab);
@@ -1571,8 +1364,7 @@ static void tab_go_forward(Tab* tab) {
         tab->path[MAX_PATH-1] = 0;
         tab->selected = -1;
         tab->sel_anchor = -1;
-        sel_clear(tab);
-        tab->pending_select_name[0] = 0;
+        memset(tab->sel_mask, 0, sizeof(tab->sel_mask));
         tab->target_scroll = 0;
         tab->scroll_y = 0;
         scan_directory(tab);
@@ -1583,42 +1375,10 @@ static void tab_go_forward(Tab* tab) {
 
 static Tab* active_tab(void) { return &g_app.panels[g_app.active_panel].tabs[g_app.panels[g_app.active_panel].active_tab]; }
 
-static void tab_alloc_buffers(Tab* t) {
-    if (!t->entries) {
-        t->entries     = (FileEntry*)calloc(ENTRIES_INIT_CAP, sizeof(FileEntry));
-        t->sel_mask    = (unsigned char*)calloc(ENTRIES_INIT_CAP, 1);
-        t->entries_cap = ENTRIES_INIT_CAP;
-    }
-}
-
-static void tab_free_buffers(Tab* t) {
-    free(t->entries);           t->entries = NULL;
-    free(t->sel_mask);          t->sel_mask = NULL;
-    free(t->pending_sel_names); t->pending_sel_names = NULL;
-    t->pending_sel_count = 0;
-    t->entries_cap = 0;
-}
-
-/* Ensure entries[] and sel_mask[] can hold `needed` entries. Grows by 2x. */
-static int tab_entries_ensure_cap(Tab* t, int needed) {
-    if (needed <= t->entries_cap) return 1;
-    int new_cap = t->entries_cap ? t->entries_cap : ENTRIES_INIT_CAP;
-    while (new_cap < needed) new_cap *= 2;
-    FileEntry* ne     = (FileEntry*)realloc(t->entries, new_cap * sizeof(FileEntry));
-    unsigned char* ns = (unsigned char*)realloc(t->sel_mask, new_cap);
-    if (!ne || !ns) { free(ne); free(ns); return 0; }
-    memset(ns + t->entries_cap, 0, new_cap - t->entries_cap);
-    t->entries     = ne;
-    t->sel_mask    = ns;
-    t->entries_cap = new_cap;
-    return 1;
-}
-
 static void new_tab(const char* path) {
     if (g_app.panels[g_app.active_panel].tab_count >= MAX_TABS) return;
     Tab* t = &g_app.panels[g_app.active_panel].tabs[g_app.panels[g_app.active_panel].tab_count];
     memset(t, 0, sizeof(Tab));
-    tab_alloc_buffers(t);
     g_app.panels[g_app.active_panel].active_tab = g_app.panels[g_app.active_panel].tab_count++;
     tab_navigate(t, path, 0);
     tabs_save();
@@ -1652,21 +1412,11 @@ static int closed_stack_pop(char* out, int n) {
 static void close_tab(int idx) {
     Panel* P = &g_app.panels[g_app.active_panel];
     if (P->tab_count <= 1) return;
-    if (idx < 0 || idx >= P->tab_count) return;
-    closed_stack_push(P->tabs[idx].path);
-    /* If the scanner has this tab as its target, disown it before the
-       shift below moves other tab data into this slot (otherwise the
-       async drain could write to the wrong tab). */
-    if (g_scanner.initialized) {
-        EnterCriticalSection(&g_scanner.cs);
-        if (g_scanner.req_tab   == &P->tabs[idx]) g_scanner.req_tab   = NULL;
-        if (g_scanner.inbox_tab == &P->tabs[idx]) g_scanner.inbox_tab = NULL;
-        LeaveCriticalSection(&g_scanner.cs);
-    }
-    tab_free_buffers(&P->tabs[idx]);
+    /* Remember the closed tab's path so Ctrl+Shift+T can reopen it */
+    if (idx >= 0 && idx < P->tab_count)
+        closed_stack_push(P->tabs[idx].path);
     for (int i = idx; i < P->tab_count - 1; i++)
         P->tabs[i] = P->tabs[i+1];
-    memset(&P->tabs[P->tab_count - 1], 0, sizeof(Tab));
     P->tab_count--;
     if (P->active_tab >= P->tab_count) P->active_tab = P->tab_count - 1;
     tabs_save();
@@ -4399,7 +4149,7 @@ static void scroll_to_entry(Tab* t, int idx) {
 }
 
 /* ---- Selection helpers ---- */
-static void sel_clear(Tab* t) { if (t->sel_mask) memset(t->sel_mask, 0, t->entries_cap); }
+static void sel_clear(Tab* t) { memset(t->sel_mask, 0, sizeof(t->sel_mask)); }
 
 static void sel_only(Tab* t, int i) {
     sel_clear(t);
@@ -4649,26 +4399,24 @@ static void filter_shell_menu(HMENU menu, int start_pos) {
    files in tab `t`. Returns IContextMenu* (caller releases) or NULL. */
 static IContextMenu* build_shell_menu(HMENU menu, HWND hwnd, Tab* t, UINT first_id) {
     /* Collect selected names */
-    int* idxs = (int*)malloc((size_t)t->entry_count * sizeof(int));
-    if (!idxs) return NULL;
-    int n = 0;
+    int idxs[MAX_ENTRIES], n = 0;
     for (int i = 0; i < t->entry_count; i++) {
         if (t->sel_mask[i] && strcmp(t->entries[i].name, "..") != 0)
             idxs[n++] = i;
     }
-    if (n == 0) { free(idxs); return NULL; }
+    if (n == 0) return NULL;
 
     WCHAR wpath[MAX_PATH];
     MultiByteToWideChar(CP_ACP, 0, t->path, -1, wpath, MAX_PATH);
     LPITEMIDLIST parent_pidl = NULL;
-    if (SHParseDisplayName(wpath, NULL, &parent_pidl, 0, NULL) != S_OK || !parent_pidl) { free(idxs); return NULL; }
+    if (SHParseDisplayName(wpath, NULL, &parent_pidl, 0, NULL) != S_OK || !parent_pidl) return NULL;
     IShellFolder* desktop = NULL;
-    if (SHGetDesktopFolder(&desktop) != S_OK) { CoTaskMemFree(parent_pidl); free(idxs); return NULL; }
+    if (SHGetDesktopFolder(&desktop) != S_OK) { CoTaskMemFree(parent_pidl); return NULL; }
     IShellFolder* folder = NULL;
     HRESULT hr = IShellFolder_BindToObject(desktop, parent_pidl, NULL, &IID_IShellFolder, (void**)&folder);
     IShellFolder_Release(desktop);
     CoTaskMemFree(parent_pidl);
-    if (FAILED(hr) || !folder) { free(idxs); return NULL; }
+    if (FAILED(hr) || !folder) return NULL;
 
     LPITEMIDLIST* pidls = (LPITEMIDLIST*)calloc(n, sizeof(LPITEMIDLIST));
     int got = 0;
@@ -4680,7 +4428,7 @@ static IContextMenu* build_shell_menu(HMENU menu, HWND hwnd, Tab* t, UINT first_
             && pidls[got])
             got++;
     }
-    if (got == 0) { free(pidls); IShellFolder_Release(folder); free(idxs); return NULL; }
+    if (got == 0) { free(pidls); IShellFolder_Release(folder); return NULL; }
 
     IContextMenu* ctx = NULL;
     hr = IShellFolder_GetUIObjectOf(folder, hwnd, got, (LPCITEMIDLIST*)pidls,
@@ -4697,7 +4445,6 @@ static IContextMenu* build_shell_menu(HMENU menu, HWND hwnd, Tab* t, UINT first_
     for (int i = 0; i < got; i++) CoTaskMemFree(pidls[i]);
     free(pidls);
     IShellFolder_Release(folder);
-    free(idxs);
     return ctx;
 }
 
@@ -5114,19 +4861,6 @@ static void build_tab_bar(float tabs_xmin, float tabs_xmax) {
         if (!g_mouse_down && g_tab_drag_idx >= 0) {
             if (g_tab_drag_active && drag_target != g_tab_drag_idx &&
                 drag_target >= 0 && drag_target < g_app.panels[g_app.active_panel].tab_count) {
-                /* Reorder shuffles tab slots — disown scanner pointers in
-                   this panel so the async drain can't write to the wrong
-                   slot post-swap. Any in-flight scan gets orphaned; a
-                   subsequent F5/navigate reissues it. */
-                Panel* P = &g_app.panels[g_app.active_panel];
-                if (g_scanner.initialized) {
-                    EnterCriticalSection(&g_scanner.cs);
-                    for (int i = 0; i < P->tab_count; i++) {
-                        if (g_scanner.req_tab   == &P->tabs[i]) g_scanner.req_tab   = NULL;
-                        if (g_scanner.inbox_tab == &P->tabs[i]) g_scanner.inbox_tab = NULL;
-                    }
-                    LeaveCriticalSection(&g_scanner.cs);
-                }
                 Tab tmp = g_app.panels[g_app.active_panel].tabs[g_tab_drag_idx];
                 int was_active = (g_app.panels[g_app.active_panel].active_tab == g_tab_drag_idx);
                 if (g_tab_drag_idx < drag_target) {
@@ -5629,9 +5363,8 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
                 g_marquee_x0     = (float)g_mouse_x - lx;
                 g_marquee_y0     = (float)g_mouse_y - ly + t->scroll_y;
                 g_marquee_additive = ctrl_p;
-                marquee_anchor_ensure(t->entries_cap);
-                if (ctrl_p) memcpy(g_marquee_anchor, t->sel_mask, t->entries_cap);
-                else        { memset(g_marquee_anchor, 0, g_marquee_anchor_cap);
+                if (ctrl_p) memcpy(g_marquee_anchor, t->sel_mask, sizeof(g_marquee_anchor));
+                else        { memset(g_marquee_anchor, 0, sizeof(g_marquee_anchor));
                               sel_clear(t); t->selected = -1; t->sel_anchor = -1; }
             }
             /* Update + draw */
@@ -5721,18 +5454,8 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
     if (!g_mouse_down) { g_drag_idx = -1; g_drag_panel = -1; }
 
     /* Build row layout. Positive = entry_idx+1, Negative = -(group_idx+1). */
-    static int* rows      = NULL;
-    static int* entry_row = NULL;
-    static int  rows_cap  = 0;
-    int rows_needed = t->entry_count + MAX_GROUPS;
-    if (rows_needed > rows_cap) {
-        int nc = rows_cap ? rows_cap : 1024;
-        while (nc < rows_needed) nc *= 2;
-        int* nr = (int*)realloc(rows,      nc * sizeof(int));
-        int* ne = (int*)realloc(entry_row, nc * sizeof(int));
-        if (!nr || !ne) { free(nr); free(ne); render_scissor_reset(r); return; }
-        rows = nr; entry_row = ne; rows_cap = nc;
-    }
+    static int rows[MAX_ENTRIES + MAX_GROUPS];
+    static int entry_row[MAX_ENTRIES];
     int row_count = 0;
     for (int i = 0; i < t->entry_count; i++) entry_row[i] = -1;
     if (t->use_groups) {
@@ -6010,12 +5733,11 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
         if (t->entries[i].is_dir) folders++; else files++;
     }
     int sel = sel_count(t);
-    char info[160];
-    const char* scanning = t->scanning ? "  scanning\xe2\x80\xa6" : "";
+    char info[128];
     if (sel > 0)
-        _snprintf(info, sizeof(info), "%d folders, %d files  (%d selected)%s", folders, files, sel, scanning);
+        _snprintf(info, sizeof(info), "%d folders, %d files  (%d selected)", folders, files, sel);
     else
-        _snprintf(info, sizeof(info), "%d folders, %d files%s", folders, files, scanning);
+        _snprintf(info, sizeof(info), "%d folders, %d files", folders, files);
     float ty = y + (STATUS_BAR_H - g_renderer.fonts[1].font_height) / 2;
     render_text_small(r, info, x0 + 10, ty, COL_SUBTEXT);
 
@@ -7245,11 +6967,6 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_addr_hwnd) addr_edit_commit();
         return 0;
 
-    case WM_APP_SCAN_BATCH:
-    case WM_APP_SCAN_DONE:
-        scan_drain();
-        return 0;
-
     case WM_APP + 3: {
         /* Drain completed thumbnails: upload to GL + put in cache */
         ThumbDone done[THUMB_Q_CAP];
@@ -7298,7 +7015,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_ERASEBKGND: return 1;
-    case WM_CLOSE: scanner_shutdown(); PostQuitMessage(0); return 0;
+    case WM_CLOSE: PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
