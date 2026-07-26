@@ -77,7 +77,9 @@ static int g_row_h = 20;
 #define IDM_VIEW_LARGE      1022
 
 /* ---- Data ---- */
-#define MAX_ENTRIES 2048
+#define ENTRIES_INIT_CAP 2048    /* alloc lazily; grows by 2x on demand */
+#define ENTRIES_MAX_CAP  32768   /* upper bound; above this, replace-oldest kicks in */
+#define MAX_ENTRIES      ENTRIES_MAX_CAP  /* legacy alias for a few static UI helpers */
 #define MAX_TABS    32
 #define MAX_HIST    32
 
@@ -102,11 +104,12 @@ typedef struct {
 typedef struct {
     char path[MAX_PATH];
     char title[64];
-    FileEntry entries[MAX_ENTRIES];
+    FileEntry* entries;         /* heap; grows 2x from ENTRIES_INIT_CAP to ENTRIES_MAX_CAP */
+    unsigned char* sel_mask;    /* heap; grows in lockstep with entries */
+    int entries_cap;            /* allocated capacity of entries[] and sel_mask[] */
     int entry_count;
     int selected;
     int sel_anchor;
-    unsigned char sel_mask[MAX_ENTRIES];
     float scroll_y, target_scroll;
     char history[MAX_HIST][MAX_PATH];
     int hist_count, hist_pos;
@@ -114,7 +117,7 @@ typedef struct {
     int group_collapsed[MAX_GROUPS];
     int view_mode;  /* VM_DETAILS / SMALL_ICONS / LARGE_ICONS */
     int grid_cols;  /* updated by build_file_list each frame in icon views */
-    int truncated;  /* 1 if scan hit MAX_ENTRIES and kept only the newest 2048 */
+    int truncated;  /* 1 if scan hit ENTRIES_MAX_CAP and kept only the newest N */
 } Tab;
 
 typedef struct {
@@ -216,6 +219,7 @@ static void watch_start(const char* path) {
 
 /* Forward decls used by IDropTarget below */
 static void scan_directory(Tab* tab);
+static int  tab_entries_grow(Tab* t);
 static void make_unique_name(const char* dir, const char* base_name, char* out, int out_n);
 
 /* ---- IDropTarget: receive drops onto our window (drag between panels) ---- */
@@ -351,24 +355,28 @@ static unsigned char g_marquee_anchor[MAX_ENTRIES];
 
 static void start_drag_out(Tab* t) {
     if (g_dragging) return;
-    /* Collect selected non-".." entries */
-    int idxs[MAX_ENTRIES], n = 0;
+    /* Collect selected non-".." entries (heap-alloc: entry_count can now
+       be up to ENTRIES_MAX_CAP=32k which is too much for a stack array). */
+    if (t->entry_count == 0) return;
+    int* idxs = (int*)malloc((size_t)t->entry_count * sizeof(int));
+    if (!idxs) return;
+    int n = 0;
     for (int i = 0; i < t->entry_count; i++) {
         if (t->sel_mask[i] && strcmp(t->entries[i].name, "..") != 0)
             idxs[n++] = i;
     }
-    if (n == 0) return;
+    if (n == 0) { free(idxs); return; }
 
     WCHAR wdir[MAX_PATH];
     u8_to_w(t->path, wdir, MAX_PATH);
     PIDLIST_ABSOLUTE dir_pidl = NULL;
-    if (SHParseDisplayName(wdir, NULL, &dir_pidl, 0, NULL) != S_OK || !dir_pidl) return;
+    if (SHParseDisplayName(wdir, NULL, &dir_pidl, 0, NULL) != S_OK || !dir_pidl) { free(idxs); return; }
     IShellFolder* desktop = NULL;
-    if (SHGetDesktopFolder(&desktop) != S_OK) { CoTaskMemFree(dir_pidl); return; }
+    if (SHGetDesktopFolder(&desktop) != S_OK) { CoTaskMemFree(dir_pidl); free(idxs); return; }
     IShellFolder* folder = NULL;
     HRESULT hr = IShellFolder_BindToObject(desktop, dir_pidl, NULL, &IID_IShellFolder, (void**)&folder);
     IShellFolder_Release(desktop);
-    if (FAILED(hr) || !folder) { CoTaskMemFree(dir_pidl); return; }
+    if (FAILED(hr) || !folder) { CoTaskMemFree(dir_pidl); free(idxs); return; }
 
     LPITEMIDLIST* children = (LPITEMIDLIST*)calloc(n, sizeof(LPITEMIDLIST));
     int got = 0;
@@ -384,6 +392,7 @@ static void start_drag_out(Tab* t) {
         free(children);
         IShellFolder_Release(folder);
         CoTaskMemFree(dir_pidl);
+        free(idxs);
         return;
     }
 
@@ -405,6 +414,7 @@ static void start_drag_out(Tab* t) {
     free(children);
     IShellFolder_Release(folder);
     CoTaskMemFree(dir_pidl);
+    free(idxs);
 }
 
 /* UI ID offset (set per-panel during render to avoid ID collisions) */
@@ -1203,7 +1213,7 @@ static void scan_directory(Tab* tab) {
     tab->entry_count = 0;
     tab->selected = -1;
     tab->sel_anchor = -1;
-    memset(tab->sel_mask, 0, sizeof(tab->sel_mask));
+    sel_clear(tab);
     int is_downloads = (g_downloads_path[0] && path_eq_ci(tab->path, g_downloads_path));
     tab->view_mode   = view_prefs_lookup(tab->path);
     refresh_today();
@@ -1216,11 +1226,13 @@ static void scan_directory(Tab* tab) {
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW(wpattern, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
-    /* When the buffer fills, we don't stop — we keep the newest 2048 by
-       replacing the oldest slot whenever a newer entry comes in. This
-       guarantees "today's files always show up" even on folders that
-       overflow the cap. Cost is one linear O(MAX_ENTRIES) rescan per
-       replacement — negligible for typical download-folder sizes. */
+    /* Two-mode scan:
+       - Below ENTRIES_MAX_CAP: buffer grows on demand (2x doubling from
+         ENTRIES_INIT_CAP=2048 up to ENTRIES_MAX_CAP=32768). Most folders
+         land here — a 3000-file folder grows once to 4096 and stops.
+       - At ENTRIES_MAX_CAP: fall back to "keep newest by mtime" — every
+         further entry replaces the oldest slot if it's newer. Guarantees
+         today's files are visible even in monster folders (100k+). */
     tab->truncated = 0;
     int oldest_idx = -1;
     FILETIME oldest_ft = {0, 0};
@@ -1228,42 +1240,48 @@ static void scan_directory(Tab* tab) {
         if (fd.cFileName[0] == L'.' && fd.cFileName[1] == 0) continue;
         if (fd.cFileName[0] == L'.' && fd.cFileName[1] == L'.' && fd.cFileName[2] == 0) continue;
 
-        if (tab->entry_count < MAX_ENTRIES) {
+        /* Try to grow if the buffer is full and we're not yet at the max cap. */
+        if (tab->entry_count >= tab->entries_cap && tab->entries_cap < ENTRIES_MAX_CAP) {
+            if (!tab_entries_grow(tab)) break;   /* OOM — stop scan */
+        }
+
+        if (tab->entry_count < tab->entries_cap) {
             FileEntry* e = &tab->entries[tab->entry_count++];
             w_to_u8(fd.cFileName, e->name, MAX_PATH);
-            e->is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-            e->size = ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            e->is_dir   = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            e->size     = ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
             e->modified = fd.ftLastWriteTime;
-            e->group = compute_group(e->modified);
-            /* On the transition to full, cache the oldest entry */
-            if (tab->entry_count == MAX_ENTRIES) {
+            e->group    = compute_group(e->modified);
+            /* On the transition to full-at-MAX, cache the oldest entry
+               so subsequent replacements don't have to rescan every time
+               a stale entry comes in. */
+            if (tab->entry_count == tab->entries_cap && tab->entries_cap == ENTRIES_MAX_CAP) {
                 oldest_idx = 0;
-                oldest_ft = tab->entries[0].modified;
-                for (int i = 1; i < MAX_ENTRIES; i++) {
+                oldest_ft  = tab->entries[0].modified;
+                for (int i = 1; i < tab->entries_cap; i++) {
                     if (CompareFileTime(&tab->entries[i].modified, &oldest_ft) < 0) {
                         oldest_idx = i;
-                        oldest_ft = tab->entries[i].modified;
+                        oldest_ft  = tab->entries[i].modified;
                     }
                 }
             }
         } else {
+            /* At ENTRIES_MAX_CAP — replace-oldest if incoming is newer */
             tab->truncated = 1;
-            /* Skip if incoming entry is no newer than our oldest */
             if (CompareFileTime(&fd.ftLastWriteTime, &oldest_ft) <= 0) continue;
-            /* Replace the oldest slot in place */
             FileEntry* e = &tab->entries[oldest_idx];
             w_to_u8(fd.cFileName, e->name, MAX_PATH);
-            e->is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-            e->size = ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            e->is_dir   = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            e->size     = ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
             e->modified = fd.ftLastWriteTime;
-            e->group = compute_group(e->modified);
+            e->group    = compute_group(e->modified);
             /* Re-find the oldest slot for the next comparison */
             oldest_idx = 0;
-            oldest_ft = tab->entries[0].modified;
-            for (int i = 1; i < MAX_ENTRIES; i++) {
+            oldest_ft  = tab->entries[0].modified;
+            for (int i = 1; i < tab->entries_cap; i++) {
                 if (CompareFileTime(&tab->entries[i].modified, &oldest_ft) < 0) {
                     oldest_idx = i;
-                    oldest_ft = tab->entries[i].modified;
+                    oldest_ft  = tab->entries[i].modified;
                 }
             }
         }
@@ -1354,7 +1372,7 @@ static void tab_navigate(Tab* tab, const char* path, int add_hist) {
        starts with a clean slate (no leaks from old folder). */
     tab->selected = -1;
     tab->sel_anchor = -1;
-    memset(tab->sel_mask, 0, sizeof(tab->sel_mask));
+    sel_clear(tab);
     tab->target_scroll = 0;
     tab->scroll_y = 0;
     scan_directory(tab);
@@ -1390,7 +1408,7 @@ static void tab_go_back(Tab* tab) {
         tab->path[MAX_PATH-1] = 0;
         tab->selected = -1;
         tab->sel_anchor = -1;
-        memset(tab->sel_mask, 0, sizeof(tab->sel_mask));
+        sel_clear(tab);
         tab->target_scroll = 0;
         tab->scroll_y = 0;
         scan_directory(tab);
@@ -1406,7 +1424,7 @@ static void tab_go_forward(Tab* tab) {
         tab->path[MAX_PATH-1] = 0;
         tab->selected = -1;
         tab->sel_anchor = -1;
-        memset(tab->sel_mask, 0, sizeof(tab->sel_mask));
+        sel_clear(tab);
         tab->target_scroll = 0;
         tab->scroll_y = 0;
         scan_directory(tab);
@@ -1417,10 +1435,40 @@ static void tab_go_forward(Tab* tab) {
 
 static Tab* active_tab(void) { return &g_app.panels[g_app.active_panel].tabs[g_app.panels[g_app.active_panel].active_tab]; }
 
+static void tab_alloc_buffers(Tab* t) {
+    if (t->entries) return;
+    t->entries     = (FileEntry*)calloc(ENTRIES_INIT_CAP, sizeof(FileEntry));
+    t->sel_mask    = (unsigned char*)calloc(ENTRIES_INIT_CAP, 1);
+    t->entries_cap = ENTRIES_INIT_CAP;
+}
+
+static void tab_free_buffers(Tab* t) {
+    free(t->entries);  t->entries  = NULL;
+    free(t->sel_mask); t->sel_mask = NULL;
+    t->entries_cap = 0;
+}
+
+/* Try to double entries+sel_mask capacity up to ENTRIES_MAX_CAP. Returns
+   1 on success (or if already at max — nothing to do), 0 on OOM. */
+static int tab_entries_grow(Tab* t) {
+    if (t->entries_cap >= ENTRIES_MAX_CAP) return 1;
+    int new_cap = t->entries_cap * 2;
+    if (new_cap > ENTRIES_MAX_CAP) new_cap = ENTRIES_MAX_CAP;
+    FileEntry* ne     = (FileEntry*)realloc(t->entries,  new_cap * sizeof(FileEntry));
+    unsigned char* ns = (unsigned char*)realloc(t->sel_mask, new_cap);
+    if (!ne || !ns) { free(ne); free(ns); return 0; }
+    memset(ns + t->entries_cap, 0, new_cap - t->entries_cap);
+    t->entries     = ne;
+    t->sel_mask    = ns;
+    t->entries_cap = new_cap;
+    return 1;
+}
+
 static void new_tab(const char* path) {
     if (g_app.panels[g_app.active_panel].tab_count >= MAX_TABS) return;
     Tab* t = &g_app.panels[g_app.active_panel].tabs[g_app.panels[g_app.active_panel].tab_count];
     memset(t, 0, sizeof(Tab));
+    tab_alloc_buffers(t);
     g_app.panels[g_app.active_panel].active_tab = g_app.panels[g_app.active_panel].tab_count++;
     tab_navigate(t, path, 0);
     /* When a fresh tab opens on Downloads, default-collapse the older
@@ -1462,11 +1510,17 @@ static int closed_stack_pop(char* out, int n) {
 static void close_tab(int idx) {
     Panel* P = &g_app.panels[g_app.active_panel];
     if (P->tab_count <= 1) return;
-    /* Remember the closed tab's path so Ctrl+Shift+T can reopen it */
-    if (idx >= 0 && idx < P->tab_count)
-        closed_stack_push(P->tabs[idx].path);
+    if (idx < 0 || idx >= P->tab_count) return;
+    closed_stack_push(P->tabs[idx].path);
+    /* Free the closed tab's heap buffers before the shift copies data
+       from other slots on top of this one (which would leak the pointers
+       we're about to overwrite). */
+    tab_free_buffers(&P->tabs[idx]);
     for (int i = idx; i < P->tab_count - 1; i++)
         P->tabs[i] = P->tabs[i+1];
+    /* Zero the now-vacant last slot so its old pointers aren't
+       double-freed by a future close_tab on the same physical slot. */
+    memset(&P->tabs[P->tab_count - 1], 0, sizeof(Tab));
     P->tab_count--;
     if (P->active_tab >= P->tab_count) P->active_tab = P->tab_count - 1;
     tabs_save();
@@ -4199,7 +4253,7 @@ static void scroll_to_entry(Tab* t, int idx) {
 }
 
 /* ---- Selection helpers ---- */
-static void sel_clear(Tab* t) { memset(t->sel_mask, 0, sizeof(t->sel_mask)); }
+static void sel_clear(Tab* t) { if (t->sel_mask) memset(t->sel_mask, 0, t->entries_cap); }
 
 static void sel_only(Tab* t, int i) {
     sel_clear(t);
@@ -4448,25 +4502,28 @@ static void filter_shell_menu(HMENU menu, int start_pos) {
 /* Append Windows Shell context menu items to `menu` for the currently-selected
    files in tab `t`. Returns IContextMenu* (caller releases) or NULL. */
 static IContextMenu* build_shell_menu(HMENU menu, HWND hwnd, Tab* t, UINT first_id) {
-    /* Collect selected names */
-    int idxs[MAX_ENTRIES], n = 0;
+    /* Collect selected names (heap-alloc — entry_count can be up to 32k) */
+    if (t->entry_count == 0) return NULL;
+    int* idxs = (int*)malloc((size_t)t->entry_count * sizeof(int));
+    if (!idxs) return NULL;
+    int n = 0;
     for (int i = 0; i < t->entry_count; i++) {
         if (t->sel_mask[i] && strcmp(t->entries[i].name, "..") != 0)
             idxs[n++] = i;
     }
-    if (n == 0) return NULL;
+    if (n == 0) { free(idxs); return NULL; }
 
     WCHAR wpath[MAX_PATH];
     MultiByteToWideChar(CP_ACP, 0, t->path, -1, wpath, MAX_PATH);
     LPITEMIDLIST parent_pidl = NULL;
-    if (SHParseDisplayName(wpath, NULL, &parent_pidl, 0, NULL) != S_OK || !parent_pidl) return NULL;
+    if (SHParseDisplayName(wpath, NULL, &parent_pidl, 0, NULL) != S_OK || !parent_pidl) { free(idxs); return NULL; }
     IShellFolder* desktop = NULL;
-    if (SHGetDesktopFolder(&desktop) != S_OK) { CoTaskMemFree(parent_pidl); return NULL; }
+    if (SHGetDesktopFolder(&desktop) != S_OK) { CoTaskMemFree(parent_pidl); free(idxs); return NULL; }
     IShellFolder* folder = NULL;
     HRESULT hr = IShellFolder_BindToObject(desktop, parent_pidl, NULL, &IID_IShellFolder, (void**)&folder);
     IShellFolder_Release(desktop);
     CoTaskMemFree(parent_pidl);
-    if (FAILED(hr) || !folder) return NULL;
+    if (FAILED(hr) || !folder) { free(idxs); return NULL; }
 
     LPITEMIDLIST* pidls = (LPITEMIDLIST*)calloc(n, sizeof(LPITEMIDLIST));
     int got = 0;
@@ -4478,7 +4535,7 @@ static IContextMenu* build_shell_menu(HMENU menu, HWND hwnd, Tab* t, UINT first_
             && pidls[got])
             got++;
     }
-    if (got == 0) { free(pidls); IShellFolder_Release(folder); return NULL; }
+    if (got == 0) { free(pidls); IShellFolder_Release(folder); free(idxs); return NULL; }
 
     IContextMenu* ctx = NULL;
     hr = IShellFolder_GetUIObjectOf(folder, hwnd, got, (LPCITEMIDLIST*)pidls,
@@ -4495,6 +4552,7 @@ static IContextMenu* build_shell_menu(HMENU menu, HWND hwnd, Tab* t, UINT first_
     for (int i = 0; i < got; i++) CoTaskMemFree(pidls[i]);
     free(pidls);
     IShellFolder_Release(folder);
+    free(idxs);
     return ctx;
 }
 
@@ -5413,8 +5471,12 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
                 g_marquee_x0     = (float)g_mouse_x - lx;
                 g_marquee_y0     = (float)g_mouse_y - ly + t->scroll_y;
                 g_marquee_additive = ctrl_p;
-                if (ctrl_p) memcpy(g_marquee_anchor, t->sel_mask, sizeof(g_marquee_anchor));
-                else        { memset(g_marquee_anchor, 0, sizeof(g_marquee_anchor));
+                /* g_marquee_anchor is sized to ENTRIES_MAX_CAP but t->sel_mask
+                   may be smaller — only copy what the tab actually has. */
+                int mn = t->entries_cap < (int)sizeof(g_marquee_anchor)
+                         ? t->entries_cap : (int)sizeof(g_marquee_anchor);
+                if (ctrl_p) memcpy(g_marquee_anchor, t->sel_mask, mn);
+                else        { memset(g_marquee_anchor, 0, mn);
                               sel_clear(t); t->selected = -1; t->sel_anchor = -1; }
             }
             /* Update + draw */
@@ -5784,7 +5846,8 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
     }
     int sel = sel_count(t);
     char info[160];
-    const char* trunc = t->truncated ? "  (newest 2048 shown)" : "";
+    char trunc[48] = {0};
+    if (t->truncated) _snprintf(trunc, sizeof(trunc), "  (newest %d shown)", ENTRIES_MAX_CAP);
     if (sel > 0)
         _snprintf(info, sizeof(info), "%d folders, %d files  (%d selected)%s", folders, files, sel, trunc);
     else
