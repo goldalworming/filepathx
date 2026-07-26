@@ -102,11 +102,11 @@ typedef struct {
 typedef struct {
     char path[MAX_PATH];
     char title[64];
-    FileEntry entries[MAX_ENTRIES];
+    FileEntry* entries;      /* heap: MAX_ENTRIES capacity, allocated per active tab */
     int entry_count;
     int selected;
     int sel_anchor;
-    unsigned char sel_mask[MAX_ENTRIES];
+    unsigned char* sel_mask; /* heap: MAX_ENTRIES bytes, allocated per active tab */
     float scroll_y, target_scroll;
     char history[MAX_HIST][MAX_PATH];
     int hist_count, hist_pos;
@@ -1203,7 +1203,7 @@ static void scan_directory(Tab* tab) {
     tab->entry_count = 0;
     tab->selected = -1;
     tab->sel_anchor = -1;
-    memset(tab->sel_mask, 0, sizeof(tab->sel_mask));
+    memset(tab->sel_mask, 0, MAX_ENTRIES);
     int is_downloads = (g_downloads_path[0] && path_eq_ci(tab->path, g_downloads_path));
     tab->view_mode   = view_prefs_lookup(tab->path);
     refresh_today();
@@ -1314,7 +1314,7 @@ static void tab_navigate(Tab* tab, const char* path, int add_hist) {
        starts with a clean slate (no leaks from old folder). */
     tab->selected = -1;
     tab->sel_anchor = -1;
-    memset(tab->sel_mask, 0, sizeof(tab->sel_mask));
+    memset(tab->sel_mask, 0, MAX_ENTRIES);
     tab->target_scroll = 0;
     tab->scroll_y = 0;
     scan_directory(tab);
@@ -1350,7 +1350,7 @@ static void tab_go_back(Tab* tab) {
         tab->path[MAX_PATH-1] = 0;
         tab->selected = -1;
         tab->sel_anchor = -1;
-        memset(tab->sel_mask, 0, sizeof(tab->sel_mask));
+        memset(tab->sel_mask, 0, MAX_ENTRIES);
         tab->target_scroll = 0;
         tab->scroll_y = 0;
         scan_directory(tab);
@@ -1366,7 +1366,7 @@ static void tab_go_forward(Tab* tab) {
         tab->path[MAX_PATH-1] = 0;
         tab->selected = -1;
         tab->sel_anchor = -1;
-        memset(tab->sel_mask, 0, sizeof(tab->sel_mask));
+        memset(tab->sel_mask, 0, MAX_ENTRIES);
         tab->target_scroll = 0;
         tab->scroll_y = 0;
         scan_directory(tab);
@@ -1377,10 +1377,21 @@ static void tab_go_forward(Tab* tab) {
 
 static Tab* active_tab(void) { return &g_app.panels[g_app.active_panel].tabs[g_app.panels[g_app.active_panel].active_tab]; }
 
+static void tab_alloc_buffers(Tab* t) {
+    if (!t->entries)  t->entries  = (FileEntry*)calloc(MAX_ENTRIES, sizeof(FileEntry));
+    if (!t->sel_mask) t->sel_mask = (unsigned char*)calloc(MAX_ENTRIES, 1);
+}
+
+static void tab_free_buffers(Tab* t) {
+    free(t->entries);  t->entries  = NULL;
+    free(t->sel_mask); t->sel_mask = NULL;
+}
+
 static void new_tab(const char* path) {
     if (g_app.panels[g_app.active_panel].tab_count >= MAX_TABS) return;
     Tab* t = &g_app.panels[g_app.active_panel].tabs[g_app.panels[g_app.active_panel].tab_count];
     memset(t, 0, sizeof(Tab));
+    tab_alloc_buffers(t);
     g_app.panels[g_app.active_panel].active_tab = g_app.panels[g_app.active_panel].tab_count++;
     tab_navigate(t, path, 0);
     tabs_save();
@@ -1414,11 +1425,12 @@ static int closed_stack_pop(char* out, int n) {
 static void close_tab(int idx) {
     Panel* P = &g_app.panels[g_app.active_panel];
     if (P->tab_count <= 1) return;
-    /* Remember the closed tab's path so Ctrl+Shift+T can reopen it */
-    if (idx >= 0 && idx < P->tab_count)
-        closed_stack_push(P->tabs[idx].path);
+    if (idx < 0 || idx >= P->tab_count) return;
+    closed_stack_push(P->tabs[idx].path);
+    tab_free_buffers(&P->tabs[idx]);
     for (int i = idx; i < P->tab_count - 1; i++)
         P->tabs[i] = P->tabs[i+1];
+    memset(&P->tabs[P->tab_count - 1], 0, sizeof(Tab));
     P->tab_count--;
     if (P->active_tab >= P->tab_count) P->active_tab = P->tab_count - 1;
     tabs_save();
@@ -4151,7 +4163,7 @@ static void scroll_to_entry(Tab* t, int idx) {
 }
 
 /* ---- Selection helpers ---- */
-static void sel_clear(Tab* t) { memset(t->sel_mask, 0, sizeof(t->sel_mask)); }
+static void sel_clear(Tab* t) { memset(t->sel_mask, 0, MAX_ENTRIES); }
 
 static void sel_only(Tab* t, int i) {
     sel_clear(t);
