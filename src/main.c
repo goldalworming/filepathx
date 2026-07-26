@@ -77,7 +77,7 @@ static int g_row_h = 20;
 #define IDM_VIEW_LARGE      1022
 
 /* ---- Data ---- */
-#define MAX_ENTRIES 2048
+#define MAX_ENTRIES 4096
 #define MAX_TABS    32
 #define MAX_HIST    32
 
@@ -114,6 +114,7 @@ typedef struct {
     int group_collapsed[MAX_GROUPS];
     int view_mode;  /* VM_DETAILS / SMALL_ICONS / LARGE_ICONS */
     int grid_cols;  /* updated by build_file_list each frame in icon views */
+    int truncated;  /* 1 if scan hit MAX_ENTRIES cap and stopped early */
 } Tab;
 
 typedef struct {
@@ -1215,10 +1216,11 @@ static void scan_directory(Tab* tab) {
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW(wpattern, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
+    tab->truncated = 0;
     do {
         if (fd.cFileName[0] == L'.' && fd.cFileName[1] == 0) continue;
         if (fd.cFileName[0] == L'.' && fd.cFileName[1] == L'.' && fd.cFileName[2] == 0) continue;
-        if (tab->entry_count >= MAX_ENTRIES) break;
+        if (tab->entry_count >= MAX_ENTRIES) { tab->truncated = 1; break; }
         FileEntry* e = &tab->entries[tab->entry_count++];
         w_to_u8(fd.cFileName, e->name, MAX_PATH);
         e->is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
@@ -5733,11 +5735,12 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
         if (t->entries[i].is_dir) folders++; else files++;
     }
     int sel = sel_count(t);
-    char info[128];
+    char info[160];
+    const char* trunc = t->truncated ? "  \xe2\x9a\xa0 truncated at 4096" : "";
     if (sel > 0)
-        _snprintf(info, sizeof(info), "%d folders, %d files  (%d selected)", folders, files, sel);
+        _snprintf(info, sizeof(info), "%d folders, %d files  (%d selected)%s", folders, files, sel, trunc);
     else
-        _snprintf(info, sizeof(info), "%d folders, %d files", folders, files);
+        _snprintf(info, sizeof(info), "%d folders, %d files%s", folders, files, trunc);
     float ty = y + (STATUS_BAR_H - g_renderer.fonts[1].font_height) / 2;
     render_text_small(r, info, x0 + 10, ty, COL_SUBTEXT);
 
