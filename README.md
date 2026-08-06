@@ -29,7 +29,7 @@ A fast, keyboard-friendly Windows file manager written in pure C with OpenGL 3.3
 
 ### Integration
 - **Shell context menu** — right-click invokes the real Windows context menu via `IContextMenu`, including *Open with*, *Send to*, *Properties*, etc. (Convert to / Rotate / Scan With are filtered out as noise)
-- **Open terminal in the current folder** — `Ctrl+D` launches your default terminal rooted at the focused tab's path
+- **Open terminal in the current folder** — `Ctrl+D` launches a terminal rooted at the focused tab's path, `Ctrl+Shift+D` adds a tab to the terminal window you already have open. Which shell it starts is picked in *Settings → General → Terminal* (see [Terminal](#terminal)), so it no longer depends on Windows Terminal's own default profile
 - **Recycle Bin** entry in the sidebar opens the system Recycle Bin
 - **Bookmarks** sidebar — right-click *Remove from bookmarks*; bookmarks are saved to `%APPDATA%\filepathx\bookmarks.txt`
 - **File-system watcher** — directory contents auto-refresh when files are added/removed/renamed externally
@@ -75,7 +75,8 @@ gcc -O2 -Wall -o build/FilePathX.exe \
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
 | `Ctrl+\` | Toggle split view |
 | `Ctrl+L` | Edit path |
-| `Ctrl+D` | Open terminal in current folder |
+| `Ctrl+D` | Open terminal in current folder (shell configurable — see [Terminal](#terminal)) |
+| `Ctrl+Shift+D` | New tab in the existing terminal window |
 | `Ctrl+N` | New empty file |
 | `Ctrl+Shift+N` | New folder |
 | `F2` | Rename (works on multi-selection → batch rename) |
@@ -94,6 +95,33 @@ State is saved under `%APPDATA%\filepathx\`:
 - `tabs.txt` — active index + one path per line
 - `sort.txt` — per-folder sort preference (LRU, capped at 200)
 - `view.txt` — per-folder view mode (LRU)
+- `settings.ini` — theme-independent preferences (font size, row density, terminal)
+
+## Terminal
+
+`Ctrl+D` shells out through `wt.exe`, so without a preference the shell you get is whatever
+profile Windows Terminal has set as its default — which is why the same build can open Command
+Prompt on one machine and PowerShell on another. *Settings → General → Terminal* pins it:
+
+| Chip | Launches |
+| --- | --- |
+| Default | Windows Terminal's own default profile (previous behaviour) |
+| Command Prompt | `cmd.exe` |
+| PowerShell | `powershell.exe` (Windows PowerShell 5) |
+| PowerShell 7 | `pwsh.exe` |
+
+The choice is stored as `terminal = 0..3` in `%APPDATA%\filepathx\settings.ini` and applies
+immediately. If `wt.exe` is missing, the selected shell is launched directly in the folder.
+
+For any other terminal emulator, set `terminal_cmd` (and optionally `terminal_args`, where
+`{dir}` is replaced with the folder) in the same file. When `terminal_cmd` is set it overrides
+the chips, which the Settings panel shows as `Custom: …`:
+
+```ini
+terminal = 1
+; terminal_cmd  = wezterm.exe
+; terminal_args = start --cwd "{dir}"
+```
 
 ## Architecture
 

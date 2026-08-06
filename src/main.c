@@ -440,6 +440,13 @@ static float g_settings_content_h = 0;
 static float g_settings_view_h    = 0;
 static int g_pref_font_size     = 11;   /* applied on next launch */
 static int g_pref_row_h         = 20;   /* applied immediately    */
+/* Terminal preference: 0 = Windows Terminal's own default profile,
+   1 = cmd.exe, 2 = Windows PowerShell, 3 = PowerShell 7 (pwsh).
+   g_pref_terminal_cmd, when set in settings.ini, overrides all of the above
+   with a custom terminal; {dir} in g_pref_terminal_args becomes the folder. */
+static int  g_pref_terminal = 0;
+static char g_pref_terminal_cmd [MAX_PATH] = "";
+static char g_pref_terminal_args[512]      = "";
 /* Session-scoped feedback for "font size will change on next launch" */
 static int g_pref_font_needs_restart = 0;
 
@@ -454,6 +461,11 @@ static void settings_save(void) {
     if (!f) return;
     fprintf(f, "font_size = %d\r\n", g_pref_font_size);
     fprintf(f, "row_h = %d\r\n",     g_pref_row_h);
+    fprintf(f, "terminal = %d\r\n",  g_pref_terminal);
+    /* Written back so a chip click (which rewrites the whole file) does not
+       drop a hand-edited custom terminal. */
+    if (g_pref_terminal_cmd [0]) fprintf(f, "terminal_cmd = %s\r\n",  g_pref_terminal_cmd);
+    if (g_pref_terminal_args[0]) fprintf(f, "terminal_args = %s\r\n", g_pref_terminal_args);
     fclose(f);
 }
 
@@ -462,7 +474,7 @@ static void settings_load(void) {
     app_data_file("settings.ini", fp, MAX_PATH);
     FILE* f = u8_fopen(fp, "rb");
     if (!f) return;
-    char line[256];
+    char line[1024];
     while (fgets(line, sizeof(line), f)) {
         int n = (int)strlen(line);
         while (n > 0 && (line[n-1]=='\n' || line[n-1]=='\r' ||
@@ -482,6 +494,11 @@ static void settings_load(void) {
         int v = atoi(val);
         if (!strcmp(p, "font_size"))    g_pref_font_size = v;
         else if (!strcmp(p, "row_h"))   g_pref_row_h = v;
+        else if (!strcmp(p, "terminal")) g_pref_terminal = v;
+        else if (!strcmp(p, "terminal_cmd"))
+            lstrcpynA(g_pref_terminal_cmd,  val, MAX_PATH);
+        else if (!strcmp(p, "terminal_args"))
+            lstrcpynA(g_pref_terminal_args, val, (int)sizeof(g_pref_terminal_args));
     }
     fclose(f);
     /* Clamp */
@@ -489,6 +506,7 @@ static void settings_load(void) {
     if (g_pref_font_size > 16) g_pref_font_size = 16;
     if (g_pref_row_h < 14) g_pref_row_h = 14;
     if (g_pref_row_h > 32) g_pref_row_h = 32;
+    if (g_pref_terminal < 0 || g_pref_terminal > 3) g_pref_terminal = 0;
     g_row_h = g_pref_row_h;
 }
 
@@ -4098,6 +4116,89 @@ static void do_open_entry(Tab* t, int idx) {
     }
 }
 
+/* ---- Terminal launcher ---- */
+
+/* Shell exe for the current preference, or NULL to let Windows Terminal use
+   whatever profile it has set as its default. */
+static const char* terminal_shell_exe(void) {
+    switch (g_pref_terminal) {
+    case 1:  return "cmd.exe";
+    case 2:  return "powershell.exe";
+    case 3:  return "pwsh.exe";
+    default: return NULL;
+    }
+}
+
+/* `-d "C:\"` would have the backslash escape the closing quote, so a trailing
+   backslash gets a "." appended: `-d "C:\."` names the same folder. */
+static void terminal_quote_dir(const char* path, char* out, int n) {
+    int len = (int)strlen(path);
+    if (len > 0 && path[len-1] == '\\') _snprintf(out, n, "\"%s.\"", path);
+    else                                _snprintf(out, n, "\"%s\"",  path);
+    out[n-1] = 0;
+}
+
+/* Copy fmt into out, replacing every {dir} token with dir. */
+static void terminal_expand_args(const char* fmt, const char* dir, char* out, int n) {
+    int o = 0;
+    for (int i = 0; fmt[i] && o < n - 1; ) {
+        if (fmt[i] == '{' && !strncmp(fmt + i, "{dir}", 5)) {
+            for (int j = 0; dir[j] && o < n - 1; j++) out[o++] = dir[j];
+            i += 5;
+        } else {
+            out[o++] = fmt[i++];
+        }
+    }
+    out[o] = 0;
+}
+
+static void open_terminal_at(const char* path, int new_tab) {
+    WCHAR wpath[MAX_PATH];
+    u8_to_w(path, wpath, MAX_PATH);
+
+    /* A custom terminal from settings.ini wins; it has no notion of tabs. */
+    if (g_pref_terminal_cmd[0]) {
+        WCHAR wcmd[MAX_PATH];
+        u8_to_w(g_pref_terminal_cmd, wcmd, MAX_PATH);
+        if (g_pref_terminal_args[0]) {
+            char  cargs[1024];
+            WCHAR wcargs[1024];
+            terminal_expand_args(g_pref_terminal_args, path, cargs, sizeof(cargs));
+            u8_to_w(cargs, wcargs, 1024);
+            if ((INT_PTR)ShellExecuteW(NULL, L"open", wcmd, wcargs, wpath, SW_SHOWNORMAL) > 32)
+                return;
+        } else if ((INT_PTR)ShellExecuteW(NULL, L"open", wcmd, NULL, wpath, SW_SHOWNORMAL) > 32) {
+            return;
+        }
+        /* Custom terminal missing — fall through to the built-in launcher. */
+    }
+
+    const char* shell = terminal_shell_exe();
+    char qdir[MAX_PATH + 8];
+    terminal_quote_dir(path, qdir, sizeof(qdir));
+
+    /* `-w 0 nt` adds a tab to the most-recently-used wt window (wt spawns one
+       if there is none). A trailing exe name overrides the profile's own
+       commandline — unlike `-p "<profile>"`, exe names are not localised. */
+    char  args [MAX_PATH + 64];
+    WCHAR wargs[MAX_PATH + 64];
+    _snprintf(args, sizeof(args), "%s-d %s%s%s",
+              new_tab ? "-w 0 nt " : "", qdir,
+              shell ? " " : "", shell ? shell : "");
+    args[sizeof(args) - 1] = 0;
+    u8_to_w(args, wargs, MAX_PATH + 64);
+    if ((INT_PTR)ShellExecuteW(NULL, L"open", L"wt.exe", wargs, NULL, SW_SHOWNORMAL) > 32)
+        return;
+
+    /* No wt.exe (not installed, or its app execution alias is off) — run the
+       shell itself in the folder, degrading to one that does exist. */
+    static const WCHAR* chain[3] = { L"pwsh.exe", L"powershell.exe", L"cmd.exe" };
+    int start = (g_pref_terminal == 3) ? 0 : (g_pref_terminal == 2) ? 1 : 2;
+    for (int i = start; i < 3; i++)
+        if ((INT_PTR)ShellExecuteW(NULL, L"open", chain[i], NULL, wpath, SW_SHOWNORMAL) > 32)
+            return;
+}
+
 /* ---- Context menu ---- */
 static void handle_context_cmd(int cmd, int item_idx) {
     Tab* t = active_tab();
@@ -4142,31 +4243,13 @@ static void handle_context_cmd(int cmd, int item_idx) {
     case IDM_REFRESH:
         scan_directory(t);
         break;
-    case IDM_OPEN_TERMINAL: {
-        char args[MAX_PATH + 8];
-        _snprintf(args, sizeof(args), "-d \"%s\"", t->path);
-        WCHAR wargs[MAX_PATH + 8], wtpath[MAX_PATH];
-        u8_to_w(args, wargs, MAX_PATH + 8);
-        u8_to_w(t->path, wtpath, MAX_PATH);
-        HINSTANCE hi = ShellExecuteW(NULL, L"open", L"wt.exe", wargs, NULL, SW_SHOWNORMAL);
-        if ((INT_PTR)hi <= 32)
-            ShellExecuteW(NULL, L"open", L"cmd.exe", NULL, wtpath, SW_SHOWNORMAL);
+    case IDM_OPEN_TERMINAL:
+        open_terminal_at(t->path, 0);
         break;
-    }
-    case IDM_OPEN_TERMINAL_TAB: {
-        /* Add a new tab in the most-recently-used Windows Terminal window
-           at the current folder. `wt -w 0 nt -d "<path>"` — the `-w 0`
-           targets the MRU window; if none exists, wt spawns a new one. */
-        char args[MAX_PATH + 32];
-        _snprintf(args, sizeof(args), "-w 0 nt -d \"%s\"", t->path);
-        WCHAR wargs[MAX_PATH + 32], wtpath[MAX_PATH];
-        u8_to_w(args, wargs, MAX_PATH + 32);
-        u8_to_w(t->path, wtpath, MAX_PATH);
-        HINSTANCE hi = ShellExecuteW(NULL, L"open", L"wt.exe", wargs, NULL, SW_SHOWNORMAL);
-        if ((INT_PTR)hi <= 32)
-            ShellExecuteW(NULL, L"open", L"cmd.exe", NULL, wtpath, SW_SHOWNORMAL);
+    case IDM_OPEN_TERMINAL_TAB:
+        /* New tab in the existing terminal window, same folder. */
+        open_terminal_at(t->path, 1);
         break;
-    }
     case IDM_ADD_BOOKMARK:
         if (item_idx >= 0 && t->entries[item_idx].is_dir) {
             char fp[MAX_PATH];
@@ -6186,7 +6269,7 @@ static void build_settings_modal(void) {
 
     /* Panel — cap to available window height and scroll internally */
     float pw = 560;
-    float ph = (g_settings_tab == 1) ? 640 : 460;
+    float ph = (g_settings_tab == 1) ? 640 : 500;
     if (ph > g_height - 40) ph = g_height - 40;
     if (pw > g_width - 40) pw = g_width - 40;
     if (ph > g_height - 40) ph = g_height - 40;
@@ -6286,6 +6369,31 @@ static void build_settings_modal(void) {
         }
         cy2 += chip_h + 10;
 
+        /* --- Terminal --- */
+        render_text(r, "Terminal", lx, cy2, COL_SUBTEXT);
+        cy2 += 22;
+        const char* term_labels[4] = { "Default", "Command Prompt", "PowerShell", "PowerShell 7" };
+        int custom_term = (g_pref_terminal_cmd[0] != 0);
+        float tw4 = (pw - 48 - chip_gap * 3) / 4;
+        for (int i = 0; i < 4; i++) {
+            int selected = (!custom_term && g_pref_terminal == i);
+            if (settings_row_button(r, lx + i * (tw4 + chip_gap), cy2,
+                                    tw4, chip_h, term_labels[i], selected, UIID(740 + i))
+                && !custom_term) {
+                g_pref_terminal = i;
+                settings_save();
+            }
+        }
+        cy2 += chip_h + 4;
+        if (custom_term) {
+            /* settings.ini overrides the chips — say so instead of lying. */
+            char ct[MAX_PATH + 16];
+            _snprintf(ct, sizeof(ct), "Custom: %s", g_pref_terminal_cmd);
+            ct[sizeof(ct) - 1] = 0;
+            render_text_small(r, ct, lx, cy2, COL_ACCENT);
+        }
+        cy2 += 16;
+
         /* --- Font size --- */
         render_text(r, "Font size (applies on next launch)", lx, cy2, COL_SUBTEXT);
         cy2 += 22;
@@ -6331,7 +6439,7 @@ static void build_settings_modal(void) {
             { "Search",     "Ctrl+F",           "Fuzzy find in current folder"     },
             { NULL,         "Ctrl+R",           "Toggle recursive (in fuzzy)"      },
             { NULL,         "Ctrl+.",           "Stop recursive scan"              },
-            { "Terminal",   "Ctrl+D",           "Open new terminal at folder"      },
+            { "Terminal",   "Ctrl+D",           "New terminal at folder (see General)" },
             { NULL,         "Ctrl+Shift+D",     "New tab in existing terminal"     },
             { "Viewer",     "← / →",            "Previous / Next image"            },
             { NULL,         "Wheel",            "Zoom toward cursor"               },
