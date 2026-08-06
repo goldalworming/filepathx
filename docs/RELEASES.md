@@ -14,6 +14,14 @@ Catatan langkah-langkah untuk membuat / mengupdate release di
 
 ## Langkah-langkah
 
+### 0. Bump versi di `src/version.h`
+
+`APP_VERSION` harus sama dengan tag yang akan dirilis (tanpa prefix `v`) —
+auto-updater membandingkan nilai ini dengan tag release terbaru di GitHub.
+Nama asset **harus** tetap `FilePathX-win64.zip` dan berisi `FilePathX.exe`
+di root zip, karena updater mendownload
+`releases/download/<tag>/FilePathX-win64.zip` lalu mengambil exe-nya.
+
 ### 1. Build binary stripped
 
 ```bash
@@ -24,9 +32,9 @@ windres -I src src/resource.rc -O coff -o build/resource.o
 
 # Compile dengan -O2 -s (strip symbols) → exe ~360 KB
 gcc -O2 -s -Wall -o build/release/FilePathX.exe \
-    src/main.c src/render.c src/ui.c -Isrc build/resource.o \
+    src/main.c src/render.c src/ui.c src/update.c -Isrc build/resource.o \
     -lopengl32 -lgdi32 -luser32 -lshell32 -lshlwapi \
-    -ldwmapi -lole32 -luuid -luxtheme -mwindows
+    -ldwmapi -lole32 -luuid -luxtheme -lcomctl32 -lwinhttp -mwindows
 ```
 
 ### 2. Package zip

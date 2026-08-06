@@ -33,6 +33,7 @@ A fast, keyboard-friendly Windows file manager written in pure C with OpenGL 3.3
 - **Recycle Bin** entry in the sidebar opens the system Recycle Bin
 - **Bookmarks** sidebar — right-click *Remove from bookmarks*; bookmarks are saved to `%APPDATA%\filepathx\bookmarks.txt`
 - **File-system watcher** — directory contents auto-refresh when files are added/removed/renamed externally
+- **Auto-update** — checks GitHub Releases in the background (at most once per 24 h); when a newer version exists a dot appears on the Settings button and *Settings → General → Updates* offers one-click *Install and restart*
 
 ### Rendering & platform
 - **Full Unicode / UTF-8 throughout** — Cyrillic, Arabic, CJK, **emoji** (👋 🎉 🚀) all render correctly. UTF-8 is the internal encoding; wide Win32 APIs are used at every system boundary (`FindFirstFileW`, `MoveFileW`, `SHFileOperationW`, clipboard `CF_HDROP` wide format, ...)
@@ -61,9 +62,9 @@ Output: `build\FilePathX.exe`.
 export PATH="/path/to/w64devkit/bin:$PATH"
 windres -I src src/resource.rc -O coff -o build/resource.o
 gcc -O2 -Wall -o build/FilePathX.exe \
-    src/main.c src/render.c src/ui.c -Isrc build/resource.o \
+    src/main.c src/render.c src/ui.c src/update.c -Isrc build/resource.o \
     -lopengl32 -lgdi32 -luser32 -lshell32 -lshlwapi \
-    -ldwmapi -lole32 -luuid -luxtheme -mwindows
+    -ldwmapi -lole32 -luuid -luxtheme -lcomctl32 -lwinhttp -mwindows
 ```
 
 ## Keyboard shortcuts

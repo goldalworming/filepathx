@@ -13,6 +13,11 @@
 #include <math.h>
 #include "render.h"
 #include "ui.h"
+#include "update.h"
+#include "version.h"
+
+/* Posted by the auto-updater worker whenever its status changes */
+#define WM_UPDATE_STATUS (WM_APP + 30)
 
 #ifndef DROPEFFECT_COPY
 #define DROPEFFECT_COPY 1
@@ -5143,7 +5148,11 @@ static void build_toolbar(float x0, float x1) {
         render_quad(r, dx, cy - ds - dg - ds/2, ds, ds, dot_col);
         render_quad(r, dx, cy - ds/2,           ds, ds, dot_col);
         render_quad(r, dx, cy + dg + ds/2,      ds, ds, dot_col);
-        if (hov) tt_set("Settings", (int)(kb_x + kb_w/2), (int)(y + 2));
+        int upd_avail = (update_status() == UPDATE_AVAILABLE);
+        if (upd_avail)
+            render_quad(r, kb_x + kb_w - 8, y + 5, 4, 4, COL_ACCENT);
+        if (hov) tt_set(upd_avail ? "Settings — update available" : "Settings",
+                        (int)(kb_x + kb_w/2), (int)(y + 2));
         if (ui_clicked(&g_ui, UIID(210), kb_x, y+2, kb_w, TOOLBAR_H-4)) {
             g_settings_open = 1;
             g_needs_redraw = 1;
@@ -6269,7 +6278,7 @@ static void build_settings_modal(void) {
 
     /* Panel — cap to available window height and scroll internally */
     float pw = 560;
-    float ph = (g_settings_tab == 1) ? 640 : 500;
+    float ph = (g_settings_tab == 1) ? 640 : 600;
     if (ph > g_height - 40) ph = g_height - 40;
     if (pw > g_width - 40) pw = g_width - 40;
     if (ph > g_height - 40) ph = g_height - 40;
@@ -6413,6 +6422,48 @@ static void build_settings_modal(void) {
                               lx + bw + 90 + bw + 20,
                               floorf(cy2 + (bh - r->fonts[1].font_height) / 2),
                               COL_ACCENT);
+        cy2 += bh + 20;
+
+        /* --- Updates --- */
+        render_text(r, "Updates", lx, cy2, COL_SUBTEXT);
+        cy2 += 22;
+        {
+            int st = update_status();
+            char ver[64];
+            update_latest_version(ver, sizeof(ver));
+            char info[224];
+            switch (st) {
+            case UPDATE_CHECKING:
+                _snprintf(info, sizeof(info), "v" APP_VERSION " — checking for updates..."); break;
+            case UPDATE_AVAILABLE:
+                _snprintf(info, sizeof(info), "v" APP_VERSION " — update %s available", ver); break;
+            case UPDATE_DOWNLOADING:
+                _snprintf(info, sizeof(info), "v" APP_VERSION " — downloading %s...", ver); break;
+            case UPDATE_RESTART_PENDING:
+                _snprintf(info, sizeof(info), "Restarting to finish the update..."); break;
+            case UPDATE_ERROR:
+                _snprintf(info, sizeof(info), "v" APP_VERSION " — check failed: %s", update_error()); break;
+            case UPDATE_UP_TO_DATE:
+                _snprintf(info, sizeof(info), "v" APP_VERSION " — up to date"); break;
+            default:
+                _snprintf(info, sizeof(info), "v" APP_VERSION); break;
+            }
+            info[sizeof(info) - 1] = 0;
+            render_text(r, info, lx, cy2,
+                        (st == UPDATE_AVAILABLE) ? COL_ACCENT : COL_TEXT);
+            cy2 += r->font_height + 8;
+            float ubw = 170;
+            if (st == UPDATE_AVAILABLE) {
+                if (settings_row_button(r, lx, cy2, ubw, chip_h,
+                                        "Install and restart", 1, UIID(780)))
+                    update_install_async();
+            } else if (st != UPDATE_CHECKING && st != UPDATE_DOWNLOADING &&
+                       st != UPDATE_RESTART_PENDING) {
+                if (settings_row_button(r, lx, cy2, ubw, chip_h,
+                                        "Check for updates", 0, UIID(780)))
+                    update_check_async(1);
+            }
+        }
     } else {
         /* -------- Shortcuts tab -------- */
         struct { const char* section; const char* key; const char* desc; } rows[] = {
@@ -7210,6 +7261,13 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
+    case WM_UPDATE_STATUS:
+        /* Updater launched its swap-and-restart script — quit so the exe's
+           file lock drops and the script can overwrite us. */
+        if (update_status() == UPDATE_RESTART_PENDING) { PostQuitMessage(0); return 0; }
+        g_needs_redraw = 1;
+        return 0;
+
     case WM_CTLCOLOREDIT: {
         if ((HWND)lp != g_edit_hwnd && (HWND)lp != g_addr_hwnd) break;
         HDC hdc_edit = (HDC)wp;
@@ -7384,6 +7442,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int cmdShow)
     if (GetCurrentDirectoryW(MAX_PATH, wcwd) == 0) strcpy(cwd, "C:\\");
     else w_to_u8(wcwd, cwd, MAX_PATH);
     tabs_load(cwd);
+
+    /* Background update check (throttled to once per 24 h) */
+    {
+        char upf[MAX_PATH];
+        app_data_file("update.ini", upf, MAX_PATH);
+        update_init(g_hwnd, WM_UPDATE_STATUS, upf);
+        update_check_async(0);
+    }
 
     ShowWindow(g_hwnd, cmdShow);
     UpdateWindow(g_hwnd);
