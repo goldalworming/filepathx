@@ -3575,13 +3575,59 @@ static void viewer_delete(ViewerState* v) {
     viewer_load_current(v);
 }
 
+/* Put the currently-displayed file's full path onto the clipboard as text. */
+static void viewer_copy_path(ViewerState* v) {
+    if (!v || v->cur_index < 0 || v->cur_index >= v->sibling_count) return;
+    char fullp[MAX_PATH];
+    _snprintf(fullp, MAX_PATH, "%s\\%s", v->dir, v->siblings[v->cur_index]);
+    clipboard_copy_text(fullp);
+}
+
+/* Put a copy of the currently-displayed bitmap onto the clipboard as
+   CF_BITMAP. Uses CopyImage to make an independent HBITMAP the system
+   can own after SetClipboardData. */
+static void viewer_copy_image(ViewerState* v) {
+    if (!v || !v->bmp) return;
+    HBITMAP copy = (HBITMAP)CopyImage(v->bmp, IMAGE_BITMAP, 0, 0, 0);
+    if (!copy) return;
+    /* Same retry-loop mindset as clipboard_copy_text: another process may
+       hold the clipboard for a few ms right after e.g. a snip capture. */
+    int opened = 0;
+    for (int i = 0; i < 10; i++) {
+        if (OpenClipboard(v->hwnd)) { opened = 1; break; }
+        Sleep(15);
+    }
+    if (!opened) { DeleteObject(copy); return; }
+    EmptyClipboard();
+    SetClipboardData(CF_BITMAP, copy);   /* system owns `copy` now */
+    CloseClipboard();
+}
+
+/* Right-click menu: Copy path / Copy image. */
+static void viewer_show_context_menu(ViewerState* v, int screen_x, int screen_y) {
+    if (!v) return;
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING, 1, L"Copy path");
+    AppendMenuW(menu, MF_STRING | (v->bmp ? 0 : MF_GRAYED), 2, L"Copy image");
+    int cmd = TrackPopupMenu(menu,
+                             TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_NONOTIFY,
+                             screen_x, screen_y, 0, v->hwnd, NULL);
+    DestroyMenu(menu);
+    if (cmd == 1) viewer_copy_path(v);
+    else if (cmd == 2) viewer_copy_image(v);
+}
+
 /* ---- Toolbar layout ---- */
 /* Button IDs (hover_btn values):
-   1=Rename, 2=Delete, 3=Rotate Left, 4=Rotate Right, 5=Flip H, 6=Flip V. */
+   1=Rename, 2=Delete, 3=Rotate Left, 4=Rotate Right, 5=Flip H, 6=Flip V,
+   7=Copy Path. */
 typedef struct { int x, y, w, h, id; const WCHAR* label; int accent_kind; } ViewerBtn;
 /* accent_kind: 0=none (neutral text), 1=accent color, 2=red */
 
-static int viewer_layout_buttons(int cw, ViewerBtn* out /* size >= 6 */) {
+#define VIEWER_BTN_COUNT 7
+
+static int viewer_layout_buttons(int cw, ViewerBtn* out /* size >= VIEWER_BTN_COUNT */) {
     int bh = 28, by = 12;
     int gap = 6;
     /* Left cluster (transform actions) — icon-like square-ish buttons */
@@ -3595,18 +3641,20 @@ static int viewer_layout_buttons(int cw, ViewerBtn* out /* size >= 6 */) {
     out[2].id = 5; out[2].label = L"⇔";      out[2].accent_kind = 0;
     out[3].x = lx + 3*(transform_w + gap);    out[3].y = by; out[3].w = transform_w; out[3].h = bh;
     out[3].id = 6; out[3].label = L"⇕";      out[3].accent_kind = 0;
-    /* Right cluster: Rename, Delete */
-    int rename_w = 86, delete_w = 86;
-    int rx = cw - 12 - delete_w - gap - rename_w;
-    out[4].x = rx;                            out[4].y = by; out[4].w = rename_w; out[4].h = bh;
-    out[4].id = 1; out[4].label = L"Rename";  out[4].accent_kind = 1;
-    out[5].x = rx + rename_w + gap;           out[5].y = by; out[5].w = delete_w; out[5].h = bh;
-    out[5].id = 2; out[5].label = L"Delete";  out[5].accent_kind = 2;
-    return 6;
+    /* Right cluster: Copy Path, Rename, Delete */
+    int copy_w = 96, rename_w = 86, delete_w = 86;
+    int rx = cw - 12 - delete_w - gap - rename_w - gap - copy_w;
+    out[4].x = rx;                                            out[4].y = by; out[4].w = copy_w;   out[4].h = bh;
+    out[4].id = 7; out[4].label = L"Copy Path";               out[4].accent_kind = 0;
+    out[5].x = rx + copy_w + gap;                             out[5].y = by; out[5].w = rename_w; out[5].h = bh;
+    out[5].id = 1; out[5].label = L"Rename";                  out[5].accent_kind = 1;
+    out[6].x = rx + copy_w + gap + rename_w + gap;            out[6].y = by; out[6].w = delete_w; out[6].h = bh;
+    out[6].id = 2; out[6].label = L"Delete";                  out[6].accent_kind = 2;
+    return VIEWER_BTN_COUNT;
 }
 
 static int viewer_hit_btn(ViewerState* v, int x, int y) {
-    ViewerBtn btns[6];
+    ViewerBtn btns[VIEWER_BTN_COUNT];
     int n = viewer_layout_buttons(v->client_w, btns);
     for (int i = 0; i < n; i++) {
         if (x >= btns[i].x && x < btns[i].x + btns[i].w &&
@@ -3865,7 +3913,7 @@ static void viewer_paint(ViewerState* v, HDC hdc) {
 
     /* ---- Toolbar buttons ---- */
     {
-        ViewerBtn btns[6];
+        ViewerBtn btns[VIEWER_BTN_COUNT];
         int nb_btns = viewer_layout_buttons(cw, btns);
         /* Use a slightly larger font for the arrow glyphs so they're not tiny */
         HFONT bfont = CreateFontW(-15, 0, 0, 0, FW_NORMAL, 0, 0, 0,
@@ -3959,6 +4007,7 @@ static LRESULT CALLBACK viewer_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (bhit == 4) { viewer_apply_transform(v, 0); return 0; }  /* Rotate Right */
             if (bhit == 5) { viewer_apply_transform(v, 2); return 0; }  /* Flip H */
             if (bhit == 6) { viewer_apply_transform(v, 3); return 0; }  /* Flip V */
+            if (bhit == 7) { viewer_copy_path(v); return 0; }           /* Copy Path */
             int edge = v->client_w / 6;
             if (x < edge)                 { viewer_next(v, -1); return 0; }
             if (x > v->client_w - edge)   { viewer_next(v, +1); return 0; }
@@ -3985,6 +4034,15 @@ static LRESULT CALLBACK viewer_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_LBUTTONUP:
         if (v) { v->dragging = 0; ReleaseCapture(); }
+        return 0;
+    case WM_RBUTTONUP:
+        if (v) {
+            /* Position given by lp is client-relative; TrackPopupMenu wants
+               screen coords. */
+            POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            ClientToScreen(hwnd, &pt);
+            viewer_show_context_menu(v, pt.x, pt.y);
+        }
         return 0;
     case WM_LBUTTONDBLCLK:
         if (v) {
