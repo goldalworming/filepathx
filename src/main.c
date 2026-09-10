@@ -169,6 +169,14 @@ static HWND     g_hwnd;
 static int      g_width = 1000, g_height = 680;
 static int      g_mouse_x, g_mouse_y, g_mouse_down;
 static int      g_mouse_clicked, g_mouse_released, g_mouse_dblclick;
+/* Set on WM_LBUTTONDBLCLK, kept until the button-up frame is handled: list
+   rows act on release, so the OS double-click flag would otherwise be gone
+   by then. */
+static int      g_mouse_dbl_pending;
+/* Panel/item of the last double-click open — a rapid extra click arrives as
+   another WM_LBUTTONDBLCLK and must not open whatever entry replaced it. */
+static int      g_dbl_open_panel = -1, g_dbl_open_item = -1;
+static DWORD    g_dbl_open_tick;
 static float    g_scroll_delta;
 static int      g_needs_redraw = 1;
 static char     g_user_profile[MAX_PATH];
@@ -186,10 +194,20 @@ static int w_to_u8(const WCHAR* w, char* out, int outn) {
     if (n == 0 && outn > 0) out[0] = 0;
     return n;
 }
+/* Join a directory and a leaf without doubling the separator. Drive roots
+   ("D:\") already end with a backslash, so a plain "%s\\%s" join would store
+   and display "D:\\backupfoto". */
+static void path_join_a(const char* dir, const char* name, char* out, int n) {
+    size_t dl = (dir && dir[0]) ? strlen(dir) : 0;
+    if (dl > 0 && dir[dl - 1] == '\\') _snprintf(out, n, "%s%s",   dir, name);
+    else                                _snprintf(out, n, "%s\\%s", dir, name);
+    if (n > 0) out[n - 1] = 0;
+}
+
 /* Helper to combine path+name and convert to wide for a single API call. */
 static void path_join_w(const char* dir, const char* name, WCHAR* out, int outn) {
     char tmp[MAX_PATH * 2];
-    _snprintf(tmp, sizeof(tmp), "%s\\%s", dir, name);
+    path_join_a(dir, name, tmp, sizeof(tmp));
     u8_to_w(tmp, out, outn);
 }
 
@@ -313,7 +331,7 @@ static HRESULT STDMETHODCALLTYPE DT_Drop(IDropTarget* This, IDataObject* pdo, DW
         } else {
             strncpy(dst_name, nm, MAX_PATH-1); dst_name[MAX_PATH-1]=0;
         }
-        _snprintf(dst, MAX_PATH, "%s\\%s", dest_dir, dst_name);
+        path_join_a(dest_dir, dst_name, dst, MAX_PATH);
         u8_to_w(dst, wdst, MAX_PATH);
         SHFILEOPSTRUCTW op = {0};
         op.hwnd = g_hwnd;
@@ -1243,7 +1261,7 @@ static void scan_directory(Tab* tab) {
     WCHAR wpattern[MAX_PATH + 4];
     {
         char pattern[MAX_PATH + 4];
-        _snprintf(pattern, sizeof(pattern), "%s\\*", tab->path);
+        path_join_a(tab->path, "*", pattern, sizeof(pattern));
         u8_to_w(pattern, wpattern, MAX_PATH + 4);
     }
     WIN32_FIND_DATAW fd;
@@ -2128,7 +2146,7 @@ static void init_sidebar(void) {
         const char* folders[] = {"Desktop","Downloads","Documents","Music","Pictures","Videos"};
         uint32_t fcols[] = {COL_YELLOW, COL_ACCENT, COL_ACCENT, COL_GREEN, COL_GREEN, COL_PEACH};
         for (int i = 0; i < 6; i++) {
-            _snprintf(p, MAX_PATH, "%s\\%s", g_user_profile, folders[i]);
+            path_join_a(g_user_profile, folders[i], p, MAX_PATH);
             shorten_path(p, sp, 18);
             add_sb(s, folders[i], p, sp, fcols[i]);
         }
@@ -2198,7 +2216,7 @@ static int path_exists(const char* path) {
 
 static void make_unique_name(const char* dir, const char* base_name, char* out, int out_n) {
     char path[MAX_PATH];
-    _snprintf(path, MAX_PATH, "%s\\%s", dir, base_name);
+    path_join_a(dir, base_name, path, MAX_PATH);
     if (!path_exists(path)) {
         strncpy(out, base_name, out_n - 1); out[out_n-1] = 0; return;
     }
@@ -2208,7 +2226,7 @@ static void make_unique_name(const char* dir, const char* base_name, char* out, 
     if (dot && dot != stem) { strncpy(ext, dot, MAX_PATH-1); *dot = 0; }
     for (int i = 2; i < 1000; i++) {
         _snprintf(out, out_n, "%s (%d)%s", stem, i, ext);
-        _snprintf(path, MAX_PATH, "%s\\%s", dir, out);
+        path_join_a(dir, out, path, MAX_PATH);
         if (!path_exists(path)) return;
     }
     strncpy(out, base_name, out_n - 1); out[out_n-1] = 0;
@@ -2522,7 +2540,7 @@ static void clipboard_paste(const char* dest_dir) {
         } else {
             strncpy(dst_name, nm, MAX_PATH - 1); dst_name[MAX_PATH-1] = 0;
         }
-        _snprintf(dst, MAX_PATH, "%s\\%s", dest_dir, dst_name);
+        path_join_a(dest_dir, dst_name, dst, MAX_PATH);
         u8_to_w(dst, wdst, MAX_PATH);
 
         SHFILEOPSTRUCTW op = {0};
@@ -2559,7 +2577,7 @@ static WCHAR* build_selected_path_list_w(Tab* t, int* out_wlen) {
     for (int i = 0; i < t->entry_count; i++) {
         if (!t->sel_mask[i]) continue;
         if (strcmp(t->entries[i].name, "..") == 0) continue;
-        _snprintf(tmp, sizeof(tmp), "%s\\%s", t->path, t->entries[i].name);
+        path_join_a(t->path, t->entries[i].name, tmp, sizeof(tmp));
         wcap += MultiByteToWideChar(CP_UTF8, 0, tmp, -1, NULL, 0); /* includes null */
         n++;
     }
@@ -2570,7 +2588,7 @@ static WCHAR* build_selected_path_list_w(Tab* t, int* out_wlen) {
     for (int i = 0; i < t->entry_count; i++) {
         if (!t->sel_mask[i]) continue;
         if (strcmp(t->entries[i].name, "..") == 0) continue;
-        _snprintf(tmp, sizeof(tmp), "%s\\%s", t->path, t->entries[i].name);
+        path_join_a(t->path, t->entries[i].name, tmp, sizeof(tmp));
         int w = MultiByteToWideChar(CP_UTF8, 0, tmp, -1, buf + off, wcap - off);
         off += w; /* includes null terminator */
     }
@@ -2898,7 +2916,7 @@ static DWORD WINAPI ff_scan_worker(LPVOID arg) {
             WCHAR wpat[MAX_PATH + 4];
             {
                 char pat[MAX_PATH + 4];
-                _snprintf(pat, sizeof(pat), "%s\\*", cur[i].full);
+                path_join_a(cur[i].full, "*", pat, sizeof(pat));
                 u8_to_w(pat, wpat, MAX_PATH + 4);
             }
             WIN32_FIND_DATAW fd;
@@ -2924,10 +2942,10 @@ static DWORD WINAPI ff_scan_worker(LPVOID arg) {
                 if (is_dir && !ff_should_skip_dir(u8name) && next_n < 512) {
                     FFScanFrame* nf = &next[next_n++];
                     if (cur[i].rel[0])
-                        _snprintf(nf->rel, MAX_PATH, "%s\\%s", cur[i].rel, u8name);
+                        path_join_a(cur[i].rel, u8name, nf->rel, MAX_PATH);
                     else
                         _snprintf(nf->rel, MAX_PATH, "%s", u8name);
-                    _snprintf(nf->full, MAX_PATH, "%s\\%s", cur[i].full, u8name);
+                    path_join_a(cur[i].full, u8name, nf->full, MAX_PATH);
                 }
             } while (FindNextFileW(h, &fd) && !g_ff_scan_cancel && my_gen == g_ff_scan_gen);
             FindClose(h);
@@ -3092,10 +3110,12 @@ static void ff_open_selected(void) {
     FFResult* r = &g_ff_results[g_ff_selected];
     FFEntry*  e = &g_ff_index[r->entry_idx];
     char full[MAX_PATH];
-    if (e->rel[0])
-        _snprintf(full, MAX_PATH, "%s\\%s\\%s", g_ff_root, e->rel, e->name);
-    else
-        _snprintf(full, MAX_PATH, "%s\\%s", g_ff_root, e->name);
+    if (e->rel[0]) {
+        char sub[MAX_PATH];
+        path_join_a(g_ff_root, e->rel, sub, MAX_PATH);
+        path_join_a(sub, e->name, full, MAX_PATH);
+    } else
+        path_join_a(g_ff_root, e->name, full, MAX_PATH);
     Tab* t = active_tab();
     if (e->is_dir) {
         tab_navigate(t, full, 1);
@@ -3223,7 +3243,7 @@ static void viewer_collect_siblings(ViewerState* v, const char* startname) {
     v->siblings = (char(*)[MAX_PATH])calloc(VIEWER_MAX_SIBLINGS, MAX_PATH);
     if (!v->siblings) return;
     char pattern[MAX_PATH+4];
-    _snprintf(pattern, sizeof(pattern), "%s\\*", v->dir);
+    path_join_a(v->dir, "*", pattern, sizeof(pattern));
     WCHAR wpat[MAX_PATH+4];
     u8_to_w(pattern, wpat, MAX_PATH+4);
     WIN32_FIND_DATAW fd;
@@ -3389,7 +3409,7 @@ static void viewer_load_current(ViewerState* v) {
         return;
     }
     char fullp[MAX_PATH];
-    _snprintf(fullp, MAX_PATH, "%s\\%s", v->dir, v->siblings[v->cur_index]);
+    path_join_a(v->dir, v->siblings[v->cur_index], fullp, MAX_PATH);
     v->next_request_id++;
     v->loading = 1;
     viewer_update_title(v);
@@ -3466,8 +3486,8 @@ static void viewer_rename_commit(ViewerState* v) {
     if (strcmp(new_name, old) == 0) { viewer_rename_cancel(v); return; }
 
     char old_full[MAX_PATH], new_full[MAX_PATH];
-    _snprintf(old_full, MAX_PATH, "%s\\%s", v->dir, old);
-    _snprintf(new_full, MAX_PATH, "%s\\%s", v->dir, new_name);
+    path_join_a(v->dir, old, old_full, MAX_PATH);
+    path_join_a(v->dir, new_name, new_full, MAX_PATH);
     WCHAR wold[MAX_PATH], wnewf[MAX_PATH];
     u8_to_w(old_full, wold, MAX_PATH);
     u8_to_w(new_full, wnewf, MAX_PATH);
@@ -3554,7 +3574,7 @@ static void viewer_delete(ViewerState* v) {
     }
 
     char fullp[MAX_PATH];
-    _snprintf(fullp, MAX_PATH, "%s\\%s", v->dir, v->siblings[v->cur_index]);
+    path_join_a(v->dir, v->siblings[v->cur_index], fullp, MAX_PATH);
     /* SHFileOperation needs double-null-terminated; over-allocate and zero it. */
     WCHAR wpath[MAX_PATH + 2] = {0};
     u8_to_w(fullp, wpath, MAX_PATH);
@@ -3579,7 +3599,7 @@ static void viewer_delete(ViewerState* v) {
 static void viewer_copy_path(ViewerState* v) {
     if (!v || v->cur_index < 0 || v->cur_index >= v->sibling_count) return;
     char fullp[MAX_PATH];
-    _snprintf(fullp, MAX_PATH, "%s\\%s", v->dir, v->siblings[v->cur_index]);
+    path_join_a(v->dir, v->siblings[v->cur_index], fullp, MAX_PATH);
     clipboard_copy_text(fullp);
 }
 
@@ -3755,7 +3775,7 @@ static ViewerXform* viewer_xform_lookup(const char* path, int create) {
 
 static void viewer_full_path(ViewerState* v, char* out, int n) {
     if (v->cur_index < 0 || v->cur_index >= v->sibling_count) { out[0] = 0; return; }
-    _snprintf(out, n, "%s\\%s", v->dir, v->siblings[v->cur_index]);
+    path_join_a(v->dir, v->siblings[v->cur_index], out, n);
 }
 
 /* Apply any saved ops to v->bmp; called from the loaded-image handler so
@@ -4163,13 +4183,13 @@ static void do_open_entry(Tab* t, int idx) {
         if (strcmp(e->name, "..") == 0) tab_go_up(t);
         else {
             char p[MAX_PATH];
-            _snprintf(p, MAX_PATH, "%s\\%s", t->path, e->name);
+            path_join_a(t->path, e->name, p, MAX_PATH);
             tab_navigate(t, p, 1);
         }
     } else {
         if (is_image_ext(e->name)) {
             char fullp[MAX_PATH];
-            _snprintf(fullp, MAX_PATH, "%s\\%s", t->path, e->name);
+            path_join_a(t->path, e->name, fullp, MAX_PATH);
             open_image_viewer(fullp);
         } else {
             WCHAR wp[MAX_PATH];
@@ -4275,7 +4295,7 @@ static void handle_context_cmd(int cmd, int item_idx) {
             if (strcmp(t->entries[item_idx].name, "..") == 0)
                 { char tmp[MAX_PATH]; strncpy(tmp, t->path, MAX_PATH); PathRemoveFileSpecA(tmp); new_tab(tmp); }
             else
-                { _snprintf(p, MAX_PATH, "%s\\%s", t->path, t->entries[item_idx].name); new_tab(p); }
+                { path_join_a(t->path, t->entries[item_idx].name, p, MAX_PATH); new_tab(p); }
         }
         break;
     case IDM_COPY:
@@ -4316,14 +4336,14 @@ static void handle_context_cmd(int cmd, int item_idx) {
     case IDM_ADD_BOOKMARK:
         if (item_idx >= 0 && t->entries[item_idx].is_dir) {
             char fp[MAX_PATH];
-            _snprintf(fp, MAX_PATH, "%s\\%s", t->path, t->entries[item_idx].name);
+            path_join_a(t->path, t->entries[item_idx].name, fp, MAX_PATH);
             bookmark_add(fp);
         }
         break;
     case IDM_COPY_PATH:
         if (item_idx >= 0) {
             char p[MAX_PATH];
-            _snprintf(p, MAX_PATH, "%s\\%s", t->path, t->entries[item_idx].name);
+            path_join_a(t->path, t->entries[item_idx].name, p, MAX_PATH);
             clipboard_copy_text(p);
         }
         break;
@@ -4345,7 +4365,7 @@ static void handle_context_cmd(int cmd, int item_idx) {
     case IDM_PROPERTIES: {
         char p[MAX_PATH];
         if (item_idx >= 0)
-            _snprintf(p, MAX_PATH, "%s\\%s", t->path, t->entries[item_idx].name);
+            path_join_a(t->path, t->entries[item_idx].name, p, MAX_PATH);
         else
             strncpy(p, t->path, MAX_PATH);
         do_properties(p);
@@ -4807,7 +4827,7 @@ static void show_context_menu(HWND hwnd, int mx, int my) {
         AppendMenuA(menu, is_dotdot ? MF_GRAYED : MF_STRING, IDM_DELETE, "Delete\tDel");
         if (e->is_dir && !is_dotdot) {
             char fp[MAX_PATH];
-            _snprintf(fp, MAX_PATH, "%s\\%s", t->path, e->name);
+            path_join_a(t->path, e->name, fp, MAX_PATH);
             int already = bookmark_find(fp) >= 0;
             AppendMenuA(menu, already ? MF_GRAYED : MF_STRING, IDM_ADD_BOOKMARK,
                         already ? "Add to bookmarks (already added)" : "Add to bookmarks");
@@ -5422,6 +5442,41 @@ static void build_column_headers(float lx, float ly, float lw) {
     render_quad(r, lx, ly+COL_HDR_H-1, lw, 1, COL_BORDER);
 }
 
+/* The user's Windows double-click speed, with a sane floor. Everything about
+   double-clicking follows this value, so raising it in Windows (Control Panel
+   → Mouse) makes remote-desktop clicking easier. */
+static DWORD dbl_click_ms(void) {
+    DWORD dc = GetDoubleClickTime();
+    return dc < 100 ? 500 : dc;
+}
+
+/* Is the click that just started on list item `i` the second half of a double
+   click? True either because the OS classified the press as one
+   (WM_LBUTTONDBLCLK) or because it follows a click on the same row inside the
+   double-click time. The second case matters over remote desktop: Windows only
+   sends WM_LBUTTONDBLCLK while the pointer stays inside its 4 px rectangle,
+   and a remote pointer wobbles further than that. */
+static int click_is_second_of_double(int i) {
+    Panel* p = &g_app.panels[g_app.active_panel];
+    return g_mouse_dbl_pending ||
+           (p->last_click_item == i &&
+            (GetTickCount() - p->last_click_time) < dbl_click_ms());
+}
+
+/* Should the click that just completed on list item `i` open it? A rapid extra
+   click arrives as another double click, so the same cell is not opened twice
+   in a row — after a navigate that would act on whatever entry now sits
+   there. */
+static int click_opens_entry(DWORD now, int i) {
+    if (!click_is_second_of_double(i)) return 0;
+    if (g_dbl_open_panel == g_app.active_panel && g_dbl_open_item == i &&
+        (now - g_dbl_open_tick) < dbl_click_ms()) return 0;
+    g_dbl_open_panel = g_app.active_panel;
+    g_dbl_open_item  = i;
+    g_dbl_open_tick  = now;
+    return 1;
+}
+
 static void build_file_list(float lx, float ly, float lw, float lh) {
     Renderer* r = &g_renderer;
     Tab* t = active_tab();
@@ -5486,7 +5541,7 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
 
             { /* SMALL & LARGE share grid layout: icon centered top, name below */
                 char fullp[MAX_PATH];
-                _snprintf(fullp, MAX_PATH, "%s\\%s", t->path, e->name);
+                path_join_a(t->path, e->name, fullp, MAX_PATH);
                 GLuint thumb = 0;
                 int tw_img = 0, th_img = 0;
                 if (strcmp(e->name, "..") != 0) {
@@ -5579,9 +5634,7 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
                 DWORD now = GetTickCount();
                 int ctrl  = GetKeyState(VK_CONTROL) < 0;
                 int shift = GetKeyState(VK_SHIFT) < 0;
-                if (g_app.panels[g_app.active_panel].last_click_item == i &&
-                    (now - g_app.panels[g_app.active_panel].last_click_time) < 400 &&
-                    !ctrl && !shift) {
+                if (!ctrl && !shift && click_opens_entry(now, i)) {
                     do_open_entry(t, i);
                     g_app.panels[g_app.active_panel].last_click_item = -1;
                 } else {
@@ -5604,7 +5657,10 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
         if (g_drag_idx >= 0 && g_drag_panel == g_app.active_panel && g_mouse_down) {
             int dx = g_mouse_x - g_drag_x0;
             int dy = g_mouse_y - g_drag_y0;
-            if (dx*dx + dy*dy > 25) { g_drag_idx = -1; start_drag_out(t); }
+            /* A press Windows flagged as a double click opens the entry; a
+               wobbling remote-desktop pointer must not turn it into a drag
+               (DoDragDrop blocks the message loop and swallows the click). */
+            if (dx*dx + dy*dy > 25) { g_drag_idx = -1; if (!g_mouse_dbl_pending) start_drag_out(t); }
         }
         if (!g_mouse_down) { g_drag_idx = -1; g_drag_panel = -1; }
 
@@ -5710,7 +5766,8 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
         int dy = g_mouse_y - g_drag_y0;
         if (dx*dx + dy*dy > 25) {
             g_drag_idx = -1;
-            start_drag_out(t);
+            /* Same as the icon view: a double-click press never becomes a drag. */
+            if (!g_mouse_dbl_pending) start_drag_out(t);
         }
     }
     if (!g_mouse_down) { g_drag_idx = -1; g_drag_panel = -1; }
@@ -5879,7 +5936,7 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
             DWORD now = GetTickCount();
             int ctrl  = GetKeyState(VK_CONTROL) < 0;
             int shift = GetKeyState(VK_SHIFT) < 0;
-            if (g_app.panels[g_app.active_panel].last_click_item == i && (now - g_app.panels[g_app.active_panel].last_click_time) < 400 && !ctrl && !shift) {
+            if (!ctrl && !shift && click_opens_entry(now, i)) {
                 /* Route through do_open_entry so image files land in the
                    built-in viewer instead of the system default app. */
                 do_open_entry(t, i);
@@ -5917,6 +5974,59 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
             else
                 SetWindowPos(g_edit_hwnd, NULL, (int)name_x, (int)ry, (int)name_w, ROW_H,
                              SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+
+    /* ---- Marquee (rubber-band) selection ----
+       Rows span the full width, so only the vertical extent decides which
+       entries are caught. A press on a row starts a drag-out instead (see
+       above), so the band starts from empty space: below the last row. */
+    {
+        int mouse_in_list = (g_mouse_x >= lx && g_mouse_x < lx + lw &&
+                             g_mouse_y >= ly && g_mouse_y < ly + lh);
+        int ctrl_p = GetKeyState(VK_CONTROL) < 0;
+        if (!g_marquee_active && g_drag_idx < 0 &&
+            g_ui.input.mouse_clicked && mouse_in_list) {
+            g_marquee_active = 1;
+            g_marquee_panel  = g_app.active_panel;
+            g_marquee_x0     = (float)g_mouse_x - lx;
+            g_marquee_y0     = (float)g_mouse_y - ly + t->scroll_y;
+            g_marquee_additive = ctrl_p;
+            int mn = t->entries_cap < (int)sizeof(g_marquee_anchor)
+                     ? t->entries_cap : (int)sizeof(g_marquee_anchor);
+            if (ctrl_p) memcpy(g_marquee_anchor, t->sel_mask, mn);
+            else        { memset(g_marquee_anchor, 0, mn);
+                          sel_clear(t); t->selected = -1; t->sel_anchor = -1; }
+        }
+        if (g_marquee_active && g_marquee_panel == g_app.active_panel && g_mouse_down) {
+            float my_c = (float)g_mouse_y - ly + t->scroll_y;
+            float ry0 = g_marquee_y0 < my_c ? g_marquee_y0 : my_c;
+            float ry1 = g_marquee_y0 < my_c ? my_c        : g_marquee_y0;
+            for (int i = 0; i < t->entry_count; i++) {
+                if (strcmp(t->entries[i].name, "..") == 0) continue;
+                int r = entry_row[i];            /* -1 inside a collapsed group */
+                int hit = 0;
+                if (r >= 0) {
+                    float top = r * (float)ROW_H, bot = top + ROW_H;
+                    hit = !(top > ry1 || bot < ry0);
+                }
+                t->sel_mask[i] = g_marquee_additive ? (g_marquee_anchor[i] || hit) : hit;
+            }
+            float bw  = lw - 8;
+            float sy0 = ry0 + ly - t->scroll_y;
+            float sy1 = ry1 + ly - t->scroll_y;
+            if (sy0 < ly) sy0 = ly;
+            if (sy1 > ly + lh) sy1 = ly + lh;
+            if (sy1 > sy0) {
+                render_quad(r, lx, sy0, bw, sy1 - sy0, 0x4035BCFE);
+                render_quad(r, lx, sy0, bw, 1,         0xFF35BCFE);
+                render_quad(r, lx, sy1 - 1, bw, 1,     0xFF35BCFE);
+            }
+            g_needs_redraw = 1;
+        }
+        if (g_marquee_active && !g_mouse_down) {
+            g_marquee_active = 0;
+            g_marquee_panel  = -1;
         }
     }
 
@@ -6649,6 +6759,13 @@ static void build_status_bar(void) {
 }
 
 static void build_ui(void) {
+    /* Advance the thumbnail-cache LRU clock once per painted frame. Items
+       drawn this frame get stamped with it, so when the cache is full
+       thumb_cache_put() evicts entries that scrolled off screen instead of
+       the freshly decoded ones still on screen. Without this every entry
+       keeps last_used == 0 and the eviction picks the same slot forever,
+       re-decoding ~70 thumbnails/s and making the grid flicker. */
+    g_thumb_frame++;
     UIInput input = {0};
     input.mouse_x = g_mouse_x; input.mouse_y = g_mouse_y;
     input.mouse_down = g_mouse_down;
@@ -6905,6 +7022,11 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_needs_redraw = 1; return 0;
 
     case WM_LBUTTONDOWN:
+        /* Take the position from this message: g_mouse_x/y is only updated by
+           WM_MOUSEMOVE, and Windows coalesces moves, so the press can arrive
+           while they still hold the previous position — which used to anchor a
+           drag several pixels away from the real press point. */
+        g_mouse_x = GET_X_LPARAM(lp); g_mouse_y = GET_Y_LPARAM(lp);
         g_mouse_down = 1; g_mouse_clicked = 1;
         SetCapture(hwnd); g_needs_redraw = 1; return 0;
 
@@ -6913,7 +7035,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ReleaseCapture(); g_needs_redraw = 1; return 0;
 
     case WM_LBUTTONDBLCLK:
+        g_mouse_x = GET_X_LPARAM(lp); g_mouse_y = GET_Y_LPARAM(lp);
         g_mouse_down = 1; g_mouse_clicked = 1; g_mouse_dblclick = 1;
+        g_mouse_dbl_pending = 1;
         SetCapture(hwnd); g_needs_redraw = 1; return 0;
 
     case WM_MOUSEWHEEL:
@@ -7536,6 +7660,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int cmdShow)
                 render_end(&g_renderer);
                 SwapBuffers(hdc);
             }
+            if (g_mouse_released) g_mouse_dbl_pending = 0;
             g_mouse_clicked = 0; g_mouse_released = 0;
             g_mouse_dblclick = 0; g_scroll_delta = 0;
         } else {

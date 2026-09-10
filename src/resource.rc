@@ -1,2 +1,30 @@
+#include <winresrc.h>
+#include "version.h"
+
 1 24 "app.manifest"
 IDI_APPICON ICON "app.ico"
+
+1 VERSIONINFO
+FILEVERSION    APP_VERSION_MAJOR, APP_VERSION_MINOR, APP_VERSION_PATCH, 0
+PRODUCTVERSION APP_VERSION_MAJOR, APP_VERSION_MINOR, APP_VERSION_PATCH, 0
+FILEOS         VOS_NT_WINDOWS32
+FILETYPE       VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName",      "goldalworming"
+      VALUE "FileDescription",  "FilePathX"
+      VALUE "FileVersion",      APP_VERSION
+      VALUE "ProductName",      "FilePathX"
+      VALUE "ProductVersion",   APP_VERSION
+      VALUE "LegalCopyright",   "MIT License"
+      VALUE "OriginalFilename", "FilePathX.exe"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

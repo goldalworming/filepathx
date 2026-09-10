@@ -48,14 +48,26 @@ powershell.exe -NoProfile -Command \
 
 Hasil: `build/FilePathX-win64.zip` (~265 KB).
 
-### 3. Pastikan main sudah commit + push
+### 3. Build zip + installer sekaligus (cara singkat)
+
+```bash
+cmd //c make-installer.bat
+```
+
+Skrip ini membaca `APP_VERSION` dari `src/version.h`, membangun exe stripped ke
+`build\stage\`, membuat `build\FilePathX-win64.zip` (aset auto-update) dan
+`build\FilePathX-<versi>-setup.exe` (installer NSIS, per-user, tanpa UAC).
+Kalau `build\release\FilePathX.exe` sedang dipakai (app jalan), salinannya
+dilewati — zip & installer tetap dibuat dari `build\stage\`.
+
+### 4. Pastikan main sudah commit + push
 
 ```bash
 git status                 # working tree clean
 git push                   # kalau ada commit yang belum di-push
 ```
 
-### 4. Tag versi (skip kalau release-nya sudah ada)
+### 5. Tag versi (skip kalau release-nya sudah ada)
 
 Cukup sekali per versi:
 
@@ -64,7 +76,7 @@ git tag -a v0.1.0 -m "Initial release"
 git push origin v0.1.0
 ```
 
-### 5. Buat release object via API (skip kalau release-nya sudah ada)
+### 6. Buat release object via API (skip kalau release-nya sudah ada)
 
 ```bash
 # Ambil token dari credential helper
@@ -84,7 +96,7 @@ curl -sS -X POST \
 
 Catat `id` (release id) yang keluar — dipakai untuk upload asset.
 
-### 6. Upload (atau replace) asset
+### 7. Upload (atau replace) asset
 
 Release id saat ini: **`323668658`**.
 
@@ -110,8 +122,22 @@ curl -sS -X POST \
   | grep -oE '"browser_download_url":"[^"]+"'
 ```
 
+```bash
+# Upload installer (aset kedua — auto-updater mengabaikannya, ini untuk
+# pengguna baru / yang mau install rapi)
+curl -sS -X POST \
+  -H "Authorization: token $TOKEN" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary "@build/FilePathX-<versi>-setup.exe" \
+  "https://uploads.github.com/repos/goldalworming/filepathx/releases/$RELEASE_ID/assets?name=FilePathX-<versi>-setup.exe" \
+  | grep -oE '"browser_download_url":"[^"]+"'
+```
+
 URL download akhir:
-`https://github.com/goldalworming/filepathx/releases/download/v0.1.0/FilePathX-win64.zip`
+`https://github.com/goldalworming/filepathx/releases/download/<tag>/FilePathX-win64.zip`
+
+Installer:
+`https://github.com/goldalworming/filepathx/releases/download/<tag>/FilePathX-<versi>-setup.exe`
 
 ## Catatan
 

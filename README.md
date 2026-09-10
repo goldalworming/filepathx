@@ -64,8 +64,22 @@ windres -I src src/resource.rc -O coff -o build/resource.o
 gcc -O2 -Wall -o build/FilePathX.exe \
     src/main.c src/render.c src/ui.c src/update.c -Isrc build/resource.o \
     -lopengl32 -lgdi32 -luser32 -lshell32 -lshlwapi \
-    -ldwmapi -lole32 -luuid -luxtheme -lcomctl32 -lwinhttp -mwindows
+    -ldwmapi -lole32 -luuid -luxtheme -lcomctl32 -lpropsys -lwinhttp -mwindows
 ```
+
+### Packaged build (portable zip + installer)
+
+```cmd
+make-installer.bat
+```
+
+Bumps nothing by itself — set `APP_VERSION` in `src/version.h` first — then
+builds the stripped release exe, the portable `build\FilePathX-win64.zip`
+(the asset the auto-updater downloads) and the NSIS installer
+`build\FilePathX-<version>-setup.exe`. Requires NSIS 3.x on `PATH` or in
+`%ProgramFiles(x86)%\NSIS`. The installer is per-user
+(`%LOCALAPPDATA%\Programs\FilePathX`, no UAC) and keeps
+`%APPDATA%\filepathx` (settings, tabs, themes) when uninstalled.
 
 ## Keyboard shortcuts
 
