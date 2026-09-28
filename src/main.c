@@ -215,7 +215,24 @@ static void path_join_w(const char* dir, const char* name, WCHAR* out, int outn)
 static HANDLE g_watch_handle = INVALID_HANDLE_VALUE;
 static char   g_watch_path[MAX_PATH] = {0};
 
+/* Change notifications arrive in bursts (a download or copy fires dozens
+   per second), so they're debounced: each one re-arms a short timer and
+   the rescan happens once things go quiet. WATCH_MAX_WAIT_MS caps the
+   delay so a folder that never stops changing still refreshes. */
+#define TIMER_WATCH_DEBOUNCE 0x5741
+#define WATCH_DEBOUNCE_MS    200
+#define WATCH_MAX_WAIT_MS    1000
+static DWORD g_watch_pending_since = 0;   /* GetTickCount of first unhandled change, 0 = none */
+
+static void watch_cancel_pending(void) {
+    if (g_watch_pending_since) {
+        KillTimer(g_hwnd, TIMER_WATCH_DEBOUNCE);
+        g_watch_pending_since = 0;
+    }
+}
+
 static void watch_stop(void) {
+    watch_cancel_pending();
     if (g_watch_handle != INVALID_HANDLE_VALUE) {
         FindCloseChangeNotification(g_watch_handle);
         g_watch_handle = INVALID_HANDLE_VALUE;
@@ -763,8 +780,10 @@ typedef struct {
     GLuint texture;
     int    w, h;
     DWORD  last_used;
+    unsigned hash;   /* thumb_hash(path), cached for bucket relinking */
+    int    next;     /* next slot in the same hash bucket, -1 = end */
 } ThumbEntry;
-typedef struct { char path[MAX_PATH]; } ThumbReq;
+typedef struct { char path[MAX_PATH]; unsigned hash; } ThumbReq;
 typedef struct { char path[MAX_PATH]; HBITMAP bmp; int w, h; int flip_v; } ThumbDone;
 
 static ThumbEntry g_thumb_cache[THUMB_CACHE_CAP];
@@ -780,19 +799,42 @@ static HANDLE g_thumb_thread = NULL;
 static volatile LONG g_thumb_quit = 0;
 static int g_thumb_initialized = 0;
 
-static int thumb_cache_find(const char* path) {
-    for (int i = 0; i < g_thumb_count; i++)
-        if (_stricmp(g_thumb_cache[i].path, path) == 0) return i;
+/* Hash buckets over g_thumb_cache so lookups (one per visible item per
+   frame) don't linearly _stricmp the whole cache. The hash folds ASCII
+   case only, matching _stricmp's C-locale comparison. */
+#define THUMB_BUCKETS 1024   /* power of two, >= 2 * THUMB_CACHE_CAP */
+static int g_thumb_bucket[THUMB_BUCKETS];
+
+static unsigned thumb_hash(const char* path) {
+    unsigned h = 2166136261u;
+    for (const unsigned char* p = (const unsigned char*)path; *p; p++) {
+        unsigned c = *p;
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        h = (h ^ c) * 16777619u;
+    }
+    return h;
+}
+static void thumb_buckets_reset(void) {
+    for (int i = 0; i < THUMB_BUCKETS; i++) g_thumb_bucket[i] = -1;
+}
+static int thumb_cache_find_h(const char* path, unsigned h) {
+    if (!g_thumb_initialized) return -1;   /* buckets not reset to -1 yet */
+    for (int i = g_thumb_bucket[h & (THUMB_BUCKETS-1)]; i >= 0; i = g_thumb_cache[i].next)
+        if (g_thumb_cache[i].hash == h && _stricmp(g_thumb_cache[i].path, path) == 0) return i;
     return -1;
 }
-static GLuint thumb_cache_get(const char* path) {
-    int i = thumb_cache_find(path);
-    if (i < 0) return 0;
-    g_thumb_cache[i].last_used = g_thumb_frame;
-    return g_thumb_cache[i].texture;
+static int thumb_cache_find(const char* path) {
+    return thumb_cache_find_h(path, thumb_hash(path));
+}
+/* Replace the link pointing at slot `from` in its bucket chain with `to`. */
+static void thumb_bucket_relink(int from, int to) {
+    int* link = &g_thumb_bucket[g_thumb_cache[from].hash & (THUMB_BUCKETS-1)];
+    while (*link >= 0 && *link != from) link = &g_thumb_cache[*link].next;
+    if (*link == from) *link = to;
 }
 static void thumb_cache_put(const char* path, GLuint tex, int w, int h) {
-    int idx = thumb_cache_find(path);
+    unsigned hash = thumb_hash(path);
+    int idx = thumb_cache_find_h(path, hash);
     if (idx >= 0) {
         glDeleteTextures(1, &g_thumb_cache[idx].texture);
         g_thumb_cache[idx].texture = tex;
@@ -805,7 +847,14 @@ static void thumb_cache_put(const char* path, GLuint tex, int w, int h) {
         for (int i = 1; i < g_thumb_count; i++)
             if (g_thumb_cache[i].last_used < g_thumb_cache[lru].last_used) lru = i;
         glDeleteTextures(1, &g_thumb_cache[lru].texture);
-        g_thumb_cache[lru] = g_thumb_cache[g_thumb_count - 1];
+        /* Unlink the victim, then move the last slot into its place and
+           repoint whatever link referenced the last slot. */
+        thumb_bucket_relink(lru, g_thumb_cache[lru].next);
+        int last = g_thumb_count - 1;
+        if (lru != last) {
+            thumb_bucket_relink(last, lru);
+            g_thumb_cache[lru] = g_thumb_cache[last];
+        }
         g_thumb_count--;
     }
     int n = g_thumb_count++;
@@ -814,25 +863,32 @@ static void thumb_cache_put(const char* path, GLuint tex, int w, int h) {
     g_thumb_cache[n].texture = tex;
     g_thumb_cache[n].w = w; g_thumb_cache[n].h = h;
     g_thumb_cache[n].last_used = g_thumb_frame;
+    g_thumb_cache[n].hash = hash;
+    int* head = &g_thumb_bucket[hash & (THUMB_BUCKETS-1)];
+    g_thumb_cache[n].next = *head;
+    *head = n;
 }
 
-static int thumb_req_pending(const char* path) {
+static int thumb_req_pending(const char* path, unsigned hash) {
     int found = 0;
     EnterCriticalSection(&g_thumb_cs);
     for (int i = g_thumb_req_head; i != g_thumb_req_tail; i = (i+1) % THUMB_Q_CAP)
-        if (_stricmp(g_thumb_req[i].path, path) == 0) { found = 1; break; }
+        if (g_thumb_req[i].hash == hash && _stricmp(g_thumb_req[i].path, path) == 0) { found = 1; break; }
     LeaveCriticalSection(&g_thumb_cs);
     return found;
 }
 static void thumb_request(const char* path) {
     if (!g_thumb_initialized) return;
-    if (thumb_cache_get(path)) return;
-    if (thumb_req_pending(path)) return;
+    unsigned hash = thumb_hash(path);
+    int ci = thumb_cache_find_h(path, hash);
+    if (ci >= 0) { g_thumb_cache[ci].last_used = g_thumb_frame; return; }
+    if (thumb_req_pending(path, hash)) return;
     EnterCriticalSection(&g_thumb_cs);
     int next_tail = (g_thumb_req_tail + 1) % THUMB_Q_CAP;
     if (next_tail != g_thumb_req_head) {
         strncpy(g_thumb_req[g_thumb_req_tail].path, path, MAX_PATH-1);
         g_thumb_req[g_thumb_req_tail].path[MAX_PATH-1] = 0;
+        g_thumb_req[g_thumb_req_tail].hash = hash;
         g_thumb_req_tail = next_tail;
         SetEvent(g_thumb_event);
     }
@@ -909,6 +965,7 @@ static void thumb_cache_clear(void) {
     for (int i = 0; i < g_thumb_count; i++)
         glDeleteTextures(1, &g_thumb_cache[i].texture);
     g_thumb_count = 0;
+    thumb_buckets_reset();
     if (g_thumb_initialized) {
         EnterCriticalSection(&g_thumb_cs);
         g_thumb_req_head = g_thumb_req_tail = 0;  /* drop pending requests */
@@ -919,6 +976,7 @@ static void thumb_cache_clear(void) {
 static void thumb_init(void) {
     if (g_thumb_initialized) return;
     InitializeCriticalSection(&g_thumb_cs);
+    thumb_buckets_reset();
     g_thumb_event = CreateEventW(NULL, FALSE, FALSE, NULL);
     g_thumb_thread = CreateThread(NULL, 0, thumb_worker, NULL, 0, NULL);
     g_thumb_initialized = 1;
@@ -1230,6 +1288,66 @@ static int compare_entries(const void* a, const void* b) {
     return g_sort_asc_cmp ? r : -r;
 }
 
+/* Effective sort — respects the user's per-folder preference for
+   every folder including Downloads. Date-groups only kick in on
+   Downloads when the sort is date-modified descending (the natural
+   "recent activity" arrangement). Any other sort (name, size, or
+   ascending date) turns groups off and behaves like any other
+   folder. */
+static void apply_sort_prefs(Tab* tab) {
+    int is_downloads = (g_downloads_path[0] && path_eq_ci(tab->path, g_downloads_path));
+    int sc = g_app.sort_col, sa = g_app.sort_asc;
+    if (!sort_prefs_lookup(tab->path, &sc, &sa) && is_downloads) {
+        /* First visit to Downloads: default to date desc so the
+           familiar date-grouped view shows up. */
+        sc = 2; sa = 0;
+    }
+    g_app.sort_col = sc;
+    g_app.sort_asc = sa;
+    tab->use_groups = is_downloads && (sc == 2 && sa == 0);
+    g_sort_col_cmp   = sc;
+    g_sort_asc_cmp   = sa;
+    g_use_groups_cmp = tab->use_groups;
+}
+
+static const FileEntry* g_resort_base;
+static int compare_entry_idx(const void* a, const void* b) {
+    return compare_entries(&g_resort_base[*(const int*)a], &g_resort_base[*(const int*)b]);
+}
+
+/* Re-sort the already-loaded entries after a sort-column change — no disk
+   access. Selection, anchor and focus follow their entries through the
+   permutation. Falls back to a full rescan if the scratch buffers can't
+   be allocated. */
+static void resort_directory(Tab* tab) {
+    int n = tab->entry_count;
+    apply_sort_prefs(tab);
+    if (n < 2) { g_needs_redraw = 1; return; }
+    int* perm = (int*)malloc((size_t)n * sizeof(int));
+    int* inv  = (int*)malloc((size_t)n * sizeof(int));
+    FileEntry* sorted = (FileEntry*)malloc((size_t)n * sizeof(FileEntry));
+    unsigned char* sel = (unsigned char*)malloc((size_t)n);
+    if (!perm || !inv || !sorted || !sel) {
+        free(perm); free(inv); free(sorted); free(sel);
+        scan_directory(tab);
+        return;
+    }
+    for (int i = 0; i < n; i++) perm[i] = i;
+    g_resort_base = tab->entries;
+    qsort(perm, n, sizeof(int), compare_entry_idx);
+    for (int i = 0; i < n; i++) {
+        sorted[i] = tab->entries[perm[i]];
+        sel[i]    = tab->sel_mask[perm[i]];
+        inv[perm[i]] = i;
+    }
+    memcpy(tab->entries, sorted, (size_t)n * sizeof(FileEntry));
+    memcpy(tab->sel_mask, sel, (size_t)n);
+    if (tab->selected   >= 0 && tab->selected   < n) tab->selected   = inv[tab->selected];
+    if (tab->sel_anchor >= 0 && tab->sel_anchor < n) tab->sel_anchor = inv[tab->sel_anchor];
+    free(perm); free(inv); free(sorted); free(sel);
+    g_needs_redraw = 1;
+}
+
 /* ---- Directory scanning ---- */
 static void scan_directory(Tab* tab) {
     /* Save UI state by NAME so refresh/auto-watcher doesn't lose selection */
@@ -1255,7 +1373,6 @@ static void scan_directory(Tab* tab) {
     tab->selected = -1;
     tab->sel_anchor = -1;
     sel_clear(tab);
-    int is_downloads = (g_downloads_path[0] && path_eq_ci(tab->path, g_downloads_path));
     tab->view_mode   = view_prefs_lookup(tab->path);
     refresh_today();
     WCHAR wpattern[MAX_PATH + 4];
@@ -1328,26 +1445,7 @@ static void scan_directory(Tab* tab) {
         }
     } while (FindNextFileW(h, &fd));
     FindClose(h);
-    /* Effective sort — respects the user's per-folder preference for
-       every folder including Downloads. Date-groups only kick in on
-       Downloads when the sort is date-modified descending (the natural
-       "recent activity" arrangement). Any other sort (name, size, or
-       ascending date) turns groups off and behaves like any other
-       folder. */
-    {
-        int sc = g_app.sort_col, sa = g_app.sort_asc;
-        if (!sort_prefs_lookup(tab->path, &sc, &sa) && is_downloads) {
-            /* First visit to Downloads: default to date desc so the
-               familiar date-grouped view shows up. */
-            sc = 2; sa = 0;
-        }
-        g_app.sort_col = sc;
-        g_app.sort_asc = sa;
-        tab->use_groups = is_downloads && (sc == 2 && sa == 0);
-        g_sort_col_cmp   = sc;
-        g_sort_asc_cmp   = sa;
-        g_use_groups_cmp = tab->use_groups;
-    }
+    apply_sort_prefs(tab);
     qsort(tab->entries, tab->entry_count, sizeof(FileEntry), compare_entries);
 
     /* Restore selection by name match */
@@ -5435,7 +5533,7 @@ static void build_column_headers(float lx, float ly, float lw) {
                it simply switches back to date-grouping when the user
                picks date-desc again. */
             sort_prefs_set(tab->path, g_app.sort_col, g_app.sort_asc);
-            scan_directory(tab);
+            resort_directory(tab);
         }
         if (i > 0) render_quad(r, cols[i].x-1, ly+4, 1, COL_HDR_H-8, COL_BORDER);
     }
@@ -6963,9 +7061,27 @@ static LRESULT handle_nchittest(HWND hwnd, LPARAM lp) {
     return HTCLIENT;
 }
 
+/* ---- Directory watcher (debounced) ---- */
+static void watch_flush(void) {
+    watch_cancel_pending();
+    scan_directory(active_tab());
+    g_needs_redraw = 1;
+}
+
+static void watch_on_change(void) {
+    DWORD now = GetTickCount();
+    if (!g_watch_pending_since) g_watch_pending_since = now ? now : 1;
+    if (now - g_watch_pending_since >= WATCH_MAX_WAIT_MS) watch_flush();
+    else SetTimer(g_hwnd, TIMER_WATCH_DEBOUNCE, WATCH_DEBOUNCE_MS, NULL);  /* re-arms */
+}
+
 /* ---- Window proc ---- */
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    case WM_TIMER:
+        if (wp == TIMER_WATCH_DEBOUNCE) { watch_flush(); return 0; }
+        break;
+
     case WM_NCCALCSIZE: return handle_nccalcsize(hwnd, wp, lp);
     case WM_NCHITTEST:  return handle_nchittest(hwnd, lp);
 
@@ -7646,9 +7762,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int cmdShow)
            events when the loop is busy redrawing (mouse move etc.). */
         if (g_watch_handle != INVALID_HANDLE_VALUE &&
             WaitForSingleObject(g_watch_handle, 0) == WAIT_OBJECT_0) {
-            scan_directory(active_tab());
             FindNextChangeNotification(g_watch_handle);
-            g_needs_redraw = 1;
+            watch_on_change();
         }
         if (g_needs_redraw) {
             g_needs_redraw = 0;
