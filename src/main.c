@@ -123,8 +123,9 @@ typedef struct {
     int view_mode;  /* VM_DETAILS / SMALL_ICONS / LARGE_ICONS */
     int grid_cols;  /* updated by build_file_list each frame in icon views */
     int truncated;  /* 1 if scan hit ENTRIES_MAX_CAP and kept only the newest N */
-    unsigned scan_gen;              /* id of the latest scan started for this tab */
+    struct ScanResult* scan_req;    /* async scan in flight (tab holds one ref), or NULL */
     int  loading;                   /* async scan in flight */
+    int  scan_timed_out;            /* last scan stalled and was abandoned */
     char loaded_path[MAX_PATH];     /* folder the current entries[] came from */
     char pending_focus[MAX_PATH];   /* entry to select once loading finishes */
 } Tab;
@@ -1357,20 +1358,30 @@ static void resort_directory(Tab* tab) {
    Enumeration (the only part that touches the disk) is split from applying
    the result to a tab, so it can run on a worker thread: FindFirstFileW on a
    network share, a spun-down HDD or a 100k-entry folder can take seconds. */
-typedef struct {
+typedef struct ScanResult {
     char       path[MAX_PATH];
-    unsigned   gen;          /* Tab.scan_gen this result was requested for */
     FileEntry* entries;      /* malloc'd; .group is filled in by scan_apply */
     int        count, cap;
     int        truncated;
+    /* Async-only bookkeeping (zero for a synchronous scan on the stack). */
+    volatile LONG  refs;          /* worker/WM_SCAN_DONE + owning tab */
+    volatile LONG  cancel;        /* set by the UI; worker stops at next entry */
+    volatile DWORD progress_tick; /* GetTickCount of the worker's last progress */
+    HANDLE         thread;        /* for CancelSynchronousIo; closed on last release */
 } ScanResult;
 
-#define WM_SCAN_DONE      (WM_APP + 31)   /* lParam = ScanResult*, receiver frees */
-#define SCAN_SYNC_WAIT_MS 40              /* apply inline if the worker is this fast */
-static unsigned g_scan_gen_counter = 0;
+#define WM_SCAN_DONE          (WM_APP + 31)  /* lParam = ScanResult*, carries the worker's ref */
+#define SCAN_SYNC_WAIT_MS     40             /* apply inline if the worker is this fast */
+#define TIMER_SCAN_WATCHDOG   0x5343
+#define SCAN_WATCHDOG_MS      1000
+#define SCAN_STALL_TIMEOUT_MS 10000          /* give up after this long with no progress */
 
-static void scan_result_free(ScanResult* r) {
-    if (r) { free(r->entries); free(r); }
+static void scan_req_release(ScanResult* r) {
+    if (r && InterlockedDecrement(&r->refs) == 0) {
+        if (r->thread) CloseHandle(r->thread);
+        free(r->entries);
+        free(r);
+    }
 }
 
 static int scan_result_grow(ScanResult* r) {
@@ -1411,6 +1422,7 @@ static void dir_enumerate(ScanResult* r) {
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW(wpattern, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
+    r->progress_tick = GetTickCount();
     /* Two-mode scan:
        - Below ENTRIES_MAX_CAP: buffer grows on demand (2x doubling from
          ENTRIES_INIT_CAP=2048 up to ENTRIES_MAX_CAP=32768). Most folders
@@ -1420,6 +1432,8 @@ static void dir_enumerate(ScanResult* r) {
          today's files are visible even in monster folders (100k+). */
     int oldest_idx = -1;
     do {
+        if (r->cancel) break;
+        r->progress_tick = GetTickCount();
         if (fd.cFileName[0] == L'.' && fd.cFileName[1] == 0) continue;
         if (fd.cFileName[0] == L'.' && fd.cFileName[1] == L'.' && fd.cFileName[2] == 0) continue;
 
@@ -1499,6 +1513,7 @@ static void scan_apply(Tab* tab, const ScanResult* res) {
     sel_clear(tab);
     tab->view_mode   = view_prefs_lookup(tab->path);
     tab->loading     = 0;
+    tab->scan_timed_out = 0;
     strncpy(tab->loaded_path, tab->path, MAX_PATH-1);
     tab->loaded_path[MAX_PATH-1] = 0;
     refresh_today();
@@ -1545,6 +1560,21 @@ static void scan_apply(Tab* tab, const ScanResult* res) {
     g_needs_redraw = 1;
 }
 
+/* Drop the tab's claim on an in-flight async scan and ask the worker to stop:
+   the flag ends a long enumeration, CancelSynchronousIo aborts a
+   FindFirstFileW/FindNextFileW stuck on an unresponsive network share.
+   Whatever the worker still posts is ignored (the tab no longer points at
+   it) and freed by WM_SCAN_DONE. */
+static void scan_cancel(Tab* tab) {
+    ScanResult* r = tab->scan_req;
+    if (!r) return;
+    tab->scan_req = NULL;
+    tab->loading  = 0;
+    InterlockedExchange(&r->cancel, 1);
+    if (r->thread) CancelSynchronousIo(r->thread);
+    scan_req_release(r);
+}
+
 /* Synchronous scan — for refreshes right after our own file operations
    (rename, delete, paste, new file), whose callers look up the new entries
    immediately. Supersedes any async scan still in flight for this tab. */
@@ -1552,7 +1582,7 @@ static void scan_directory(Tab* tab) {
     ScanResult r;
     memset(&r, 0, sizeof(r));
     strncpy(r.path, tab->path, MAX_PATH-1);
-    tab->scan_gen = ++g_scan_gen_counter;
+    scan_cancel(tab);
     dir_enumerate(&r);
     scan_apply(tab, &r);
     free(r.entries);
@@ -1561,29 +1591,36 @@ static void scan_directory(Tab* tab) {
 static DWORD WINAPI scan_worker(LPVOID arg) {
     ScanResult* r = (ScanResult*)arg;
     dir_enumerate(r);
-    if (!PostMessageW(g_hwnd, WM_SCAN_DONE, 0, (LPARAM)r)) scan_result_free(r);
+    /* Our ref travels with the message; if it can't be posted, drop it here. */
+    if (!PostMessageW(g_hwnd, WM_SCAN_DONE, 0, (LPARAM)r)) scan_req_release(r);
     return 0;
 }
 
-static Tab* tab_by_scan_gen(unsigned gen) {
+static Tab* tab_by_scan_req(const ScanResult* r) {
     for (int p = 0; p < 2; p++)
         for (int i = 0; i < g_app.panels[p].tab_count; i++)
-            if (g_app.panels[p].tabs[i].scan_gen == gen) return &g_app.panels[p].tabs[i];
+            if (g_app.panels[p].tabs[i].scan_req == r) return &g_app.panels[p].tabs[i];
     return NULL;
 }
 
-/* WM_SCAN_DONE: apply if the tab still exists, still wants this scan (no
-   newer one was started) and still points at the same folder. */
+/* WM_SCAN_DONE: apply if some tab still wants this scan (it wasn't
+   superseded, cancelled or timed out, and the tab wasn't closed). */
 static void scan_on_done(ScanResult* r) {
-    Tab* t = tab_by_scan_gen(r->gen);
-    if (t && path_eq_ci(t->path, r->path)) {
-        /* scan_apply resolves the sort prefs of *its* tab into the global
-           header state; don't let a background tab's result clobber it. */
-        int sc = g_app.sort_col, sa = g_app.sort_asc;
-        scan_apply(t, r);
-        if (t != active_tab()) { g_app.sort_col = sc; g_app.sort_asc = sa; }
+    Tab* t = tab_by_scan_req(r);
+    if (t) {
+        t->scan_req = NULL;
+        if (!r->cancel && path_eq_ci(t->path, r->path)) {
+            /* scan_apply resolves the sort prefs of *its* tab into the global
+               header state; don't let a background tab's result clobber it. */
+            int sc = g_app.sort_col, sa = g_app.sort_asc;
+            scan_apply(t, r);
+            if (t != active_tab()) { g_app.sort_col = sc; g_app.sort_asc = sa; }
+        } else {
+            t->loading = 0;
+        }
+        scan_req_release(r);   /* the tab's ref */
     }
-    scan_result_free(r);
+    scan_req_release(r);       /* the worker's ref, carried by the message */
 }
 
 static void scan_drain_done(void) {
@@ -1592,21 +1629,54 @@ static void scan_drain_done(void) {
         scan_on_done((ScanResult*)m.lParam);
 }
 
+/* WM_TIMER: abandon scans whose worker has made no progress for
+   SCAN_STALL_TIMEOUT_MS (dead share, hung redirector). Measured from the
+   last entry read, not the start, so a big-but-moving folder isn't cut off. */
+static void scan_watchdog(void) {
+    DWORD now = GetTickCount();
+    int still_loading = 0;
+    for (int p = 0; p < 2; p++)
+        for (int i = 0; i < g_app.panels[p].tab_count; i++) {
+            Tab* t = &g_app.panels[p].tabs[i];
+            if (!t->scan_req) continue;
+            if (now - t->scan_req->progress_tick >= SCAN_STALL_TIMEOUT_MS) {
+                scan_cancel(t);
+                t->scan_timed_out = 1;
+                g_needs_redraw = 1;
+            } else {
+                still_loading = 1;
+            }
+        }
+    if (!still_loading) KillTimer(g_hwnd, TIMER_SCAN_WATCHDOG);
+}
+
 /* Scan on a worker thread. Fast folders (the common case) finish within
    SCAN_SYNC_WAIT_MS and are applied before returning, so there's no loading
    flash and callers see the new entries. Slow ones leave the tab in a
-   loading state and land later via WM_SCAN_DONE while the UI stays live. */
+   loading state and land later via WM_SCAN_DONE while the UI stays live;
+   scan_watchdog gives up on them if they stall. */
 static void scan_directory_async(Tab* tab) {
     if (!g_hwnd) { scan_directory(tab); return; }
+    scan_cancel(tab);
+    tab->scan_timed_out = 0;
     ScanResult* r = (ScanResult*)calloc(1, sizeof(ScanResult));
     if (!r) { scan_directory(tab); return; }
     strncpy(r->path, tab->path, MAX_PATH-1);
-    r->gen = tab->scan_gen = ++g_scan_gen_counter;
-    HANDLE th = CreateThread(NULL, 0, scan_worker, r, 0, NULL);
-    if (!th) { scan_result_free(r); scan_directory(tab); return; }
-    DWORD w = WaitForSingleObject(th, SCAN_SYNC_WAIT_MS);
-    CloseHandle(th);
-    if (w == WAIT_OBJECT_0) { scan_drain_done(); return; }
+    r->refs = 2;                        /* worker + tab */
+    r->progress_tick = GetTickCount();
+    tab->scan_req = r;
+    r->thread = CreateThread(NULL, 0, scan_worker, r, CREATE_SUSPENDED, NULL);
+    if (!r->thread) {
+        tab->scan_req = NULL;
+        free(r);
+        scan_directory(tab);
+        return;
+    }
+    ResumeThread(r->thread);
+    if (WaitForSingleObject(r->thread, SCAN_SYNC_WAIT_MS) == WAIT_OBJECT_0) {
+        scan_drain_done();
+        return;
+    }
 
     tab->loading = 1;
     if (!path_eq_ci(tab->path, tab->loaded_path)) {
@@ -1619,6 +1689,7 @@ static void scan_directory_async(Tab* tab) {
         tab->loaded_path[0] = 0;
     }
     get_tab_title(tab->path, tab->title, sizeof(tab->title));
+    SetTimer(g_hwnd, TIMER_SCAN_WATCHDOG, SCAN_WATCHDOG_MS, NULL);
     g_needs_redraw = 1;
 }
 
@@ -1723,7 +1794,9 @@ static void tab_alloc_buffers(Tab* t) {
     t->entries_cap = ENTRIES_INIT_CAP;
 }
 
+static void scan_cancel(Tab* tab);
 static void tab_free_buffers(Tab* t) {
+    scan_cancel(t);
     free(t->entries);  t->entries  = NULL;
     free(t->sel_mask); t->sel_mask = NULL;
     t->entries_cap = 0;
@@ -5716,10 +5789,25 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
     render_scissor(r, (int)lx, (int)ly, (int)lw, (int)lh);
 
     /* Async scan of a new folder still running — nothing to list yet. */
-    if (t->loading && t->entry_count == 0) {
-        const char* msg = "Loading\xE2\x80\xA6";
+    if ((t->loading || t->scan_timed_out) && t->entry_count == 0) {
+        const char* msg = t->loading ? "Loading\xE2\x80\xA6" : "This folder is not responding.";
         float tw = (float)render_text_width(r, msg);
         render_text(r, msg, floorf(lx + (lw - tw) / 2), floorf(ly + 40), COL_SUBTEXT);
+        if (t->scan_timed_out && !t->loading) {
+            /* Visible retry — not everyone knows about F5. */
+            const char* lbl = "Refresh";
+            float bw = (float)render_text_width(r, lbl) + 16 + 8 + 24, bh = 30;
+            float bx = floorf(lx + (lw - bw) / 2), by = floorf(ly + 40 + r->font_height + 14);
+            int hov = ui_hover(&g_ui, bx, by, bw, bh);
+            render_quad(r, bx, by, bw, bh, hov ? COL_SELECTED : COL_HOVER);
+            uint32_t fg = hov ? COL_TEXT : COL_SUBTEXT;
+            render_mdl2(r, ICON_REFRESH, bx + 12, by + (bh - 14) / 2, 14, fg);
+            render_text(r, lbl, bx + 12 + 16 + 8, floorf(by + (bh - r->font_height) / 2), fg);
+            if (ui_clicked(&g_ui, UIID(990), bx, by, bw, bh)) {
+                scan_directory_async(t);
+                g_needs_redraw = 1;
+            }
+        }
         render_scissor_reset(r);
         return;
     }
@@ -6349,12 +6437,26 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
     char trunc[48] = {0};
     if (t->truncated) _snprintf(trunc, sizeof(trunc), "  (newest %d shown)", ENTRIES_MAX_CAP);
     if (t->loading)   _snprintf(trunc + strlen(trunc), sizeof(trunc) - strlen(trunc), "  Loading\xE2\x80\xA6");
+    else if (t->scan_timed_out)
+        _snprintf(trunc + strlen(trunc), sizeof(trunc) - strlen(trunc), "  (not responding)");
     if (sel > 0)
         _snprintf(info, sizeof(info), "%d folders, %d files  (%d selected)%s", folders, files, sel, trunc);
     else
         _snprintf(info, sizeof(info), "%d folders, %d files%s", folders, files, trunc);
     float ty = y + (STATUS_BAR_H - g_renderer.fonts[1].font_height) / 2;
     render_text_small(r, info, x0 + 10, ty, COL_SUBTEXT);
+    if (t->scan_timed_out && !t->loading) {
+        /* Clickable retry next to "(not responding)" — covers a refresh that
+           stalled while the old listing is still on screen. */
+        float rx = x0 + 10 + render_text_width_small(r, info) + 8;
+        float rw = (float)render_text_width_small(r, "Retry");
+        int hov = ui_hover(&g_ui, rx - 4, y, rw + 8, STATUS_BAR_H);
+        render_text_small(r, "Retry", rx, ty, hov ? COL_TEXT : COL_ACCENT);
+        if (ui_clicked(&g_ui, UIID(991 + panel_idx), rx - 4, y, rw + 8, STATUS_BAR_H)) {
+            scan_directory_async(t);
+            g_needs_redraw = 1;
+        }
+    }
 
     float btn_sz = 14, btn_pad = 6;
     float btn_w  = btn_sz + btn_pad * 2;
@@ -7223,6 +7325,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_TIMER:
         if (wp == TIMER_WATCH_DEBOUNCE) { watch_flush(); return 0; }
+        if (wp == TIMER_SCAN_WATCHDOG)  { scan_watchdog(); return 0; }
         break;
 
     case WM_NCCALCSIZE: return handle_nccalcsize(hwnd, wp, lp);
