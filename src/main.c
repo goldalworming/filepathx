@@ -123,6 +123,10 @@ typedef struct {
     int view_mode;  /* VM_DETAILS / SMALL_ICONS / LARGE_ICONS */
     int grid_cols;  /* updated by build_file_list each frame in icon views */
     int truncated;  /* 1 if scan hit ENTRIES_MAX_CAP and kept only the newest N */
+    unsigned scan_gen;              /* id of the latest scan started for this tab */
+    int  loading;                   /* async scan in flight */
+    char loaded_path[MAX_PATH];     /* folder the current entries[] came from */
+    char pending_focus[MAX_PATH];   /* entry to select once loading finishes */
 } Tab;
 
 typedef struct {
@@ -663,6 +667,7 @@ static volatile int g_ff_scanning = 0;
 
 /* Forward decls */
 static void scroll_to_entry(Tab* t, int idx);
+static Tab*  active_tab(void);
 static void ff_open(void);
 static void ff_close(void);
 static void ff_refresh_results(void);
@@ -1348,8 +1353,126 @@ static void resort_directory(Tab* tab) {
     g_needs_redraw = 1;
 }
 
-/* ---- Directory scanning ---- */
-static void scan_directory(Tab* tab) {
+/* ---- Directory scanning ----
+   Enumeration (the only part that touches the disk) is split from applying
+   the result to a tab, so it can run on a worker thread: FindFirstFileW on a
+   network share, a spun-down HDD or a 100k-entry folder can take seconds. */
+typedef struct {
+    char       path[MAX_PATH];
+    unsigned   gen;          /* Tab.scan_gen this result was requested for */
+    FileEntry* entries;      /* malloc'd; .group is filled in by scan_apply */
+    int        count, cap;
+    int        truncated;
+} ScanResult;
+
+#define WM_SCAN_DONE      (WM_APP + 31)   /* lParam = ScanResult*, receiver frees */
+#define SCAN_SYNC_WAIT_MS 40              /* apply inline if the worker is this fast */
+static unsigned g_scan_gen_counter = 0;
+
+static void scan_result_free(ScanResult* r) {
+    if (r) { free(r->entries); free(r); }
+}
+
+static int scan_result_grow(ScanResult* r) {
+    if (r->cap >= ENTRIES_MAX_CAP) return 1;
+    int new_cap = r->cap ? r->cap * 2 : ENTRIES_INIT_CAP;
+    if (new_cap > ENTRIES_MAX_CAP) new_cap = ENTRIES_MAX_CAP;
+    FileEntry* ne = (FileEntry*)realloc(r->entries, (size_t)new_cap * sizeof(FileEntry));
+    if (!ne) return 0;
+    r->entries = ne;
+    r->cap = new_cap;
+    return 1;
+}
+
+static void scan_fill_entry(FileEntry* e, const WIN32_FIND_DATAW* fd) {
+    w_to_u8(fd->cFileName, e->name, MAX_PATH);
+    e->is_dir   = (fd->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    e->size     = ((ULONGLONG)fd->nFileSizeHigh << 32) | fd->nFileSizeLow;
+    e->modified = fd->ftLastWriteTime;
+    e->group    = 0;
+}
+
+static int scan_oldest_idx(const ScanResult* r) {
+    int oldest = 0;
+    for (int i = 1; i < r->count; i++)
+        if (CompareFileTime(&r->entries[i].modified, &r->entries[oldest].modified) < 0)
+            oldest = i;
+    return oldest;
+}
+
+/* Thread-safe: touches only `r`. */
+static void dir_enumerate(ScanResult* r) {
+    WCHAR wpattern[MAX_PATH + 4];
+    {
+        char pattern[MAX_PATH + 4];
+        path_join_a(r->path, "*", pattern, sizeof(pattern));
+        u8_to_w(pattern, wpattern, MAX_PATH + 4);
+    }
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wpattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    /* Two-mode scan:
+       - Below ENTRIES_MAX_CAP: buffer grows on demand (2x doubling from
+         ENTRIES_INIT_CAP=2048 up to ENTRIES_MAX_CAP=32768). Most folders
+         land here — a 3000-file folder grows once to 4096 and stops.
+       - At ENTRIES_MAX_CAP: fall back to "keep newest by mtime" — every
+         further entry replaces the oldest slot if it's newer. Guarantees
+         today's files are visible even in monster folders (100k+). */
+    int oldest_idx = -1;
+    do {
+        if (fd.cFileName[0] == L'.' && fd.cFileName[1] == 0) continue;
+        if (fd.cFileName[0] == L'.' && fd.cFileName[1] == L'.' && fd.cFileName[2] == 0) continue;
+
+        /* Try to grow if the buffer is full and we're not yet at the max cap. */
+        if (r->count >= r->cap && r->cap < ENTRIES_MAX_CAP) {
+            if (!scan_result_grow(r)) break;   /* OOM — stop scan */
+        }
+
+        if (r->count < r->cap) {
+            scan_fill_entry(&r->entries[r->count++], &fd);
+            /* On the transition to full-at-MAX, cache the oldest entry
+               so subsequent replacements don't have to rescan every time
+               a stale entry comes in. */
+            if (r->count == ENTRIES_MAX_CAP) oldest_idx = scan_oldest_idx(r);
+        } else {
+            /* At ENTRIES_MAX_CAP — replace-oldest if incoming is newer */
+            r->truncated = 1;
+            if (CompareFileTime(&fd.ftLastWriteTime, &r->entries[oldest_idx].modified) <= 0) continue;
+            scan_fill_entry(&r->entries[oldest_idx], &fd);
+            /* Re-find the oldest slot for the next comparison */
+            oldest_idx = scan_oldest_idx(r);
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+/* Select + reveal the entry called `name`. Returns 0 if it isn't listed. */
+static int tab_select_name(Tab* t, const char* name) {
+    for (int i = 0; i < t->entry_count; i++) {
+        if (_stricmp(t->entries[i].name, name) == 0) {
+            sel_only(t, i);
+            t->selected = i;
+            t->sel_anchor = i;
+            scroll_to_entry(t, i);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Like tab_select_name, but if the folder is still loading, remember the
+   name and select it once the scan lands. */
+static void tab_focus_name(Tab* t, const char* name) {
+    if (t->loading) {
+        strncpy(t->pending_focus, name, MAX_PATH-1);
+        t->pending_focus[MAX_PATH-1] = 0;
+        return;
+    }
+    tab_select_name(t, name);
+}
+
+/* UI thread: install a finished enumeration into the tab. */
+static void scan_apply(Tab* tab, const ScanResult* res) {
     /* Save UI state by NAME so refresh/auto-watcher doesn't lose selection */
     char saved_sel_name[MAX_PATH] = {0};
     char saved_anchor_name[MAX_PATH] = {0};
@@ -1363,9 +1486,10 @@ static void scan_directory(Tab* tab) {
     if (n_sel > 0) {
         saved_names = (char(*)[MAX_PATH])calloc(n_sel, MAX_PATH);
         int k = 0;
-        for (int i = 0; i < tab->entry_count; i++)
-            if (tab->sel_mask[i])
-                strncpy(saved_names[k++], tab->entries[i].name, MAX_PATH-1);
+        if (saved_names)
+            for (int i = 0; i < tab->entry_count; i++)
+                if (tab->sel_mask[i])
+                    strncpy(saved_names[k++], tab->entries[i].name, MAX_PATH-1);
     }
     float saved_target_scroll = tab->target_scroll;
 
@@ -1374,77 +1498,20 @@ static void scan_directory(Tab* tab) {
     tab->sel_anchor = -1;
     sel_clear(tab);
     tab->view_mode   = view_prefs_lookup(tab->path);
+    tab->loading     = 0;
+    strncpy(tab->loaded_path, tab->path, MAX_PATH-1);
+    tab->loaded_path[MAX_PATH-1] = 0;
     refresh_today();
-    WCHAR wpattern[MAX_PATH + 4];
-    {
-        char pattern[MAX_PATH + 4];
-        path_join_a(tab->path, "*", pattern, sizeof(pattern));
-        u8_to_w(pattern, wpattern, MAX_PATH + 4);
-    }
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW(wpattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
-    /* Two-mode scan:
-       - Below ENTRIES_MAX_CAP: buffer grows on demand (2x doubling from
-         ENTRIES_INIT_CAP=2048 up to ENTRIES_MAX_CAP=32768). Most folders
-         land here — a 3000-file folder grows once to 4096 and stops.
-       - At ENTRIES_MAX_CAP: fall back to "keep newest by mtime" — every
-         further entry replaces the oldest slot if it's newer. Guarantees
-         today's files are visible even in monster folders (100k+). */
-    tab->truncated = 0;
-    int oldest_idx = -1;
-    FILETIME oldest_ft = {0, 0};
-    do {
-        if (fd.cFileName[0] == L'.' && fd.cFileName[1] == 0) continue;
-        if (fd.cFileName[0] == L'.' && fd.cFileName[1] == L'.' && fd.cFileName[2] == 0) continue;
 
-        /* Try to grow if the buffer is full and we're not yet at the max cap. */
-        if (tab->entry_count >= tab->entries_cap && tab->entries_cap < ENTRIES_MAX_CAP) {
-            if (!tab_entries_grow(tab)) break;   /* OOM — stop scan */
-        }
+    while (tab->entries_cap < res->count && tab->entries_cap < ENTRIES_MAX_CAP)
+        if (!tab_entries_grow(tab)) break;
+    int n = res->count < tab->entries_cap ? res->count : tab->entries_cap;
+    if (n > 0) memcpy(tab->entries, res->entries, (size_t)n * sizeof(FileEntry));
+    tab->entry_count = n;
+    tab->truncated   = res->truncated || n < res->count;
+    for (int i = 0; i < n; i++)
+        tab->entries[i].group = compute_group(tab->entries[i].modified);
 
-        if (tab->entry_count < tab->entries_cap) {
-            FileEntry* e = &tab->entries[tab->entry_count++];
-            w_to_u8(fd.cFileName, e->name, MAX_PATH);
-            e->is_dir   = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-            e->size     = ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-            e->modified = fd.ftLastWriteTime;
-            e->group    = compute_group(e->modified);
-            /* On the transition to full-at-MAX, cache the oldest entry
-               so subsequent replacements don't have to rescan every time
-               a stale entry comes in. */
-            if (tab->entry_count == tab->entries_cap && tab->entries_cap == ENTRIES_MAX_CAP) {
-                oldest_idx = 0;
-                oldest_ft  = tab->entries[0].modified;
-                for (int i = 1; i < tab->entries_cap; i++) {
-                    if (CompareFileTime(&tab->entries[i].modified, &oldest_ft) < 0) {
-                        oldest_idx = i;
-                        oldest_ft  = tab->entries[i].modified;
-                    }
-                }
-            }
-        } else {
-            /* At ENTRIES_MAX_CAP — replace-oldest if incoming is newer */
-            tab->truncated = 1;
-            if (CompareFileTime(&fd.ftLastWriteTime, &oldest_ft) <= 0) continue;
-            FileEntry* e = &tab->entries[oldest_idx];
-            w_to_u8(fd.cFileName, e->name, MAX_PATH);
-            e->is_dir   = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-            e->size     = ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-            e->modified = fd.ftLastWriteTime;
-            e->group    = compute_group(e->modified);
-            /* Re-find the oldest slot for the next comparison */
-            oldest_idx = 0;
-            oldest_ft  = tab->entries[0].modified;
-            for (int i = 1; i < tab->entries_cap; i++) {
-                if (CompareFileTime(&tab->entries[i].modified, &oldest_ft) < 0) {
-                    oldest_idx = i;
-                    oldest_ft  = tab->entries[i].modified;
-                }
-            }
-        }
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
     apply_sort_prefs(tab);
     qsort(tab->entries, tab->entry_count, sizeof(FileEntry), compare_entries);
 
@@ -1469,6 +1536,88 @@ static void scan_directory(Tab* tab) {
             }
     tab->target_scroll = saved_target_scroll;
 
+    if (tab->pending_focus[0]) {
+        tab_select_name(tab, tab->pending_focus);
+        tab->pending_focus[0] = 0;
+    }
+
+    get_tab_title(tab->path, tab->title, sizeof(tab->title));
+    g_needs_redraw = 1;
+}
+
+/* Synchronous scan — for refreshes right after our own file operations
+   (rename, delete, paste, new file), whose callers look up the new entries
+   immediately. Supersedes any async scan still in flight for this tab. */
+static void scan_directory(Tab* tab) {
+    ScanResult r;
+    memset(&r, 0, sizeof(r));
+    strncpy(r.path, tab->path, MAX_PATH-1);
+    tab->scan_gen = ++g_scan_gen_counter;
+    dir_enumerate(&r);
+    scan_apply(tab, &r);
+    free(r.entries);
+}
+
+static DWORD WINAPI scan_worker(LPVOID arg) {
+    ScanResult* r = (ScanResult*)arg;
+    dir_enumerate(r);
+    if (!PostMessageW(g_hwnd, WM_SCAN_DONE, 0, (LPARAM)r)) scan_result_free(r);
+    return 0;
+}
+
+static Tab* tab_by_scan_gen(unsigned gen) {
+    for (int p = 0; p < 2; p++)
+        for (int i = 0; i < g_app.panels[p].tab_count; i++)
+            if (g_app.panels[p].tabs[i].scan_gen == gen) return &g_app.panels[p].tabs[i];
+    return NULL;
+}
+
+/* WM_SCAN_DONE: apply if the tab still exists, still wants this scan (no
+   newer one was started) and still points at the same folder. */
+static void scan_on_done(ScanResult* r) {
+    Tab* t = tab_by_scan_gen(r->gen);
+    if (t && path_eq_ci(t->path, r->path)) {
+        /* scan_apply resolves the sort prefs of *its* tab into the global
+           header state; don't let a background tab's result clobber it. */
+        int sc = g_app.sort_col, sa = g_app.sort_asc;
+        scan_apply(t, r);
+        if (t != active_tab()) { g_app.sort_col = sc; g_app.sort_asc = sa; }
+    }
+    scan_result_free(r);
+}
+
+static void scan_drain_done(void) {
+    MSG m;
+    while (PeekMessageW(&m, g_hwnd, WM_SCAN_DONE, WM_SCAN_DONE, PM_REMOVE))
+        scan_on_done((ScanResult*)m.lParam);
+}
+
+/* Scan on a worker thread. Fast folders (the common case) finish within
+   SCAN_SYNC_WAIT_MS and are applied before returning, so there's no loading
+   flash and callers see the new entries. Slow ones leave the tab in a
+   loading state and land later via WM_SCAN_DONE while the UI stays live. */
+static void scan_directory_async(Tab* tab) {
+    if (!g_hwnd) { scan_directory(tab); return; }
+    ScanResult* r = (ScanResult*)calloc(1, sizeof(ScanResult));
+    if (!r) { scan_directory(tab); return; }
+    strncpy(r->path, tab->path, MAX_PATH-1);
+    r->gen = tab->scan_gen = ++g_scan_gen_counter;
+    HANDLE th = CreateThread(NULL, 0, scan_worker, r, 0, NULL);
+    if (!th) { scan_result_free(r); scan_directory(tab); return; }
+    DWORD w = WaitForSingleObject(th, SCAN_SYNC_WAIT_MS);
+    CloseHandle(th);
+    if (w == WAIT_OBJECT_0) { scan_drain_done(); return; }
+
+    tab->loading = 1;
+    if (!path_eq_ci(tab->path, tab->loaded_path)) {
+        /* Entries belong to the previous folder — don't show or act on them. */
+        tab->entry_count = 0;
+        tab->selected = -1;
+        tab->sel_anchor = -1;
+        sel_clear(tab);
+        tab->truncated = 0;
+        tab->loaded_path[0] = 0;
+    }
     get_tab_title(tab->path, tab->title, sizeof(tab->title));
     g_needs_redraw = 1;
 }
@@ -1514,7 +1663,8 @@ static void tab_navigate(Tab* tab, const char* path, int add_hist) {
     sel_clear(tab);
     tab->target_scroll = 0;
     tab->scroll_y = 0;
-    scan_directory(tab);
+    tab->pending_focus[0] = 0;
+    scan_directory_async(tab);
     watch_start(tab->path);
     tabs_save();
 }
@@ -1527,17 +1677,7 @@ static void tab_go_up(Tab* tab) {
     PathRemoveFileSpecA(parent);
     if (strlen(parent) < 2) return;
     tab_navigate(tab, parent, 1);
-    if (leaf[0]) {
-        for (int i = 0; i < tab->entry_count; i++) {
-            if (strcmp(tab->entries[i].name, leaf) == 0) {
-                tab->selected = i;
-                tab->sel_anchor = i;
-                tab->sel_mask[i] = 1;
-                scroll_to_entry(tab, i);
-                break;
-            }
-        }
-    }
+    if (leaf[0]) tab_focus_name(tab, leaf);
 }
 
 static void tab_go_back(Tab* tab) {
@@ -1550,7 +1690,8 @@ static void tab_go_back(Tab* tab) {
         sel_clear(tab);
         tab->target_scroll = 0;
         tab->scroll_y = 0;
-        scan_directory(tab);
+        tab->pending_focus[0] = 0;
+        scan_directory_async(tab);
         watch_start(tab->path);
         tabs_save();
     }
@@ -1566,7 +1707,8 @@ static void tab_go_forward(Tab* tab) {
         sel_clear(tab);
         tab->target_scroll = 0;
         tab->scroll_y = 0;
-        scan_directory(tab);
+        tab->pending_focus[0] = 0;
+        scan_directory_async(tab);
         watch_start(tab->path);
         tabs_save();
     }
@@ -3224,16 +3366,7 @@ static void ff_open_selected(void) {
         char* slash = strrchr(parent, '\\');
         if (slash) *slash = 0;
         if (_stricmp(parent, t->path) != 0) tab_navigate(t, parent, 1);
-        /* select the file by name */
-        for (int i = 0; i < t->entry_count; i++) {
-            if (_stricmp(t->entries[i].name, e->name) == 0) {
-                sel_only(t, i);
-                t->selected = i;
-                t->sel_anchor = i;
-                scroll_to_entry(t, i);
-                break;
-            }
-        }
+        tab_focus_name(t, e->name);
     }
     ff_close();
 }
@@ -4422,7 +4555,7 @@ static void handle_context_cmd(int cmd, int item_idx) {
         do_new_file(t);
         break;
     case IDM_REFRESH:
-        scan_directory(t);
+        scan_directory_async(t);
         break;
     case IDM_OPEN_TERMINAL:
         open_terminal_at(t->path, 0);
@@ -5582,6 +5715,15 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
     render_quad(r, lx, ly, lw, lh, COL_BG);
     render_scissor(r, (int)lx, (int)ly, (int)lw, (int)lh);
 
+    /* Async scan of a new folder still running — nothing to list yet. */
+    if (t->loading && t->entry_count == 0) {
+        const char* msg = "Loading\xE2\x80\xA6";
+        float tw = (float)render_text_width(r, msg);
+        render_text(r, msg, floorf(lx + (lw - tw) / 2), floorf(ly + 40), COL_SUBTEXT);
+        render_scissor_reset(r);
+        return;
+    }
+
     /* Icon grid view modes (small/large) — separate render path */
     if (t->view_mode != VM_DETAILS) {
         int item_w  = (t->view_mode == VM_SMALL_ICONS) ? 90  : 180;
@@ -6206,6 +6348,7 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
     char info[160];
     char trunc[48] = {0};
     if (t->truncated) _snprintf(trunc, sizeof(trunc), "  (newest %d shown)", ENTRIES_MAX_CAP);
+    if (t->loading)   _snprintf(trunc + strlen(trunc), sizeof(trunc) - strlen(trunc), "  Loading\xE2\x80\xA6");
     if (sel > 0)
         _snprintf(info, sizeof(info), "%d folders, %d files  (%d selected)%s", folders, files, sel, trunc);
     else
@@ -7064,7 +7207,7 @@ static LRESULT handle_nchittest(HWND hwnd, LPARAM lp) {
 /* ---- Directory watcher (debounced) ---- */
 static void watch_flush(void) {
     watch_cancel_pending();
-    scan_directory(active_tab());
+    scan_directory_async(active_tab());
     g_needs_redraw = 1;
 }
 
@@ -7410,7 +7553,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_typeahead_len = 0; g_needs_redraw = 1; return 0;
         }
         if (wp == VK_BACK) { tab_go_up(t); g_needs_redraw = 1; }
-        else if (wp == VK_F5) { thumb_cache_clear(); scan_directory(t); }
+        else if (wp == VK_F5) { thumb_cache_clear(); scan_directory_async(t); }
         else if (wp == VK_F2 && t->selected >= 0) { do_rename(t, t->selected); }
         else if (wp == VK_DELETE && sel_count(t) > 0) {
             if (shift) do_permanent_delete_selected(t);
@@ -7558,6 +7701,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (n > 0) g_needs_redraw = 1;
         return 0;
     }
+
+    case WM_SCAN_DONE:
+        scan_on_done((ScanResult*)lp);
+        return 0;
 
     case WM_UPDATE_STATUS:
         /* Updater launched its swap-and-restart script — quit so the exe's
