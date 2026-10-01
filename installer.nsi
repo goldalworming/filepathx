@@ -2,7 +2,7 @@
 ;
 ; Build with make-installer.bat (it reads the version out of src/version.h and
 ; passes it in):
-;     makensis /DAPP_VERSION=0.7.9 /DAPP_VERSION4=0.7.9.0 installer.nsi
+;     makensis /DAPP_VERSION=0.7.10 /DAPP_VERSION4=0.7.10.0 installer.nsi
 ;
 ; Per-user install (no UAC): %LOCALAPPDATA%\Programs\FilePathX. The in-app
 ; auto-updater replaces FilePathX.exe in place, so it keeps working from here.
