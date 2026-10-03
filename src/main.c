@@ -6549,8 +6549,9 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
     float btn_y  = y + 1;
     float btn_x  = x1 - btn_w - 4;
 
-    /* Right-most button: panel 0 = split toggle, panel 1 = sync toggle */
-    if (panel_idx == 0) {
+    /* Right-most button: split toggle on both panels, so the right panel's
+       corner closes split view too. */
+    {
         int hov = ui_hover(&g_ui, btn_x, btn_y, btn_w, btn_h);
         if (hov) render_quad(r, btn_x, btn_y, btn_w, btn_h, COL_HOVER);
         uint32_t col = g_app.split_active ? COL_ACCENT : (hov ? COL_TEXT : COL_SUBTEXT);
@@ -6558,7 +6559,7 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
         if (hov) tt_set(g_app.split_active ? "Close split view  (Ctrl+\\)"
                                            : "Split view  (Ctrl+\\)",
                         (int)(btn_x + btn_w / 2), (int)btn_y);
-        if (ui_clicked(&g_ui, 600, btn_x, btn_y, btn_w, btn_h)) {
+        if (ui_clicked(&g_ui, panel_idx ? 603 : 600, btn_x, btn_y, btn_w, btn_h)) {
             g_app.split_active = !g_app.split_active;
             if (g_app.split_active && g_app.panels[1].tab_count == 0) {
                 int saved = g_app.active_panel;
@@ -6566,19 +6567,8 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
                 new_tab(g_app.panels[0].tabs[g_app.panels[0].active_tab].path);
                 g_app.active_panel = saved;
             }
+            if (!g_app.split_active && g_app.active_panel == 1) g_app.active_panel = 0;
             tabs_save();
-            g_needs_redraw = 1;
-        }
-    } else {
-        int hov = ui_hover(&g_ui, btn_x, btn_y, btn_w, btn_h);
-        if (hov) render_quad(r, btn_x, btn_y, btn_w, btn_h, COL_HOVER);
-        uint32_t col = g_sync_scroll ? COL_ACCENT : (hov ? COL_TEXT : COL_SUBTEXT);
-        render_mdl2(r, ICON_LINK, btn_x + btn_pad, btn_y + (btn_h - btn_sz) / 2, btn_sz, col);
-        if (hov) tt_set(g_sync_scroll ? "Sync scroll: on (both panels scroll together)"
-                                      : "Sync scroll: off",
-                        (int)(btn_x + btn_w / 2), (int)btn_y);
-        if (ui_clicked(&g_ui, 601, btn_x, btn_y, btn_w, btn_h)) {
-            g_sync_scroll = !g_sync_scroll;
             g_needs_redraw = 1;
         }
     }
@@ -6619,6 +6609,22 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
             t->scroll_y = 0;
             t->target_scroll = 0;
             view_prefs_set(t->path, new_mode);
+            g_needs_redraw = 1;
+        }
+    }
+
+    /* Sync-scroll toggle (right panel only), left of the view-mode button */
+    if (panel_idx == 1) {
+        float sx = vx - btn_w - 2;
+        int hov = ui_hover(&g_ui, sx, btn_y, btn_w, btn_h);
+        if (hov) render_quad(r, sx, btn_y, btn_w, btn_h, COL_HOVER);
+        uint32_t col = g_sync_scroll ? COL_ACCENT : (hov ? COL_TEXT : COL_SUBTEXT);
+        render_mdl2(r, ICON_LINK, sx + btn_pad, btn_y + (btn_h - btn_sz) / 2, btn_sz, col);
+        if (hov) tt_set(g_sync_scroll ? "Sync scroll: on (both panels scroll together)"
+                                      : "Sync scroll: off",
+                        (int)(sx + btn_w / 2), (int)btn_y);
+        if (ui_clicked(&g_ui, 601, sx, btn_y, btn_w, btn_h)) {
+            g_sync_scroll = !g_sync_scroll;
             g_needs_redraw = 1;
         }
     }
@@ -7803,6 +7809,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 new_tab(g_app.panels[0].tabs[g_app.panels[0].active_tab].path);
                 g_app.active_panel = saved;
             }
+            if (!g_app.split_active && g_app.active_panel == 1) g_app.active_panel = 0;
             tabs_save();
             g_needs_redraw = 1;
         }
