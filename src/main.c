@@ -2720,8 +2720,12 @@ static void inline_rename_start(int idx) {
 
     WCHAR wname[MAX_PATH];
     u8_to_w(t->entries[idx].name, wname, MAX_PATH);
+    /* Icon views draw the name centered under the icon; keep the editor
+       centered too so the text doesn't jump to the left on F2. The grid
+       renderer moves the box into place on the next frame. */
+    DWORD align = (t->view_mode != VM_DETAILS) ? ES_CENTER : ES_LEFT;
     g_edit_hwnd = CreateWindowExW(0, L"EDIT", wname,
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_MULTILINE,
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_MULTILINE | align,
         (int)name_x, (int)ry, (int)name_w, ROW_H,
         g_hwnd, NULL, GetModuleHandle(NULL), NULL);
 
@@ -6151,9 +6155,19 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
             float name_y = iy + icon_sz + 14;
             float name_h = (float)(item_h - icon_sz - 18);
             if (iy + item_h < ly || iy > ly + lh) inline_rename_cancel();
-            else SetWindowPos(g_edit_hwnd, NULL, (int)ix, (int)name_y,
-                              (int)(item_w - 4), (int)name_h,
-                              SWP_NOZORDER | SWP_NOACTIVATE);
+            else {
+                int ew = item_w - 4, eh = (int)name_h;
+                RECT cur; GetClientRect(g_edit_hwnd, &cur);
+                SetWindowPos(g_edit_hwnd, NULL, (int)ix, (int)name_y, ew, eh,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+                /* Resizing resets the edit's formatting rect; re-apply it so
+                   the text sits on the same line as the drawn label. */
+                if (cur.right != ew || cur.bottom != eh) {
+                    int top = (int)(iy + icon_sz + 18 - name_y);
+                    RECT fmt = { 4, top, ew - 4, top + r->font_height };
+                    SendMessageW(g_edit_hwnd, EM_SETRECT, 0, (LPARAM)&fmt);
+                }
+            }
         }
         render_scissor_reset(r);
         return;
