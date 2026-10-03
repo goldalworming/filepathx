@@ -266,6 +266,9 @@ static void watch_start(const char* path) {
 static void scan_directory(Tab* tab);
 static int  tab_entries_grow(Tab* t);
 static void make_unique_name(const char* dir, const char* base_name, char* out, int out_n);
+typedef struct WList { WCHAR* buf; int len, cap; } WList;
+static int  wlist_add(WList* l, const WCHAR* s);
+static void fileop_start(UINT func, WList* from, WList* to, FILEOP_FLAGS flags);
 
 /* ---- IDropTarget: receive drops onto our window (drag between panels) ---- */
 typedef struct { IDropTargetVtbl* lpVtbl; LONG refs; } DT;
@@ -331,6 +334,7 @@ static HRESULT STDMETHODCALLTYPE DT_Drop(IDropTarget* This, IDataObject* pdo, DW
     if (FAILED(pdo->lpVtbl->GetData(pdo, &fmt, &med))) { *pdwEffect = DROPEFFECT_NONE; return S_OK; }
     HDROP hd = (HDROP)med.hGlobal;
     const char* dest_dir = g_app.panels[target].tabs[g_app.panels[target].active_tab].path;
+    WList from = {0}, to = {0};
     int count = DragQueryFileW(hd, 0xFFFFFFFF, NULL, 0);
     for (int i = 0; i < count; i++) {
         WCHAR wsrc[MAX_PATH + 2] = {0}, wdst[MAX_PATH + 2] = {0};
@@ -355,19 +359,13 @@ static HRESULT STDMETHODCALLTYPE DT_Drop(IDropTarget* This, IDataObject* pdo, DW
         }
         path_join_a(dest_dir, dst_name, dst, MAX_PATH);
         u8_to_w(dst, wdst, MAX_PATH);
-        SHFILEOPSTRUCTW op = {0};
-        op.hwnd = g_hwnd;
-        op.wFunc = (effect == DROPEFFECT_MOVE) ? FO_MOVE : FO_COPY;
-        op.pFrom = wsrc;
-        op.pTo   = wdst;
-        op.fFlags = FOF_ALLOWUNDO;
-        SHFileOperationW(&op);
+        wlist_add(&from, wsrc);
+        wlist_add(&to, wdst);
     }
     ReleaseStgMedium(&med);
-    /* Refresh both panels so source + dest update */
-    scan_directory(&g_app.panels[0].tabs[g_app.panels[0].active_tab]);
-    if (g_app.panels[1].tab_count > 0)
-        scan_directory(&g_app.panels[1].tabs[g_app.panels[1].active_tab]);
+    /* Runs on a worker thread; both panels are rescanned when it finishes. */
+    fileop_start((effect == DROPEFFECT_MOVE) ? FO_MOVE : FO_COPY, &from, &to,
+                 FOF_ALLOWUNDO | FOF_MULTIDESTFILES);
     *pdwEffect = effect;
     g_needs_redraw = 1;
     return S_OK;
@@ -2722,8 +2720,12 @@ static void inline_rename_start(int idx) {
 
     WCHAR wname[MAX_PATH];
     u8_to_w(t->entries[idx].name, wname, MAX_PATH);
+    /* Icon views draw the name centered under the icon; keep the editor
+       centered too so the text doesn't jump to the left on F2. The grid
+       renderer moves the box into place on the next frame. */
+    DWORD align = (t->view_mode != VM_DETAILS) ? ES_CENTER : ES_LEFT;
     g_edit_hwnd = CreateWindowExW(0, L"EDIT", wname,
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_MULTILINE,
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_MULTILINE | align,
         (int)name_x, (int)ry, (int)name_w, ROW_H,
         g_hwnd, NULL, GetModuleHandle(NULL), NULL);
 
@@ -2812,6 +2814,93 @@ static void clipboard_set_files(const char* path, DWORD effect) {
     CloseClipboard();
 }
 
+/* ---- Background file operations ----
+   SHFileOperationW blocks until the whole job is done — deleting or copying a
+   big folder can take minutes. Called on the UI thread that froze the app, so
+   each job runs on its own worker thread and WM_FILEOP_DONE rescans the
+   visible tabs when it finishes. The progress/confirm dialogs are unowned
+   (hwnd = NULL) so they never disable the main window. */
+#define WM_FILEOP_DONE (WM_APP + 32)
+
+typedef struct FileOpJob {
+    UINT         func;
+    WCHAR*       from;   /* double-null-terminated */
+    WCHAR*       to;     /* double-null-terminated or NULL */
+    FILEOP_FLAGS flags;
+} FileOpJob;
+
+static volatile LONG g_fileop_running = 0;
+
+/* Append one path to a double-null-terminated list. */
+static int wlist_add(WList* l, const WCHAR* s) {
+    int n = (int)wcslen(s) + 1;
+    if (l->len + n + 1 > l->cap) {
+        int nc = l->cap ? l->cap * 2 : 1024;
+        while (nc < l->len + n + 1) nc *= 2;
+        WCHAR* nb = (WCHAR*)realloc(l->buf, nc * sizeof(WCHAR));
+        if (!nb) return 0;
+        l->buf = nb; l->cap = nc;
+    }
+    memcpy(l->buf + l->len, s, n * sizeof(WCHAR));
+    l->len += n;
+    l->buf[l->len] = 0;
+    return 1;
+}
+
+static DWORD WINAPI fileop_worker(LPVOID arg) {
+    FileOpJob* j = (FileOpJob*)arg;
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    SHFILEOPSTRUCTW op = {0};
+    op.hwnd   = NULL;
+    op.wFunc  = j->func;
+    op.pFrom  = j->from;
+    op.pTo    = j->to;
+    op.fFlags = j->flags;
+    SHFileOperationW(&op);
+    CoUninitialize();
+    free(j->from);
+    free(j->to);
+    free(j);
+    InterlockedDecrement(&g_fileop_running);
+    PostMessageW(g_hwnd, WM_FILEOP_DONE, 0, 0);
+    return 0;
+}
+
+/* Takes ownership of the lists' buffers (they are reset to empty). */
+static void fileop_start(UINT func, WList* from, WList* to, FILEOP_FLAGS flags) {
+    WCHAR* f = from ? from->buf : NULL;
+    WCHAR* t = to   ? to->buf   : NULL;
+    if (from) memset(from, 0, sizeof(*from));
+    if (to)   memset(to,   0, sizeof(*to));
+    if (!f || !f[0]) { free(f); free(t); return; }
+
+    FileOpJob* j = (FileOpJob*)calloc(1, sizeof(FileOpJob));
+    HANDLE th = NULL;
+    if (j) {
+        j->func = func; j->from = f; j->to = t; j->flags = flags;
+        InterlockedIncrement(&g_fileop_running);
+        th = CreateThread(NULL, 0, fileop_worker, j, 0, NULL);
+        if (th) { CloseHandle(th); return; }
+        InterlockedDecrement(&g_fileop_running);
+        free(j);
+    }
+    /* Couldn't spawn a thread — fall back to doing it inline. */
+    SHFILEOPSTRUCTW op = {0};
+    op.hwnd = g_hwnd; op.wFunc = func; op.pFrom = f; op.pTo = t; op.fFlags = flags;
+    SHFileOperationW(&op);
+    free(f); free(t);
+    PostMessageW(g_hwnd, WM_FILEOP_DONE, 0, 0);
+}
+
+static void fileop_on_done(void) {
+    for (int p = 0; p < 2; p++) {
+        Panel* pn = &g_app.panels[p];
+        if (pn->tab_count <= 0) continue;
+        scan_directory_async(&pn->tabs[pn->active_tab]);
+    }
+    g_needs_redraw = 1;
+}
+
 static void clipboard_paste(const char* dest_dir) {
     if (!IsClipboardFormatAvailable(CF_HDROP)) return;
     if (!OpenClipboard(g_hwnd)) return;
@@ -2824,6 +2913,7 @@ static void clipboard_paste(const char* dest_dir) {
         if (he) { DWORD* pe = (DWORD*)GlobalLock(he); if (pe) { effect = *pe; GlobalUnlock(he); } }
     }
 
+    WList from = {0}, to = {0};
     int count = DragQueryFileW(hd, 0xFFFFFFFF, NULL, 0);
     for (int i = 0; i < count; i++) {
         WCHAR wsrc[MAX_PATH + 2] = {0}, wdst[MAX_PATH + 2] = {0};
@@ -2855,19 +2945,15 @@ static void clipboard_paste(const char* dest_dir) {
         }
         path_join_a(dest_dir, dst_name, dst, MAX_PATH);
         u8_to_w(dst, wdst, MAX_PATH);
-
-        SHFILEOPSTRUCTW op = {0};
-        op.hwnd = g_hwnd;
-        op.wFunc = (effect == DROPEFFECT_MOVE) ? FO_MOVE : FO_COPY;
-        op.pFrom = wsrc;
-        op.pTo = wdst;
-        op.fFlags = FOF_ALLOWUNDO;
-        SHFileOperationW(&op);
+        wlist_add(&from, wsrc);
+        wlist_add(&to, wdst);
     }
     CloseClipboard();
     if (effect == DROPEFFECT_MOVE) {
         OpenClipboard(g_hwnd); EmptyClipboard(); CloseClipboard();
     }
+    fileop_start((effect == DROPEFFECT_MOVE) ? FO_MOVE : FO_COPY, &from, &to,
+                 FOF_ALLOWUNDO | FOF_MULTIDESTFILES);
 }
 
 /* ---- File operations ---- */
@@ -2938,13 +3024,8 @@ static void do_delete_selected(Tab* t) {
     int wlen = 0;
     WCHAR* list = build_selected_path_list_w(t, &wlen);
     if (!list) return;
-    SHFILEOPSTRUCTW op = {0};
-    op.hwnd = g_hwnd;
-    op.wFunc = FO_DELETE;
-    op.pFrom = list;
-    op.fFlags = FOF_ALLOWUNDO;
-    SHFileOperationW(&op);
-    free(list);
+    WList from = { list, wlen, wlen };
+    fileop_start(FO_DELETE, &from, NULL, FOF_ALLOWUNDO);
 }
 
 static void do_permanent_delete_selected(Tab* t) {
@@ -2978,13 +3059,9 @@ static void do_permanent_delete_selected(Tab* t) {
     int wlen = 0;
     WCHAR* list = build_selected_path_list_w(t, &wlen);
     if (!list) return;
-    SHFILEOPSTRUCTW op = {0};
-    op.hwnd = g_hwnd;
-    op.wFunc = FO_DELETE;
-    op.pFrom = list;
-    op.fFlags = FOF_NOCONFIRMATION;  /* permanent + skip Windows' own prompt */
-    SHFileOperationW(&op);
-    free(list);
+    WList from = { list, wlen, wlen };
+    /* permanent + skip Windows' own prompt */
+    fileop_start(FO_DELETE, &from, NULL, FOF_NOCONFIRMATION);
 }
 
 /* ---- Batch rename ---- */
@@ -4610,12 +4687,10 @@ static void handle_context_cmd(int cmd, int item_idx) {
         break;
     case IDM_PASTE:
         clipboard_paste(t->path);
-        scan_directory(t);
         break;
     case IDM_DELETE:
         if (sel_count(t) > 0) {
             do_delete_selected(t);
-            scan_directory(t);
         }
         break;
     case IDM_RENAME:
@@ -6080,9 +6155,19 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
             float name_y = iy + icon_sz + 14;
             float name_h = (float)(item_h - icon_sz - 18);
             if (iy + item_h < ly || iy > ly + lh) inline_rename_cancel();
-            else SetWindowPos(g_edit_hwnd, NULL, (int)ix, (int)name_y,
-                              (int)(item_w - 4), (int)name_h,
-                              SWP_NOZORDER | SWP_NOACTIVATE);
+            else {
+                int ew = item_w - 4, eh = (int)name_h;
+                RECT cur; GetClientRect(g_edit_hwnd, &cur);
+                SetWindowPos(g_edit_hwnd, NULL, (int)ix, (int)name_y, ew, eh,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+                /* Resizing resets the edit's formatting rect; re-apply it so
+                   the text sits on the same line as the drawn label. */
+                if (cur.right != ew || cur.bottom != eh) {
+                    int top = (int)(iy + icon_sz + 18 - name_y);
+                    RECT fmt = { 4, top, ew - 4, top + r->font_height };
+                    SendMessageW(g_edit_hwnd, EM_SETRECT, 0, (LPARAM)&fmt);
+                }
+            }
         }
         render_scissor_reset(r);
         return;
@@ -6464,8 +6549,9 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
     float btn_y  = y + 1;
     float btn_x  = x1 - btn_w - 4;
 
-    /* Right-most button: panel 0 = split toggle, panel 1 = sync toggle */
-    if (panel_idx == 0) {
+    /* Right-most button: split toggle on both panels, so the right panel's
+       corner closes split view too. */
+    {
         int hov = ui_hover(&g_ui, btn_x, btn_y, btn_w, btn_h);
         if (hov) render_quad(r, btn_x, btn_y, btn_w, btn_h, COL_HOVER);
         uint32_t col = g_app.split_active ? COL_ACCENT : (hov ? COL_TEXT : COL_SUBTEXT);
@@ -6473,7 +6559,7 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
         if (hov) tt_set(g_app.split_active ? "Close split view  (Ctrl+\\)"
                                            : "Split view  (Ctrl+\\)",
                         (int)(btn_x + btn_w / 2), (int)btn_y);
-        if (ui_clicked(&g_ui, 600, btn_x, btn_y, btn_w, btn_h)) {
+        if (ui_clicked(&g_ui, panel_idx ? 603 : 600, btn_x, btn_y, btn_w, btn_h)) {
             g_app.split_active = !g_app.split_active;
             if (g_app.split_active && g_app.panels[1].tab_count == 0) {
                 int saved = g_app.active_panel;
@@ -6481,19 +6567,8 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
                 new_tab(g_app.panels[0].tabs[g_app.panels[0].active_tab].path);
                 g_app.active_panel = saved;
             }
+            if (!g_app.split_active && g_app.active_panel == 1) g_app.active_panel = 0;
             tabs_save();
-            g_needs_redraw = 1;
-        }
-    } else {
-        int hov = ui_hover(&g_ui, btn_x, btn_y, btn_w, btn_h);
-        if (hov) render_quad(r, btn_x, btn_y, btn_w, btn_h, COL_HOVER);
-        uint32_t col = g_sync_scroll ? COL_ACCENT : (hov ? COL_TEXT : COL_SUBTEXT);
-        render_mdl2(r, ICON_LINK, btn_x + btn_pad, btn_y + (btn_h - btn_sz) / 2, btn_sz, col);
-        if (hov) tt_set(g_sync_scroll ? "Sync scroll: on (both panels scroll together)"
-                                      : "Sync scroll: off",
-                        (int)(btn_x + btn_w / 2), (int)btn_y);
-        if (ui_clicked(&g_ui, 601, btn_x, btn_y, btn_w, btn_h)) {
-            g_sync_scroll = !g_sync_scroll;
             g_needs_redraw = 1;
         }
     }
@@ -6534,6 +6609,22 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
             t->scroll_y = 0;
             t->target_scroll = 0;
             view_prefs_set(t->path, new_mode);
+            g_needs_redraw = 1;
+        }
+    }
+
+    /* Sync-scroll toggle (right panel only), left of the view-mode button */
+    if (panel_idx == 1) {
+        float sx = vx - btn_w - 2;
+        int hov = ui_hover(&g_ui, sx, btn_y, btn_w, btn_h);
+        if (hov) render_quad(r, sx, btn_y, btn_w, btn_h, COL_HOVER);
+        uint32_t col = g_sync_scroll ? COL_ACCENT : (hov ? COL_TEXT : COL_SUBTEXT);
+        render_mdl2(r, ICON_LINK, sx + btn_pad, btn_y + (btn_h - btn_sz) / 2, btn_sz, col);
+        if (hov) tt_set(g_sync_scroll ? "Sync scroll: on (both panels scroll together)"
+                                      : "Sync scroll: off",
+                        (int)(sx + btn_w / 2), (int)btn_y);
+        if (ui_clicked(&g_ui, 601, sx, btn_y, btn_w, btn_h)) {
+            g_sync_scroll = !g_sync_scroll;
             g_needs_redraw = 1;
         }
     }
@@ -7661,7 +7752,6 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else if (wp == VK_DELETE && sel_count(t) > 0) {
             if (shift) do_permanent_delete_selected(t);
             else       do_delete_selected(t);
-            scan_directory(t);
         }
         else if (wp == VK_RETURN && t->selected >= 0) {
             do_open_entry(t, t->selected);
@@ -7681,7 +7771,6 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         else if (wp=='V' && ctrl) {
             clipboard_paste(t->path);
-            scan_directory(t);
         }
         else if (wp=='D' && ctrl && shift) { handle_context_cmd(IDM_OPEN_TERMINAL_TAB, -1); }
         else if (wp=='D' && ctrl) { handle_context_cmd(IDM_OPEN_TERMINAL, -1); }
@@ -7720,6 +7809,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 new_tab(g_app.panels[0].tabs[g_app.panels[0].active_tab].path);
                 g_app.active_panel = saved;
             }
+            if (!g_app.split_active && g_app.active_panel == 1) g_app.active_panel = 0;
             tabs_save();
             g_needs_redraw = 1;
         }
@@ -7807,6 +7897,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_SCAN_DONE:
         scan_on_done((ScanResult*)lp);
+        return 0;
+
+    case WM_FILEOP_DONE:
+        fileop_on_done();
         return 0;
 
     case WM_UPDATE_STATUS:
@@ -8038,6 +8132,18 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int cmdShow)
         }
     }
 done:
+    /* Leaving WinMain ends the process and would kill a delete/copy worker
+       half-way. Hide the window and let running file operations finish;
+       their own progress dialogs stay up and keep pumping messages. */
+    if (g_fileop_running > 0) {
+        ShowWindow(g_hwnd, SW_HIDE);
+        while (g_fileop_running > 0) {
+            while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg); DispatchMessageW(&msg);
+            }
+            MsgWaitForMultipleObjects(0, NULL, FALSE, 100, QS_ALLINPUT);
+        }
+    }
     wglMakeCurrent(NULL, NULL);
     wglDeleteContext(glrc);
     ReleaseDC(g_hwnd, hdc);
