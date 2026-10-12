@@ -4785,9 +4785,25 @@ static void scroll_to_entry(Tab* t, int idx) {
         int gi = t->entries[idx].group;
         if (t->group_collapsed[gi]) t->group_collapsed[gi] = 0;
     }
+    float lh = (float)(g_height - CONTENT_TOP - COL_HDR_H - STATUS_BAR_H);
+    if (t->view_mode != VM_DETAILS) {
+        /* Icon grids lay items out in rows of grid_cols (".." hidden), each
+           item_h tall — Details row math lands on the wrong item, badly so
+           with Large Icons' 180px rows. Mirror build_file_list's layout. */
+        if (strcmp(t->entries[idx].name, "..") == 0) return;
+        int item_h = (t->view_mode == VM_SMALL_ICONS) ? 100 : 180;
+        int cols = t->grid_cols > 0 ? t->grid_cols : 1;
+        int slot = 0;
+        for (int k = 0; k < idx; k++)
+            if (strcmp(t->entries[k].name, "..") != 0) slot++;
+        float iy = 4.0f + (float)(slot / cols) * item_h;
+        if (iy >= t->target_scroll && iy + item_h <= t->target_scroll + lh) return;
+        t->target_scroll = iy + item_h * 0.5f - lh * 0.5f;
+        if (t->target_scroll < 0) t->target_scroll = 0;
+        return;
+    }
     int r = entry_to_row(t, idx);
     if (r < 0) return;
-    float lh = (float)(g_height - CONTENT_TOP - COL_HDR_H - STATUS_BAR_H);
     float ry = (float)r * ROW_H;
     /* If already comfortably in view (top half not too high, bottom not clipped), leave it. */
     float margin = ROW_H * 2;
