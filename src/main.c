@@ -5632,9 +5632,27 @@ static void build_toolbar(float x0, float x1) {
         }
     }
 
-    /* Breadcrumb (shrunk to leave room for kebab) */
+    /* Search (fuzzy finder) button, left of the kebab — same as Ctrl+F.
+       Highlighted while this panel's finder is open (the finder's own X or
+       Esc closes it; the overlay swallows clicks meanwhile). */
+    float sr_w = 26;
+    float sr_x = kb_x - sr_w - 2;
+    {
+        int ff_here = (g_ff_active && g_ff_panel == g_app.active_panel);
+        int hov = ui_hover(&g_ui, sr_x, y+2, sr_w, TOOLBAR_H-4);
+        if (hov || ff_here) render_quad(r, sr_x, y+2, sr_w, TOOLBAR_H-4, COL_HOVER);
+        render_mdl2(r, ICON_SEARCH, sr_x + (sr_w - 12) / 2, y + (TOOLBAR_H - 12) / 2, 12,
+                    ff_here ? COL_ACCENT : (hov ? COL_TEXT : COL_SUBTEXT));
+        if (hov) tt_set("Search files  (Ctrl+F)", (int)(sr_x + sr_w/2), (int)(y + 2));
+        if (ui_clicked(&g_ui, UIID(211), sr_x, y+2, sr_w, TOOLBAR_H-4)) {
+            if (g_ff_active) ff_close();   /* finder open in the other panel */
+            ff_open();
+        }
+    }
+
+    /* Breadcrumb (shrunk to leave room for search + kebab) */
     float crumb_x0 = bx;
-    float crumb_w  = kb_x - bx - 4;
+    float crumb_w  = sr_x - bx - 4;
     int addr_here = (g_addr_hwnd && g_addr_panel == g_app.active_panel);
     if (addr_here) {
         int nx = (int)crumb_x0, ny = (int)(y+3);
@@ -6717,9 +6735,25 @@ static void build_fuzzy_finder(void) {
     if ((GetTickCount() / 500) & 1)
         render_quad(r, tx + cur_w + 1, ty - 2, 1, r->font_height + 4, COL_TEXT);
 
-    /* Recursive checkbox on the right */
+    /* Close (X) button at the right end of the input row — same as Esc */
+    float cl_sz = 24;
+    float cl_x  = ff_x + ff_w - 8 - 6 - cl_sz;
+    float cl_y  = ff_y + 8 + (in_h - cl_sz) / 2;
+    {
+        int hov = ui_hover(&g_ui, cl_x, cl_y, cl_sz, cl_sz);
+        if (hov) render_quad(r, cl_x, cl_y, cl_sz, cl_sz, COL_HOVER);
+        render_mdl2(r, ICON_CLOSE, cl_x + (cl_sz - 10) / 2, cl_y + (cl_sz - 10) / 2, 10,
+                    hov ? COL_TEXT : COL_SUBTEXT);
+        if (hov) tt_set("Close  (Esc)", (int)(cl_x + cl_sz / 2), (int)cl_y);
+        if (ui_clicked(&g_ui, UIID(799), cl_x, cl_y, cl_sz, cl_sz)) {
+            ff_close();
+            return;
+        }
+    }
+
+    /* Recursive checkbox, left of the close button */
     float cb_sz = 14;
-    float cb_x  = ff_x + ff_w - 20 - cb_sz - render_text_width(r, "Recursive");
+    float cb_x  = cl_x - 12 - cb_sz - render_text_width(r, "Recursive");
     float cb_y  = ff_y + 8 + (in_h - cb_sz) / 2;
     render_quad(r, cb_x - 1, cb_y - 1, cb_sz + 2, cb_sz + 2, COL_BORDER);
     render_quad(r, cb_x, cb_y, cb_sz, cb_sz, g_ff_recursive ? COL_ACCENT : COL_BG);
