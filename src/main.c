@@ -7,6 +7,7 @@
 #include <shlwapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <wincodec.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3562,6 +3563,7 @@ typedef struct {
     HWND hwnd;
     char path[MAX_PATH];
     int  request_id;
+    int  full;          /* decode at original resolution instead of a preview */
 } ViewerLoadReq;
 
 typedef struct {
@@ -3569,6 +3571,8 @@ typedef struct {
     int      request_id;
     HBITMAP  bmp;
     int      w, h;
+    int      orig_w, orig_h;   /* source size after EXIF rotation; 0 if unknown */
+    int      full;             /* bmp is the full-resolution decode */
     char     date_taken[64];
 } ViewerLoadResult;
 
@@ -3615,6 +3619,10 @@ typedef struct {
     int    hover_btn;       /* 0=none, 1=rename, 2=delete */
     int    next_request_id; /* monotonic; result discarded if != latest */
     int    loading;         /* 1 while async decode in flight */
+    int    full_mode;       /* user asked for full resolution (sticky per window) */
+    int    is_full;         /* v->bmp is a full-resolution decode */
+    int    orig_w, orig_h;  /* source size; 0 if unknown */
+    int    keep_view;       /* pending reload of the same image: keep zoom/pan */
 } ViewerState;
 
 static void viewer_collect_siblings(ViewerState* v, const char* startname) {
@@ -3659,9 +3667,158 @@ static void viewer_collect_siblings(ViewerState* v, const char* startname) {
 static void viewer_update_title(ViewerState* v);
 static void viewer_rename_cancel(ViewerState* v);
 
+/* ---- Full-resolution decode (WIC) ----
+   The default viewer path asks the shell for a <=2048px image, which is fast
+   and often comes straight from the thumbnail cache — but it falls apart when
+   zooming into a large photo. Full mode decodes the original with WIC.
+   GUIDs are spelled out so we don't depend on which import lib carries them. */
+static const GUID FPX_CLSID_WICImagingFactory =
+    {0xcacaf262,0x9370,0x4615,{0xa1,0x3b,0x9f,0x55,0x39,0xda,0x4c,0x0a}};
+static const GUID FPX_IID_IWICImagingFactory =
+    {0xec5ec8a9,0xc395,0x4314,{0x9c,0x77,0x54,0xd7,0xa9,0x35,0xff,0x70}};
+static const GUID FPX_WICPixelFormat32bppPBGRA =
+    {0x6fddc324,0x4e03,0x4bfe,{0xb1,0x85,0x3d,0x77,0x76,0x8d,0xc9,0x10}};
+
+/* Cap on decoded pixels (~800 MB at 32bpp); bigger sources are scaled down
+   to fit so CreateDIBSection doesn't fail outright. */
+#define VIEWER_FULL_MAX_PIXELS (200.0 * 1000 * 1000)
+
+static int wic_orientation(IWICBitmapFrameDecode* fr) {
+    int o = 1;
+    IWICMetadataQueryReader* q = NULL;
+    if (FAILED(fr->lpVtbl->GetMetadataQueryReader(fr, &q)) || !q) return 1;
+    static const WCHAR* names[] = {
+        L"System.Photo.Orientation", L"/app1/ifd/{ushort=274}", L"/ifd/{ushort=274}"
+    };
+    for (int i = 0; i < 3; i++) {
+        PROPVARIANT pv;
+        PropVariantInit(&pv);
+        if (SUCCEEDED(q->lpVtbl->GetMetadataByName(q, names[i], &pv)) && pv.vt == VT_UI2)
+            o = pv.uiVal;
+        PropVariantClear(&pv);
+        if (o != 1) break;
+    }
+    q->lpVtbl->Release(q);
+    return (o >= 1 && o <= 8) ? o : 1;
+}
+
+/* Opens the first frame; *orient gets the EXIF orientation (1..8). */
+static IWICBitmapFrameDecode* wic_open_frame(IWICImagingFactory* f, const WCHAR* path,
+                                             UINT* w, UINT* h, int* orient) {
+    IWICBitmapDecoder* dec = NULL;
+    IWICBitmapFrameDecode* fr = NULL;
+    if (FAILED(f->lpVtbl->CreateDecoderFromFilename(f, path, NULL, GENERIC_READ,
+                                                    WICDecodeMetadataCacheOnDemand, &dec)) || !dec)
+        return NULL;
+    if (FAILED(dec->lpVtbl->GetFrame(dec, 0, &fr))) fr = NULL;
+    dec->lpVtbl->Release(dec);   /* the frame keeps the decoder alive */
+    if (!fr) return NULL;
+    if (FAILED(fr->lpVtbl->GetSize(fr, w, h)) || *w == 0 || *h == 0) {
+        fr->lpVtbl->Release(fr);
+        return NULL;
+    }
+    *orient = wic_orientation(fr);
+    return fr;
+}
+
+/* Original size as displayed (EXIF 5..8 swap width/height). Header-only. */
+static void wic_probe_size(IWICImagingFactory* f, const WCHAR* path, int* ow, int* oh) {
+    UINT w = 0, h = 0; int o = 1;
+    IWICBitmapFrameDecode* fr = wic_open_frame(f, path, &w, &h, &o);
+    if (!fr) return;
+    fr->lpVtbl->Release(fr);
+    if (o >= 5) { UINT t = w; w = h; h = t; }
+    *ow = (int)w; *oh = (int)h;
+}
+
+static HBITMAP wic_decode_full(IWICImagingFactory* f, const WCHAR* path,
+                               int* out_w, int* out_h, int* ow, int* oh) {
+    UINT w = 0, h = 0; int o = 1;
+    IWICBitmapFrameDecode* fr = wic_open_frame(f, path, &w, &h, &o);
+    if (!fr) return NULL;
+    *ow = (int)((o >= 5) ? h : w);
+    *oh = (int)((o >= 5) ? w : h);
+
+    IWICBitmapSource* cur = (IWICBitmapSource*)fr;   /* owns one reference */
+    HBITMAP bmp = NULL;
+
+    if ((double)w * h > VIEWER_FULL_MAX_PIXELS) {
+        double k = sqrt(VIEWER_FULL_MAX_PIXELS / ((double)w * h));
+        UINT nw = (UINT)(w * k), nh = (UINT)(h * k);
+        if (nw < 1) nw = 1;
+        if (nh < 1) nh = 1;
+        IWICBitmapScaler* sc = NULL;
+        if (FAILED(f->lpVtbl->CreateBitmapScaler(f, &sc)) || !sc) goto done;
+        if (FAILED(sc->lpVtbl->Initialize(sc, cur, nw, nh, WICBitmapInterpolationModeFant))) {
+            sc->lpVtbl->Release(sc); goto done;
+        }
+        cur->lpVtbl->Release(cur);
+        cur = (IWICBitmapSource*)sc;
+    }
+    if (o != 1) {
+        static const WICBitmapTransformOptions xf[9] = {
+            WICBitmapTransformRotate0,
+            WICBitmapTransformRotate0,                                     /* 1 */
+            WICBitmapTransformFlipHorizontal,                              /* 2 */
+            WICBitmapTransformRotate180,                                   /* 3 */
+            WICBitmapTransformFlipVertical,                                /* 4 */
+            WICBitmapTransformRotate90  | WICBitmapTransformFlipHorizontal,/* 5 */
+            WICBitmapTransformRotate90,                                    /* 6 */
+            WICBitmapTransformRotate270 | WICBitmapTransformFlipHorizontal,/* 7 */
+            WICBitmapTransformRotate270,                                   /* 8 */
+        };
+        IWICBitmapFlipRotator* fl = NULL;
+        if (SUCCEEDED(f->lpVtbl->CreateBitmapFlipRotator(f, &fl)) && fl) {
+            if (SUCCEEDED(fl->lpVtbl->Initialize(fl, cur, xf[o]))) {
+                cur->lpVtbl->Release(cur);
+                cur = (IWICBitmapSource*)fl;
+            } else {
+                fl->lpVtbl->Release(fl);
+            }
+        }
+    }
+    {
+        IWICFormatConverter* cv = NULL;
+        if (FAILED(f->lpVtbl->CreateFormatConverter(f, &cv)) || !cv) goto done;
+        if (FAILED(cv->lpVtbl->Initialize(cv, cur, &FPX_WICPixelFormat32bppPBGRA,
+                                          WICBitmapDitherTypeNone, NULL, 0.0,
+                                          WICBitmapPaletteTypeCustom))) {
+            cv->lpVtbl->Release(cv); goto done;
+        }
+        cur->lpVtbl->Release(cur);
+        cur = (IWICBitmapSource*)cv;
+    }
+    {
+        UINT fw = 0, fh = 0;
+        if (FAILED(cur->lpVtbl->GetSize(cur, &fw, &fh)) || !fw || !fh) goto done;
+        BITMAPINFO bmi = {0};
+        bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth       = (LONG)fw;
+        bmi.bmiHeader.biHeight      = -(LONG)fh;   /* top-down */
+        bmi.bmiHeader.biPlanes      = 1;
+        bmi.bmiHeader.biBitCount    = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        void* bits = NULL;
+        HBITMAP dib = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+        if (!dib || !bits) { if (dib) DeleteObject(dib); goto done; }
+        UINT stride = fw * 4;
+        if (FAILED(cur->lpVtbl->CopyPixels(cur, NULL, stride, stride * fh, (BYTE*)bits))) {
+            DeleteObject(dib); goto done;
+        }
+        bmp = dib;
+        *out_w = (int)fw; *out_h = (int)fh;
+    }
+done:
+    cur->lpVtbl->Release(cur);
+    return bmp;
+}
+
 static DWORD WINAPI viewer_load_worker(LPVOID arg) {
     (void)arg;
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    IWICImagingFactory* wic = NULL;
+    CoCreateInstance(&FPX_CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+                     &FPX_IID_IWICImagingFactory, (void**)&wic);
     while (1) {
         WaitForSingleObject(g_vload_event, INFINITE);
         for (;;) {
@@ -3683,21 +3840,36 @@ static DWORD WINAPI viewer_load_worker(LPVOID arg) {
             if (superseded) continue;
 
             HBITMAP hbmp = NULL;
-            int w = 0, h = 0;
+            int w = 0, h = 0, orig_w = 0, orig_h = 0, got_full = 0;
             char date_taken[64] = {0};
             WCHAR wp[MAX_PATH];
             u8_to_w(req.path, wp, MAX_PATH);
 
+            if (req.full && wic) {
+                hbmp = wic_decode_full(wic, wp, &w, &h, &orig_w, &orig_h);
+                got_full = (hbmp != NULL);
+            } else if (wic) {
+                wic_probe_size(wic, wp, &orig_w, &orig_h);
+            }
+
             IShellItem* item = NULL;
-            if (SUCCEEDED(SHCreateItemFromParsingName(wp, NULL, &IID_IShellItem, (void**)&item)) && item) {
+            if (!hbmp && SUCCEEDED(SHCreateItemFromParsingName(wp, NULL, &IID_IShellItem, (void**)&item)) && item) {
                 IShellItemImageFactory* fac = NULL;
                 if (SUCCEEDED(item->lpVtbl->QueryInterface(item, &IID_IShellItemImageFactory, (void**)&fac)) && fac) {
+                    /* Preview: <=2048px. Full mode lands here only when WIC
+                       can't decode the format; ask the shell for the
+                       original size instead. */
                     SIZE sz = { 2048, 2048 };
+                    if (req.full) {
+                        sz.cx = orig_w > 0 ? orig_w : 8192;
+                        sz.cy = orig_h > 0 ? orig_h : 8192;
+                    }
                     if (SUCCEEDED(fac->lpVtbl->GetImage(fac, sz, SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK, &hbmp)) && hbmp) {
                         DIBSECTION ds = {0};
                         GetObject(hbmp, sizeof(ds), &ds);
                         w = ds.dsBm.bmWidth;
                         h = abs(ds.dsBm.bmHeight);
+                        got_full = req.full;
                     }
                     fac->lpVtbl->Release(fac);
                 }
@@ -3737,6 +3909,9 @@ static DWORD WINAPI viewer_load_worker(LPVOID arg) {
                 res->bmp        = hbmp;
                 res->w          = w;
                 res->h          = h;
+                res->orig_w     = orig_w;
+                res->orig_h     = orig_h;
+                res->full       = got_full;
                 memcpy(res->date_taken, date_taken, sizeof(date_taken));
                 if (!PostMessageW(req.hwnd, WM_VIEWER_LOADED, 0, (LPARAM)res)) {
                     /* Window already gone */
@@ -3759,7 +3934,7 @@ static void viewer_async_init(void) {
     g_vload_init   = 1;
 }
 
-static void viewer_async_request(HWND hwnd, const char* path, int req_id) {
+static void viewer_async_request(HWND hwnd, const char* path, int req_id, int full) {
     viewer_async_init();
     EnterCriticalSection(&g_vload_cs);
     int next = (g_vload_q_tail + 1) % VLOAD_Q_CAP;
@@ -3769,6 +3944,7 @@ static void viewer_async_request(HWND hwnd, const char* path, int req_id) {
         strncpy(r->path, path, MAX_PATH-1);
         r->path[MAX_PATH-1] = 0;
         r->request_id = req_id;
+        r->full = full;
         g_vload_q_tail = next;
         SetEvent(g_vload_event);
     }
@@ -3784,6 +3960,9 @@ static void viewer_load_current(ViewerState* v) {
     v->zoom  = 1.0f; v->pan_x = v->pan_y = 0;
     v->date_taken[0] = 0;
     v->loading = 0;
+    v->is_full = 0;
+    v->orig_w = v->orig_h = 0;
+    v->keep_view = 0;
     if (v->cur_index < 0 || v->cur_index >= v->sibling_count) {
         viewer_update_title(v);
         InvalidateRect(v->hwnd, NULL, FALSE);
@@ -3795,7 +3974,28 @@ static void viewer_load_current(ViewerState* v) {
     v->loading = 1;
     viewer_update_title(v);
     InvalidateRect(v->hwnd, NULL, FALSE);
-    viewer_async_request(v->hwnd, fullp, v->next_request_id);
+    viewer_async_request(v->hwnd, fullp, v->next_request_id, v->full_mode);
+}
+
+/* Toggle full-resolution mode and re-decode the current image in place.
+   The current bitmap stays on screen until the new one arrives, and the
+   zoom/pan are carried over so the view doesn't jump. */
+static void viewer_toggle_full(ViewerState* v) {
+    v->full_mode = !v->full_mode;
+    if (v->cur_index < 0 || v->cur_index >= v->sibling_count) {
+        InvalidateRect(v->hwnd, NULL, FALSE);
+        return;
+    }
+    if (!v->bmp) { viewer_load_current(v); return; }
+    if (v->is_full == v->full_mode) { InvalidateRect(v->hwnd, NULL, FALSE); return; }
+    char fullp[MAX_PATH];
+    path_join_a(v->dir, v->siblings[v->cur_index], fullp, MAX_PATH);
+    v->next_request_id++;
+    v->loading = 1;
+    v->keep_view = 1;
+    viewer_update_title(v);
+    InvalidateRect(v->hwnd, NULL, FALSE);
+    viewer_async_request(v->hwnd, fullp, v->next_request_id, v->full_mode);
 }
 
 static void viewer_update_title(ViewerState* v) {
@@ -3803,18 +4003,32 @@ static void viewer_update_title(ViewerState* v) {
     WCHAR title[MAX_PATH+128];
     WCHAR wname[MAX_PATH];
     u8_to_w(v->siblings[v->cur_index], wname, MAX_PATH);
-    if (v->loading) {
+    /* Show the source size; flag when what's on screen is a smaller preview. */
+    int sw = v->orig_w > 0 ? v->orig_w : v->img_w;
+    int sh = v->orig_h > 0 ? v->orig_h : v->img_h;
+    WCHAR size[96];
+    if (v->img_w > 0 && v->img_w < sw)
+        _snwprintf(size, 96, v->is_full ? L"%d × %d, scaled to %d × %d"
+                                        : L"%d × %d, preview %d × %d — F for full",
+                   sw, sh, v->img_w, v->img_h);
+    else
+        _snwprintf(size, 96, L"%d × %d", sw, sh);
+    if (v->loading && v->keep_view) {
+        _snwprintf(title, MAX_PATH+128,
+                   L"%ls  —  Loading %ls…  —  FilePathX Viewer", wname,
+                   v->full_mode ? L"full resolution" : L"preview");
+    } else if (v->loading) {
         _snwprintf(title, MAX_PATH+128,
                    L"%ls  —  Loading…  —  FilePathX Viewer", wname);
     } else if (v->date_taken[0]) {
         WCHAR wdate[64]; u8_to_w(v->date_taken, wdate, 64);
         _snwprintf(title, MAX_PATH+128,
-                   L"%ls  (%d × %d)  —  Taken %ls  —  FilePathX Viewer",
-                   wname, v->img_w, v->img_h, wdate);
+                   L"%ls  (%ls)  —  Taken %ls  —  FilePathX Viewer",
+                   wname, size, wdate);
     } else {
         _snwprintf(title, MAX_PATH+128,
-                   L"%ls  (%d × %d)  —  FilePathX Viewer",
-                   wname, v->img_w, v->img_h);
+                   L"%ls  (%ls)  —  FilePathX Viewer",
+                   wname, size);
     }
     SetWindowTextW(v->hwnd, title);
 }
@@ -4022,11 +4236,11 @@ static void viewer_show_context_menu(ViewerState* v, int screen_x, int screen_y)
 /* ---- Toolbar layout ---- */
 /* Button IDs (hover_btn values):
    1=Rename, 2=Delete, 3=Rotate Left, 4=Rotate Right, 5=Flip H, 6=Flip V,
-   7=Copy Path. */
+   7=Copy Path, 8=Full resolution toggle. */
 typedef struct { int x, y, w, h, id; const WCHAR* label; int accent_kind; } ViewerBtn;
 /* accent_kind: 0=none (neutral text), 1=accent color, 2=red */
 
-#define VIEWER_BTN_COUNT 7
+#define VIEWER_BTN_COUNT 8
 
 static int viewer_layout_buttons(int cw, ViewerBtn* out /* size >= VIEWER_BTN_COUNT */) {
     int bh = 28, by = 12;
@@ -4042,6 +4256,9 @@ static int viewer_layout_buttons(int cw, ViewerBtn* out /* size >= VIEWER_BTN_CO
     out[2].id = 5; out[2].label = L"⇔";      out[2].accent_kind = 0;
     out[3].x = lx + 3*(transform_w + gap);    out[3].y = by; out[3].w = transform_w; out[3].h = bh;
     out[3].id = 6; out[3].label = L"⇕";      out[3].accent_kind = 0;
+    /* Full-resolution toggle, after the transform cluster */
+    out[7].x = lx + 4*(transform_w + gap) + gap; out[7].y = by; out[7].w = 124; out[7].h = bh;
+    out[7].id = 8; out[7].label = L"Full resolution"; out[7].accent_kind = 0;
     /* Right cluster: Copy Path, Rename, Delete */
     int copy_w = 96, rename_w = 86, delete_w = 86;
     int rx = cw - 12 - delete_w - gap - rename_w - gap - copy_w;
@@ -4256,10 +4473,37 @@ static void viewer_paint(ViewerState* v, HDC hdc) {
         HBITMAP olds = (HBITMAP)SelectObject(src, v->bmp);
         SetStretchBltMode(mem, HALFTONE);
         SetBrushOrgEx(mem, 0, 0, NULL);
-        StretchBlt(mem, dx, dy, dw, dh, src, 0, 0, v->img_w, v->img_h, SRCCOPY);
+        /* Only blit the source pixels that land on screen — zoomed into a
+           full-resolution image, stretching the whole bitmap every paint
+           would be very slow. Whole source pixels keep the mapping exact. */
+        {
+            float ivx0 = (dx < 0 ? -dx : 0) / scale;
+            float ivy0 = (dy < 0 ? -dy : 0) / scale;
+            float ivx1 = ((dx + dw > cw ? cw : dx + dw) - dx) / scale;
+            float ivy1 = ((dy + dh > ch ? ch : dy + dh) - dy) / scale;
+            int sx0 = (int)floorf(ivx0), sy0 = (int)floorf(ivy0);
+            int sx1 = (int)ceilf(ivx1),  sy1 = (int)ceilf(ivy1);
+            if (sx1 > v->img_w) sx1 = v->img_w;
+            if (sy1 > v->img_h) sy1 = v->img_h;
+            if (sx1 > sx0 && sy1 > sy0) {
+                int ox0 = dx + (int)floorf(sx0 * scale + 0.5f);
+                int oy0 = dy + (int)floorf(sy0 * scale + 0.5f);
+                int ox1 = dx + (int)floorf(sx1 * scale + 0.5f);
+                int oy1 = dy + (int)floorf(sy1 * scale + 0.5f);
+                StretchBlt(mem, ox0, oy0, ox1 - ox0, oy1 - oy0,
+                           src, sx0, sy0, sx1 - sx0, sy1 - sy0, SRCCOPY);
+            }
+        }
         SelectObject(src, olds);
         DeleteDC(src);
 
+        if (v->loading && v->keep_view) {
+            SetTextColor(mem, t_accent);
+            SetBkMode(mem, TRANSPARENT);
+            RECT rl = { 0, ch - 54, cw, ch - 32 };
+            DrawTextW(mem, v->full_mode ? L"Loading full resolution…" : L"Loading preview…",
+                      -1, &rl, DT_CENTER | DT_SINGLELINE);
+        }
         if (v->sibling_count > 1) {
             WCHAR buf[64];
             _snwprintf(buf, 64, L"%d / %d", v->cur_index + 1, v->sibling_count);
@@ -4324,19 +4568,20 @@ static void viewer_paint(ViewerState* v, HDC hdc) {
         SetBkMode(mem, TRANSPARENT);
         for (int i = 0; i < nb_btns; i++) {
             int hover = (v->hover_btn == btns[i].id);
+            int on    = (btns[i].id == 8 && v->full_mode);
             COLORREF accent =
                 (btns[i].accent_kind == 2) ? t_red :
                 (btns[i].accent_kind == 1) ? t_accent : t_accent;
             RECT br = { btns[i].x, btns[i].y,
                         btns[i].x + btns[i].w, btns[i].y + btns[i].h };
             HBRUSH bb = CreateSolidBrush(hover ? t_hover : t_header);
-            HPEN   border = CreatePen(PS_SOLID, 1, hover ? accent : t_border);
+            HPEN   border = CreatePen(PS_SOLID, 1, (hover || on) ? accent : t_border);
             HGDIOBJ old_b = SelectObject(mem, bb);
             HGDIOBJ old_p = SelectObject(mem, border);
             RoundRect(mem, br.left, br.top, br.right, br.bottom, 10, 10);
             SelectObject(mem, old_b); SelectObject(mem, old_p);
             DeleteObject(bb); DeleteObject(border);
-            SetTextColor(mem, hover ? accent : t_text);
+            SetTextColor(mem, (hover || on) ? accent : t_text);
             DrawTextW(mem, btns[i].label, -1, &br,
                       DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
@@ -4380,6 +4625,7 @@ static LRESULT CALLBACK viewer_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == 'L')      { viewer_apply_transform(v, 1); return 0; }  /* Rotate left */
         if (wp == 'H')      { viewer_apply_transform(v, 2); return 0; }  /* Flip horizontal */
         if (wp == 'V')      { viewer_apply_transform(v, 3); return 0; }  /* Flip vertical */
+        if (wp == 'F')      { viewer_toggle_full(v); return 0; }          /* Full resolution */
         break;
     case WM_MOUSEWHEEL: {
         if (!v) break;
@@ -4409,6 +4655,7 @@ static LRESULT CALLBACK viewer_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (bhit == 5) { viewer_apply_transform(v, 2); return 0; }  /* Flip H */
             if (bhit == 6) { viewer_apply_transform(v, 3); return 0; }  /* Flip V */
             if (bhit == 7) { viewer_copy_path(v); return 0; }           /* Copy Path */
+            if (bhit == 8) { viewer_toggle_full(v); return 0; }         /* Full resolution */
             int edge = v->client_w / 6;
             if (x < edge)                 { viewer_next(v, -1); return 0; }
             if (x > v->client_w - edge)   { viewer_next(v, +1); return 0; }
@@ -4460,16 +4707,43 @@ static LRESULT CALLBACK viewer_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             free(res);
             return 0;
         }
+        if (v->keep_view && !res->bmp) {
+            /* Re-decode failed — keep showing what we had. */
+            v->full_mode = v->is_full;
+            v->keep_view = 0;
+            v->loading = 0;
+            free(res);
+            viewer_update_title(v);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        /* Same image at another resolution: remember the on-screen scale
+           so the swap is seamless. */
+        float old_scale = 0.0f; int old_w = v->img_w;
+        if (v->keep_view && v->img_w > 0 && v->img_h > 0 && v->client_w > 0 && v->client_h > 0) {
+            float fx = (float)v->client_w / v->img_w, fy = (float)v->client_h / v->img_h;
+            float fit = fx < fy ? fx : fy; if (fit > 1.0f) fit = 1.0f;
+            old_scale = fit * v->zoom;
+        }
         if (v->bmp) DeleteObject(v->bmp);
         v->bmp     = res->bmp;
         v->img_w   = res->w;
         v->img_h   = res->h;
+        v->is_full = res->full;
+        v->orig_w  = res->orig_w;
+        v->orig_h  = res->orig_h;
         memcpy(v->date_taken, res->date_taken, sizeof(v->date_taken));
         v->loading = 0;
         free(res);
         /* Replay any rotate / flip ops stashed for this path so
            navigating away and back preserves the transform. */
         viewer_replay_saved_ops(v);
+        if (v->keep_view && old_scale > 0.0f && v->img_w > 0 && v->img_h > 0) {
+            float fx = (float)v->client_w / v->img_w, fy = (float)v->client_h / v->img_h;
+            float fit = fx < fy ? fx : fy; if (fit > 1.0f) fit = 1.0f;
+            v->zoom = old_scale * ((float)old_w / v->img_w) / fit;
+        }
+        v->keep_view = 0;
         viewer_update_title(v);
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
