@@ -25,9 +25,9 @@ typedef struct {
 void layout_init(Layout* L, int panel);
 int  layout_leaf(const Layout* L, int panel);          /* node of panel, -1 */
 int  layout_panel_count(const Layout* L);
-/* Split panel's leaf; new_panel goes right (vertical) or below. Returns
-   the new leaf node, or -1 if the node pool is full. */
-int  layout_split(Layout* L, int panel, int vertical, int new_panel);
+/* Split panel's leaf; new_panel goes right (vertical) or below, or left /
+   above with before. Returns the new leaf node, or -1 if the pool is full. */
+int  layout_split(Layout* L, int panel, int vertical, int new_panel, int before);
 /* Remove panel's leaf; its space goes to the neighbour. No-op on the last. */
 void layout_remove(Layout* L, int panel);
 /* Lay the tree out in a rect; no leaf goes below min_w x min_h while the
@@ -44,8 +44,13 @@ int  layout_panel_step(const Layout* L, int panel, int dir);
 int  layout_splitter_at(const Layout* L, float x, float y, float slop, float skip_top);
 /* Drag splitter c to mouse position; keeps both sides at their minimum. */
 void layout_splitter_drag(Layout* L, int c, float mx, float my, float min_w, float min_h);
-/* Even out the ratios of panel's siblings. */
+/* Even out the ratios of panel's siblings, or of node c's. */
 void layout_even(Layout* L, int panel);
+void layout_even_siblings(Layout* L, int c);
+/* Panel next to panel in direction (dx, dy) — one of them is 0 — going by
+   the rects from layout_compute; the one sharing the most edge wins. -1 if
+   none. */
+int  layout_panel_dir(const Layout* L, int panel, int dx, int dy);
 /* Validate a loaded tree; returns 1 if usable. */
 int  layout_valid(const Layout* L);
 

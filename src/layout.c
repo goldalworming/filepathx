@@ -46,9 +46,9 @@ static void even_children(Layout* L, int g) {
 }
 
 /* If the parent runs the other way, the leaf turns into a group holding a
-   copy of itself; the new leaf is linked in after it and all siblings get
+   copy of itself; the new leaf is linked in next to it and all siblings get
    an even share. */
-int layout_split(Layout* L, int panel, int vertical, int new_panel) {
+int layout_split(Layout* L, int panel, int vertical, int new_panel, int before) {
     int leaf = layout_leaf(L, panel);
     if (leaf < 0) return -1;
     int p = L->n[leaf].parent;
@@ -66,10 +66,18 @@ int layout_split(Layout* L, int panel, int vertical, int new_panel) {
     int nn = node_alloc(L);
     L->n[nn].panel  = new_panel;
     L->n[nn].parent = p;
-    L->n[nn].prev   = leaf;
-    L->n[nn].next   = L->n[leaf].next;
-    if (L->n[leaf].next >= 0) L->n[L->n[leaf].next].prev = nn;
-    L->n[leaf].next = nn;
+    if (before) {
+        L->n[nn].prev = L->n[leaf].prev;
+        L->n[nn].next = leaf;
+        if (L->n[leaf].prev >= 0) L->n[L->n[leaf].prev].next = nn;
+        else L->n[p].child = nn;
+        L->n[leaf].prev = nn;
+    } else {
+        L->n[nn].prev = leaf;
+        L->n[nn].next = L->n[leaf].next;
+        if (L->n[leaf].next >= 0) L->n[L->n[leaf].next].prev = nn;
+        L->n[leaf].next = nn;
+    }
     even_children(L, p);
     return nn;
 }
@@ -257,8 +265,44 @@ void layout_splitter_drag(Layout* L, int c, float mx, float my, float min_w, flo
 }
 
 void layout_even(Layout* L, int panel) {
+    layout_even_siblings(L, layout_leaf(L, panel));
+}
+
+void layout_even_siblings(Layout* L, int c) {
+    if (c >= 0 && c < MAX_LNODES && L->n[c].used && L->n[c].parent >= 0)
+        even_children(L, L->n[c].parent);
+}
+
+static float overlap(float a0, float a1, float b0, float b1) {
+    float lo = a0 > b0 ? a0 : b0, hi = a1 < b1 ? a1 : b1;
+    return hi - lo;
+}
+
+int layout_panel_dir(const Layout* L, int panel, int dx, int dy) {
     int c = layout_leaf(L, panel);
-    if (c >= 0 && L->n[c].parent >= 0) even_children(L, L->n[c].parent);
+    if (c < 0) return -1;
+    const LNode* a = &L->n[c];
+    int best = -1;
+    float best_gap = 0, best_ov = 0;
+    for (int i = 0; i < MAX_LNODES; i++) {
+        const LNode* n = &L->n[i];
+        if (!n->used || n->child >= 0 || i == c || n->w <= 0 || n->h <= 0) continue;
+        /* Gap from a's edge to n's facing edge, and how much they share
+           across that edge; neighbours touch (gap 0) and share > 0. */
+        float gap, ov;
+        if (dx) {
+            gap = dx > 0 ? n->x - (a->x + a->w) : a->x - (n->x + n->w);
+            ov  = overlap(a->y, a->y + a->h, n->y, n->y + n->h);
+        } else {
+            gap = dy > 0 ? n->y - (a->y + a->h) : a->y - (n->y + n->h);
+            ov  = overlap(a->x, a->x + a->w, n->x, n->x + n->w);
+        }
+        if (gap < -1 || ov <= 0) continue;
+        if (best < 0 || gap < best_gap - 0.5f || (gap <= best_gap + 0.5f && ov > best_ov)) {
+            best = i; best_gap = gap; best_ov = ov;
+        }
+    }
+    return best >= 0 ? L->n[best].panel : -1;
 }
 
 static int check(const Layout* L, int i, int parent, int depth, int* seen, int* panels) {
