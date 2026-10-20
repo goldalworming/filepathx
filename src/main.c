@@ -488,7 +488,12 @@ static int   g_focused_panel = 0;
 
 /* Splitter drag state */
 static int   g_splitter_drag = -1;   /* layout node whose trailing splitter is dragged */
-static int   g_focus_next = -1;      /* panel to focus after this frame's panel loop */
+/* Split/close asked for while the panel loop is drawing (a tab's X, the
+   panel menu) wait for the start of the next frame, so no frame mixes two
+   layouts. */
+static int   g_in_panel_loop = 0;
+static int   g_panel_op = 0;         /* 1 split right, 2 split bottom, 3 close */
+static int   g_panel_op_panel = -1;
 #define SPLITTER_HIT_W 6
 
 /* Sync scroll between panels (default off) */
@@ -3197,6 +3202,12 @@ static int panel_split_try(Layout* out, int vertical, int np) {
 }
 
 static void panel_split(int vertical) {
+    if (g_in_panel_loop) {
+        g_panel_op = vertical ? 1 : 2;
+        g_panel_op_panel = g_app.active_panel;
+        g_needs_redraw = 1;
+        return;
+    }
     int np = panel_free_slot();
     Layout split;
     if (!panel_split_try(&split, vertical, np)) return;
@@ -3204,7 +3215,7 @@ static void panel_split(int vertical) {
     strncpy(path, active_tab()->path, MAX_PATH - 1);
     path[MAX_PATH - 1] = 0;
     g_app.layout = split;
-    g_app.active_panel = g_focus_next = np;
+    g_app.active_panel = np;
     g_app.panels[np].last_click_item = -1;
     new_tab(path);
     layout_update();
@@ -3212,6 +3223,12 @@ static void panel_split(int vertical) {
 }
 
 static void panel_close(int p) {
+    if (g_in_panel_loop) {
+        g_panel_op = 3;
+        g_panel_op_panel = p;
+        g_needs_redraw = 1;
+        return;
+    }
     if (layout_panel_count(&g_app.layout) <= 1) return;
     if (g_edit_hwnd && g_edit_panel == p) inline_rename_cancel();
     if (g_addr_hwnd && g_addr_panel == p) addr_edit_cancel();
@@ -3230,6 +3247,16 @@ static void panel_close(int p) {
     layout_update();
     tabs_save();
     g_needs_redraw = 1;
+}
+
+static void panel_op_flush(void) {
+    int op = g_panel_op, p = g_panel_op_panel;
+    g_panel_op = 0;
+    if (op == 3) panel_close(p);
+    else if (op && layout_leaf(&g_app.layout, p) >= 0) {
+        g_app.active_panel = p;
+        panel_split(op == 1);
+    }
 }
 
 static void batch_rename_commit(void) {
@@ -7016,8 +7043,8 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
             DestroyMenu(pm);
             g_app.active_panel = panel_idx;
             if (cmd == 1 || cmd == 2) panel_split(cmd == 1);
-            if (cmd == 3) { layout_even(&g_app.layout, panel_idx); layout_update(); tabs_save(); }
-            if (cmd == 4) { panel_close(panel_idx); return; }
+            if (cmd == 3) { layout_even(&g_app.layout, panel_idx); tabs_save(); }
+            if (cmd == 4) panel_close(panel_idx);
             g_needs_redraw = 1;
         }
     }
@@ -7688,6 +7715,7 @@ static void build_ui(void) {
         g_scroll_delta = 0;
     }
 
+    panel_op_flush();
     layout_update();
 
     /* Focus follows click: clicking in any panel makes it active */
@@ -7705,6 +7733,7 @@ static void build_ui(void) {
     int win_btns_left = g_width - WIN_BTN_W * 3;
     int saved_active = g_app.active_panel;
     g_focused_panel = saved_active;
+    g_in_panel_loop = 1;
     for (int p = 0; p < MAX_PANELS; p++) {
         if (g_app.panels[p].tab_count == 0 || layout_leaf(&g_app.layout, p) < 0) continue;
         g_app.active_panel = p;
@@ -7717,16 +7746,13 @@ static void build_ui(void) {
         float tabs_xmax = (top == 0 && panel_x + panel_w >= g_width) ? (float)win_btns_left
                                                                       : panel_x + panel_w;
         build_tab_bar(tabs_xmin, tabs_xmax, top);
-        if (g_app.panels[p].tab_count == 0) continue;   /* closed by its last tab's X */
         build_toolbar(panel_x, panel_x + panel_w);
         build_column_headers(panel_x, P_CONTENT(p), panel_w);
         build_file_list(panel_x, P_CONTENT(p) + COL_HDR_H,
                         panel_w, P_STATUS(p) - P_CONTENT(p) - COL_HDR_H);
         build_panel_status(p);
     }
-    if (g_focus_next >= 0) { saved_active = g_focus_next; g_focus_next = -1; }
-    if (layout_leaf(&g_app.layout, saved_active) < 0)
-        saved_active = layout_panel_step(&g_app.layout, -1, 0);
+    g_in_panel_loop = 0;
     g_app.active_panel = saved_active;
     g_ui_id_base = 0;
 
