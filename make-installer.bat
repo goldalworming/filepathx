@@ -43,7 +43,7 @@ if not exist build\stage\themes mkdir build\stage\themes
 echo === Compiling FilePathX %APPVER% ===
 windres -I src src\resource.rc -O coff -o build\resource.o || exit /b 1
 gcc -O2 -s -Wall -o build\stage\FilePathX.exe ^
-    src\main.c src\render.c src\ui.c src\update.c -Isrc build\resource.o ^
+    src\main.c src\layout.c src\render.c src\ui.c src\update.c -Isrc build\resource.o ^
     -lopengl32 -lgdi32 -luser32 -lshell32 -lshlwapi ^
     -ldwmapi -lole32 -luuid -luxtheme -lcomctl32 -lpropsys -lwinhttp -mwindows || exit /b 1
 

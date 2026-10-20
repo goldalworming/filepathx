@@ -60,6 +60,15 @@ static int g_row_h = 20;
 #define COLW_TYPE    90
 #define COLW_DATE    150
 #define COLW_SIZE    55
+#define NAME_MIN_W   120  /* narrower panels clip Date/Size instead of Name */
+
+/* Details columns sit against the right edge, but Name keeps NAME_MIN_W:
+   in a narrow panel Type/Date/Size run past the edge and get clipped. */
+static float details_type_x(float lx, float lw) {
+    float x = lx + lw - 10 - COLW_SIZE - COLW_DATE - COLW_TYPE;
+    float min_x = lx + 28 + NAME_MIN_W;
+    return x < min_x ? min_x : x;
+}
 
 /* ---- Context menu IDs ---- */
 #define IDM_OPEN        1001
@@ -1933,7 +1942,7 @@ static void tabs_load(const char* fallback) {
     int saved_active[MAX_PANELS] = {0};
     int saved_active_panel = 0;
     /* Pre-tree files: active= / split_active= / split_ratio= / panel1_active= */
-    int old_split = 0, has_nodes = 0;
+    int old_split = 0, old_format = 0, has_nodes = 0;
     float old_ratio = 0.5f;
     Layout L;
     memset(&L, 0, sizeof(L));
@@ -1965,7 +1974,7 @@ static void tabs_load(const char* fallback) {
                 continue;
             }
             if (strncmp(line, "active=", 7) == 0) { saved_active[0] = atoi(line + 7); continue; }
-            if (strncmp(line, "split_active=", 13) == 0) { old_split = atoi(line + 13); continue; }
+            if (strncmp(line, "split_active=", 13) == 0) { old_split = atoi(line + 13); old_format = 1; continue; }
             if (strncmp(line, "split_ratio=", 12) == 0) { old_ratio = (float)atof(line + 12); continue; }
             if (strncmp(line, "active_panel=", 13) == 0) { saved_active_panel = atoi(line + 13); continue; }
             if (strncmp(line, "panel1_active=", 14) == 0) {
@@ -1978,7 +1987,9 @@ static void tabs_load(const char* fallback) {
                 WCHAR wline[MAX_PATH]; u8_to_w(line, wline, MAX_PATH);
                 if (GetFileAttributesW(wline) != INVALID_FILE_ATTRIBUTES) {
                     int saved_p = g_app.active_panel;
-                    g_app.active_panel = section;
+                    /* Old files kept the right panel's tabs while split was
+                       off; there's no hidden panel now, so keep them in panel 0. */
+                    g_app.active_panel = (old_format && !old_split) ? 0 : section;
                     new_tab(line);
                     g_app.active_panel = saved_p;
                 }
@@ -2809,8 +2820,7 @@ static void inline_rename_start(int idx) {
     float ly = P_CONTENT(g_app.active_panel) + COL_HDR_H;
     float ry = ly + idx * ROW_H - t->scroll_y;
     float name_x = lx + 23;
-    float right = lx + prect(g_app.active_panel)->w - 10;
-    float type_x = right - COLW_SIZE - COLW_DATE - COLW_TYPE;
+    float type_x = details_type_x(lx, prect(g_app.active_panel)->w);
     float name_w = type_x - name_x - 2;
 
     WCHAR wname[MAX_PATH];
@@ -6386,10 +6396,10 @@ static void build_sidebar(void) {
 static void build_column_headers(float lx, float ly, float lw) {
     Renderer* r = &g_renderer;
     render_quad(r, lx, ly, lw, COL_HDR_H, COL_HEADER);
-    float right = lx + lw - 10;
-    float size_x = right - COLW_SIZE;
-    float date_x = size_x - COLW_DATE;
-    float type_x = date_x - COLW_TYPE;
+    float type_x = details_type_x(lx, lw);
+    float date_x = type_x + COLW_TYPE;
+    float size_x = date_x + COLW_DATE;
+    render_scissor(r, (int)lx, (int)ly, (int)lw, COL_HDR_H);
     float ty = ly + (COL_HDR_H - g_renderer.font_height) / 2;
 
     struct { const char* label; float x, w; int col; } cols[] = {
@@ -6397,6 +6407,9 @@ static void build_column_headers(float lx, float ly, float lw) {
         {"Date Modified", date_x, COLW_DATE, 2}, {"Size", size_x, COLW_SIZE, 5},
     };
     for (int i = 0; i < 4; i++) {
+        /* columns pushed past the panel edge must not catch the neighbour's clicks */
+        if (cols[i].x + cols[i].w > lx + lw) cols[i].w = lx + lw - cols[i].x;
+        if (cols[i].w <= 0) break;
         int hov = ui_hover(&g_ui, cols[i].x, ly, cols[i].w, COL_HDR_H);
         render_text(r, cols[i].label, cols[i].x+4, ty, hov ? COL_TEXT : COL_SUBTEXT);
         if (g_app.sort_col == cols[i].col) {
@@ -6416,6 +6429,7 @@ static void build_column_headers(float lx, float ly, float lw) {
         }
         if (i > 0) render_quad(r, cols[i].x-1, ly+4, 1, COL_HDR_H-8, COL_BORDER);
     }
+    render_scissor_reset(r);
     render_quad(r, lx, ly+COL_HDR_H-1, lw, 1, COL_BORDER);
 }
 
@@ -6832,10 +6846,9 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
     if (t->target_scroll - t->scroll_y > 0.5f || t->target_scroll - t->scroll_y < -0.5f)
         g_needs_redraw = 1;
 
-    float right = lx + lw - 10;
-    float size_x = right - COLW_SIZE;
-    float date_x = size_x - COLW_DATE;
-    float type_x = date_x - COLW_TYPE;
+    float type_x = details_type_x(lx, lw);
+    float date_x = type_x + COLW_TYPE;
+    float size_x = date_x + COLW_DATE;
 
     int first = (int)(t->scroll_y / ROW_H);
     int last = first + (int)(lh / ROW_H) + 2;
@@ -8659,6 +8672,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int cmdShow)
     g_cf_drop_effect = RegisterClipboardFormatA("Preferred DropEffect");
     /* Preferences must load before font creation so font_size applies. */
     settings_load();
+    /* WM_GETMINMAXINFO arrives inside CreateWindowExW, before tabs_load
+       builds the real layout; a zeroed layout recurses forever. */
+    layout_init(&g_app.layout, 0);
 
     WNDCLASSEXW wc = {0};
     wc.cbSize = sizeof(wc);
