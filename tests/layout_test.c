@@ -96,6 +96,16 @@ int main(void) {
     assert(layout_panel_count(&L) == 1);
     L.n[L.root].panel = MAX_PANELS;
     assert(!layout_valid(&L));
+    layout_split(&M, 0, 0, 4);
+    assert(layout_valid(&M));
+    M.n[layout_leaf(&M, 4)].ratio *= 0.5f;          /* shares no longer add up */
+    assert(!layout_valid(&M));
+    layout_init(&L, 0);                             /* group with one child */
+    layout_split(&L, 0, 1, 1);
+    L.n[L.n[L.root].child].next = -1;
+    L.n[layout_leaf(&L, 1)].used = 0;
+    L.n[L.n[L.root].child].ratio = 1.0f;
+    assert(!layout_valid(&L));
     puts("layout ok");
     return 0;
 }

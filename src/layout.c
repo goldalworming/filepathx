@@ -272,13 +272,17 @@ static int check(const Layout* L, int i, int parent, int depth, int* seen, int* 
         return 1;
     }
     if (n->panel >= 0) return 0;
-    int prev = -1;
+    int prev = -1, k = 0;
+    float sum = 0;
     for (int c = n->child; c != -1; c = L->n[c].next) {
         if (c < 0 || c >= MAX_LNODES || L->n[c].prev != prev) return 0;
         if (!check(L, c, i, depth + 1, seen, panels)) return 0;
+        sum += L->n[c].ratio;
         prev = c;
+        k++;
     }
-    return 1;
+    /* A group splits its rect among two or more children, all of it. */
+    return k >= 2 && fabsf(sum - 1.0f) < 0.01f;
 }
 
 int layout_valid(const Layout* L) {
