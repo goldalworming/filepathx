@@ -221,14 +221,14 @@ int layout_panel_step(const Layout* L, int panel, int dir) {
     return k ? list[0] : panel;
 }
 
-int layout_splitter_at(const Layout* L, float x, float y, float slop) {
+int layout_splitter_at(const Layout* L, float x, float y, float slop, float skip_top) {
     for (int c = 0; c < MAX_LNODES; c++) {
         const LNode* n = &L->n[c];
         if (!n->used || n->next < 0 || n->parent < 0) continue;
         const LNode* g = &L->n[n->parent];
         if (g->vertical) {
             float e = n->x + n->w;
-            if (fabsf(x - e) <= slop && y >= g->y && y < g->y + g->h) return c;
+            if (fabsf(x - e) <= slop && y >= g->y + skip_top && y < g->y + g->h) return c;
         } else {
             float e = n->y + n->h;
             if (fabsf(y - e) <= slop && x >= g->x && x < g->x + g->w) return c;

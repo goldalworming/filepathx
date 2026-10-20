@@ -38,8 +38,10 @@ void layout_min_size(const Layout* L, float min_w, float min_h, float* w, float*
 int  layout_panel_at(const Layout* L, float x, float y);   /* panel, -1 */
 /* Next/previous panel in tree order (wraps). */
 int  layout_panel_step(const Layout* L, int panel, int dir);
-/* Splitter after node c (between c and c->next). Returns c, or -1. */
-int  layout_splitter_at(const Layout* L, float x, float y, float slop);
+/* Splitter after node c (between c and c->next). Returns c, or -1.
+   Side-by-side splitters skip the top skip_top pixels of their group (the
+   tab bar row, which belongs to the tabs). */
+int  layout_splitter_at(const Layout* L, float x, float y, float slop, float skip_top);
 /* Drag splitter c to mouse position; keeps both sides at their minimum. */
 void layout_splitter_drag(Layout* L, int c, float mx, float my, float min_w, float min_h);
 /* Even out the ratios of panel's siblings. */

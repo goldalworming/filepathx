@@ -26,8 +26,9 @@ int main(void) {
     assert(L.n[layout_leaf(&L, 3)].x == 300 && L.n[layout_leaf(&L, 1)].x == 600);
 
     /* splitter between 0 and 3 */
-    int s = layout_splitter_at(&L, 300, 50, 3);
+    int s = layout_splitter_at(&L, 300, 50, 3, 28);
     assert(s == layout_leaf(&L, 0));
+    assert(layout_splitter_at(&L, 300, 10, 3, 28) < 0);   /* tab bar row */
     layout_splitter_drag(&L, s, 450, 0, 100, 0);
     layout_compute(&L, 0, 0, 900, 600, 0, 0);
     assert(L.n[layout_leaf(&L, 3)].x == 450);

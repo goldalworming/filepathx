@@ -7694,7 +7694,7 @@ static void build_ui(void) {
     if (g_mouse_clicked && g_splitter_drag < 0) {
         int hit = layout_panel_at(&g_app.layout, (float)g_mouse_x, (float)g_mouse_y);
         if (hit >= 0 && layout_splitter_at(&g_app.layout, (float)g_mouse_x, (float)g_mouse_y,
-                                           SPLITTER_HIT_W / 2.0f) < 0)
+                                           SPLITTER_HIT_W / 2.0f, TAB_BAR_H) < 0)
             g_app.active_panel = hit;
     }
 
@@ -7749,7 +7749,7 @@ static void build_ui(void) {
     {
         Renderer* r = &g_renderer;
         int hov = layout_splitter_at(&g_app.layout, (float)g_ui.input.mouse_x,
-                                     (float)g_ui.input.mouse_y, SPLITTER_HIT_W / 2.0f);
+                                     (float)g_ui.input.mouse_y, SPLITTER_HIT_W / 2.0f, TAB_BAR_H);
         if (hov >= 0 && g_ui.input.mouse_clicked) g_splitter_drag = hov;
         if (g_splitter_drag >= 0 && !g_ui.input.mouse_down) {
             g_splitter_drag = -1;
@@ -7886,7 +7886,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 POINT pt; GetCursorPos(&pt); ScreenToClient(g_hwnd, &pt);
                 int c = g_splitter_drag >= 0 ? g_splitter_drag
                       : layout_splitter_at(&g_app.layout, (float)pt.x, (float)pt.y,
-                                           SPLITTER_HIT_W / 2.0f);
+                                           SPLITTER_HIT_W / 2.0f, TAB_BAR_H);
                 if (c >= 0) {
                     int v = g_app.layout.n[g_app.layout.n[c].parent].vertical;
                     SetCursor(LoadCursor(NULL, v ? IDC_SIZEWE : IDC_SIZENS));
