@@ -164,6 +164,7 @@ typedef struct {
     float tab_scroll;
     float tab_scroll_target;
     int   tab_scroll_last_active;
+    float tab_strip_last_w;      /* strip width last frame: a split/resize re-shows the active tab */
 } Panel;
 
 typedef struct {
@@ -6073,8 +6074,12 @@ static void build_tab_bar(float tabs_xmin, float tabs_xmax, float ty) {
         g_needs_redraw = 1;
     }
 
-    /* Auto-scroll active tab into view ONLY when active tab actually changes. */
-    if (overflow && g_app.panels[g_app.active_panel].active_tab >= 0 && g_app.panels[g_app.active_panel].active_tab != g_app.panels[g_app.active_panel].tab_scroll_last_active) {
+    /* Auto-scroll active tab into view when the active tab changes or the
+       strip is resized (panel split/close, splitter drag, window resize);
+       otherwise leave the user's arrow/wheel scrolling alone. */
+    if (overflow && g_app.panels[g_app.active_panel].active_tab >= 0 &&
+        (g_app.panels[g_app.active_panel].active_tab != g_app.panels[g_app.active_panel].tab_scroll_last_active ||
+         visible_w != g_app.panels[g_app.active_panel].tab_strip_last_w)) {
         float a_x = tabs_x0 - g_app.panels[g_app.active_panel].tab_scroll_target + g_app.panels[g_app.active_panel].active_tab * step;
         if (a_x < tabs_x0) g_app.panels[g_app.active_panel].tab_scroll_target -= (tabs_x0 - a_x);
         else if (a_x + tab_w > tabs_x1) g_app.panels[g_app.active_panel].tab_scroll_target += (a_x + tab_w - tabs_x1);
@@ -6082,6 +6087,7 @@ static void build_tab_bar(float tabs_xmin, float tabs_xmax, float ty) {
         if (g_app.panels[g_app.active_panel].tab_scroll_target > max_scroll) g_app.panels[g_app.active_panel].tab_scroll_target = max_scroll;
     }
     g_app.panels[g_app.active_panel].tab_scroll_last_active = g_app.panels[g_app.active_panel].active_tab;
+    g_app.panels[g_app.active_panel].tab_strip_last_w = visible_w;
 
     /* Drag threshold + commit logic only for the panel where drag started */
     if (drag_here) {
@@ -7883,6 +7889,15 @@ static void build_ui(void) {
     build_sidebar();
     build_window_buttons();
 
+    /* A press on a splitter belongs to the splitter (handled after the
+       panels): keep it from also clicking the list underneath, which
+       cleared the selection on a splitter double-click. */
+    int on_splitter = !overlay_open && g_zoom_panel < 0 &&
+        layout_splitter_at(&g_app.layout, (float)g_ui.input.mouse_x, (float)g_ui.input.mouse_y,
+                           SPLITTER_HIT_W / 2.0f, TAB_BAR_H) >= 0;
+    int split_clk = g_ui.input.mouse_clicked, split_dbl = g_ui.input.mouse_dblclick;
+    if (on_splitter) g_ui.input.mouse_clicked = g_ui.input.mouse_dblclick = 0;
+
     int win_btns_left = g_width - WIN_BTN_W * 3;
     int saved_active = g_app.active_panel;
     g_focused_panel = saved_active;
@@ -7957,6 +7972,7 @@ static void build_ui(void) {
 
     /* Splitters: a line between every pair of neighbouring panels; drag to
        move the share between those two (File Pilot keeps siblings' ratios). */
+    if (on_splitter) { g_ui.input.mouse_clicked = split_clk; g_ui.input.mouse_dblclick = split_dbl; }
     {
         Renderer* r = &g_renderer;
         /* A maximized panel has no neighbours on screen, so no splitters. */
