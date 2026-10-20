@@ -16,6 +16,7 @@
 #include "ui.h"
 #include "update.h"
 #include "version.h"
+#include "layout.h"
 
 /* Posted by the auto-updater worker whenever its status changes */
 #define WM_UPDATE_STATUS (WM_APP + 30)
@@ -59,6 +60,15 @@ static int g_row_h = 20;
 #define COLW_TYPE    90
 #define COLW_DATE    150
 #define COLW_SIZE    55
+#define NAME_MIN_W   120  /* narrower panels clip Date/Size instead of Name */
+
+/* Details columns sit against the right edge, but Name keeps NAME_MIN_W:
+   in a narrow panel Type/Date/Size run past the edge and get clipped. */
+static float details_type_x(float lx, float lw) {
+    float x = lx + lw - 10 - COLW_SIZE - COLW_DATE - COLW_TYPE;
+    float min_x = lx + 28 + NAME_MIN_W;
+    return x < min_x ? min_x : x;
+}
 
 /* ---- Context menu IDs ---- */
 #define IDM_OPEN        1001
@@ -154,13 +164,13 @@ typedef struct {
     float tab_scroll;
     float tab_scroll_target;
     int   tab_scroll_last_active;
+    float tab_strip_last_w;      /* strip width last frame: a split/resize re-shows the active tab */
 } Panel;
 
 typedef struct {
-    Panel panels[2];
-    int active_panel;          /* 0 = left/only, 1 = right */
-    int split_active;          /* 1 = both panels visible */
-    float split_ratio;         /* 0..1, left panel width fraction */
+    Panel panels[MAX_PANELS];  /* slot is open when tab_count > 0 */
+    int active_panel;
+    Layout layout;             /* which open panels go where */
     SidebarSection sections[4];
     int section_count;
     int sort_col, sort_asc;
@@ -173,6 +183,33 @@ static App      g_app;
 static GLuint   g_logo_tex = 0;
 static HWND     g_hwnd;
 static int      g_width = 1000, g_height = 680;
+/* Panel rect = its layout leaf (tab bar + toolbar + list + status bar),
+   filled by layout_compute at the top of every frame. */
+static LNode* prect(int p) {
+    int n = layout_leaf(&g_app.layout, p);
+    static LNode none;
+    return n >= 0 ? &g_app.layout.n[n] : &none;
+}
+#define P_TOP(p)     (prect(p)->y)
+#define P_CONTENT(p) (prect(p)->y + TAB_BAR_H + TOOLBAR_H)
+#define P_STATUS(p)  (prect(p)->y + prect(p)->h - STATUS_BAR_H)
+/* Smallest panel: room for the toolbar and a few rows of the list. */
+#define PANEL_MIN_W  160
+#define PANEL_MIN_H  (TAB_BAR_H + TOOLBAR_H + COL_HDR_H + STATUS_BAR_H + 60)
+/* Maximized panel (-1 = none): it gets the whole area and the others no
+   rect, so they aren't drawn, hit-tested or given splitters. */
+static int g_zoom_panel = -1;
+static void layout_update(void) {
+    Layout* L = &g_app.layout;
+    float x = SIDEBAR_W, w = (float)g_width - SIDEBAR_W, h = (float)g_height;
+    layout_compute(L, x, 0, w, h, PANEL_MIN_W, PANEL_MIN_H);
+    if (g_zoom_panel < 0) return;
+    int z = layout_leaf(L, g_zoom_panel);
+    if (z < 0 || layout_panel_count(L) < 2) { g_zoom_panel = -1; return; }
+    for (int i = 0; i < MAX_LNODES; i++) L->n[i].w = L->n[i].h = 0;
+    L->n[z].x = x; L->n[z].y = 0; L->n[z].w = w; L->n[z].h = h;
+}
+
 static int      g_mouse_x, g_mouse_y, g_mouse_down;
 static int      g_mouse_clicked, g_mouse_released, g_mouse_dblclick;
 /* Set on WM_LBUTTONDBLCLK, kept until the button-up frame is handled: list
@@ -288,11 +325,9 @@ static ULONG   STDMETHODCALLTYPE DT_Release(IDropTarget* This) { return --((DT*)
 static int target_panel_for_screen_pt(POINTL pt) {
     POINT p = { pt.x, pt.y };
     ScreenToClient(g_hwnd, &p);
-    if (p.x < SIDEBAR_W || p.y < CONTENT_TOP) return -1;
-    if (p.y >= g_height - STATUS_BAR_H) return -1;
-    if (!g_app.split_active) return 0;
-    float split_x = SIDEBAR_W + g_app.split_ratio * (g_width - SIDEBAR_W);
-    return (p.x < split_x) ? 0 : 1;
+    int pn = layout_panel_at(&g_app.layout, (float)p.x, (float)p.y);
+    if (pn < 0 || p.y < P_CONTENT(pn) || p.y >= P_STATUS(pn)) return -1;
+    return pn;
 }
 
 static DWORD effect_from_keystate(DWORD ks, DWORD allowed) {
@@ -465,12 +500,24 @@ static void start_drag_out(Tab* t) {
 static int   g_ui_id_base = 0;
 #define UIID(x) ((x) + g_ui_id_base)
 
+
 /* Real focused panel (preserved across the render loop where active_panel
    is temporarily swapped per-panel). Used to color active tab differently. */
 static int   g_focused_panel = 0;
 
 /* Splitter drag state */
-static int   g_splitter_dragging = 0;
+static int   g_splitter_drag = -1;   /* layout node whose trailing splitter is dragged */
+/* Split/close asked for while the panel loop is drawing (a tab's X, the
+   panel menu) wait for the start of the next frame, so no frame mixes two
+   layouts. */
+static int   g_in_panel_loop = 0;
+static int   g_panel_op = 0;         /* 1 split right, 2 split bottom, 3 close, 4 dock, 5 zoom */
+static int   g_panel_op_panel = -1;
+/* A tab dragged off its strip docks into the panel under the cursor, or
+   splits it at the edge it is near (File Pilot style). */
+enum { DOCK_NONE, DOCK_INTO, DOCK_LEFT, DOCK_RIGHT, DOCK_TOP, DOCK_BOTTOM };
+static int   g_dock_panel = -1, g_dock_zone = DOCK_NONE;   /* live, while dragging */
+static int   g_dock_op_tab, g_dock_op_dst, g_dock_op_zone;  /* queued drop */
 #define SPLITTER_HIT_W 6
 
 /* Sync scroll between panels (default off) */
@@ -592,15 +639,17 @@ static void tt_draw(void) {
 }
 
 /* Tab bar hit-test zones written by build_tab_bar each frame. */
-static int   g_tab_bar_tabs_end_x  = 0;
-static int   g_tab_bar_btns_start_x = 0;
-static int   g_tab_bar_btn_end_x   = 0;
+static int   g_tab_bar_tabs_end_x[MAX_PANELS];   /* per panel, for WM_NCHITTEST */
+static int   g_tab_bar_btns_start_x[MAX_PANELS];
+static int   g_tab_bar_btn_end_x[MAX_PANELS];
 
 /* Tab reorder drag state */
 static int   g_tab_drag_idx    = -1;
 static int   g_tab_drag_panel  = -1;
 static int   g_tab_drag_active = 0;
 static int   g_tab_drag_x0     = 0;
+static int   g_tab_drag_y0     = 0;
+static int   g_tab_drag_docking = 0;   /* dragged off its strip: docks on drop */
 static int   g_tab_drag_offset = 0;
 
 /* ---- Type-ahead search ---- */
@@ -1596,7 +1645,7 @@ static DWORD WINAPI scan_worker(LPVOID arg) {
 }
 
 static Tab* tab_by_scan_req(const ScanResult* r) {
-    for (int p = 0; p < 2; p++)
+    for (int p = 0; p < MAX_PANELS; p++)
         for (int i = 0; i < g_app.panels[p].tab_count; i++)
             if (g_app.panels[p].tabs[i].scan_req == r) return &g_app.panels[p].tabs[i];
     return NULL;
@@ -1634,7 +1683,7 @@ static void scan_drain_done(void) {
 static void scan_watchdog(void) {
     DWORD now = GetTickCount();
     int still_loading = 0;
-    for (int p = 0; p < 2; p++)
+    for (int p = 0; p < MAX_PANELS; p++)
         for (int i = 0; i < g_app.panels[p].tab_count; i++) {
             Tab* t = &g_app.panels[p].tabs[i];
             if (!t->scan_req) continue;
@@ -1860,9 +1909,11 @@ static int closed_stack_pop(char* out, int n) {
     return 1;
 }
 
+static void panel_close(int p);
 static void close_tab(int idx) {
     Panel* P = &g_app.panels[g_app.active_panel];
-    if (P->tab_count <= 1) return;
+    /* Closing a panel's only tab closes the panel (as File Pilot does). */
+    if (P->tab_count <= 1) { panel_close(g_app.active_panel); return; }
     if (idx < 0 || idx >= P->tab_count) return;
     closed_stack_push(P->tabs[idx].path);
     /* Free the closed tab's heap buffers before the shift copies data
@@ -1880,13 +1931,23 @@ static void close_tab(int idx) {
     g_needs_redraw = 1;
 }
 
+/* tabs_load calls new_tab, which saves; saving would truncate the file
+   being read and the loop would re-read its own output. */
+static int g_tabs_loading = 0;
+
 static void tabs_load(const char* fallback) {
+    g_tabs_loading = 1;
     char fp[MAX_PATH];
     app_data_file("tabs.txt", fp, MAX_PATH);
     FILE* f = u8_fopen(fp, "rb");
-    int saved_active0 = 0, saved_active1 = 0;
-    int saved_split = 0, saved_active_panel = 0;
-    float saved_ratio = 0.5f;
+    int saved_active[MAX_PANELS] = {0};
+    int saved_active_panel = 0;
+    /* Pre-tree files: active= / split_active= / split_ratio= / panel1_active= */
+    int old_split = 0, old_format = 0, has_nodes = 0;
+    float old_ratio = 0.5f;
+    Layout L;
+    memset(&L, 0, sizeof(L));
+    L.root = -1;
     int section = 0;
     if (f) {
         char line[MAX_PATH];
@@ -1894,20 +1955,42 @@ static void tabs_load(const char* fallback) {
             int n = (int)strlen(line);
             while (n > 0 && (line[n-1]=='\n' || line[n-1]=='\r' || line[n-1]==' ')) line[--n] = 0;
             if (n == 0) continue;
-            if (strncmp(line, "active=", 7) == 0) { saved_active0 = atoi(line + 7); continue; }
-            if (strncmp(line, "split_active=", 13) == 0) { saved_split = atoi(line + 13); continue; }
-            if (strncmp(line, "split_ratio=", 12) == 0) { saved_ratio = (float)atof(line + 12); continue; }
+            int a, b;
+            if (sscanf(line, "panel=%d active=%d", &a, &b) == 2) {
+                section = (a >= 0 && a < MAX_PANELS) ? a : -1;
+                if (section >= 0) saved_active[section] = b;
+                continue;
+            }
+            if (strncmp(line, "layout=", 7) == 0) { L.root = atoi(line + 7); continue; }
+            if (strncmp(line, "node=", 5) == 0) {
+                LNode t = {0};
+                int idx;
+                if (sscanf(line + 5, "%d %d %d %d %d %d %d %f", &idx, &t.parent, &t.child,
+                           &t.next, &t.prev, &t.panel, &t.vertical, &t.ratio) == 8 &&
+                    idx >= 0 && idx < MAX_LNODES) {
+                    t.used = 1;
+                    L.n[idx] = t;
+                    has_nodes = 1;
+                }
+                continue;
+            }
+            if (strncmp(line, "active=", 7) == 0) { saved_active[0] = atoi(line + 7); continue; }
+            if (strncmp(line, "split_active=", 13) == 0) { old_split = atoi(line + 13); old_format = 1; continue; }
+            if (strncmp(line, "split_ratio=", 12) == 0) { old_ratio = (float)atof(line + 12); continue; }
             if (strncmp(line, "active_panel=", 13) == 0) { saved_active_panel = atoi(line + 13); continue; }
             if (strncmp(line, "panel1_active=", 14) == 0) {
-                saved_active1 = atoi(line + 14);
+                saved_active[1] = atoi(line + 14);
                 section = 1;
                 continue;
             }
+            if (section < 0) continue;
             {
                 WCHAR wline[MAX_PATH]; u8_to_w(line, wline, MAX_PATH);
                 if (GetFileAttributesW(wline) != INVALID_FILE_ATTRIBUTES) {
                     int saved_p = g_app.active_panel;
-                    g_app.active_panel = section;
+                    /* Old files kept the right panel's tabs while split was
+                       off; there's no hidden panel now, so keep them in panel 0. */
+                    g_app.active_panel = (old_format && !old_split) ? 0 : section;
                     new_tab(line);
                     g_app.active_panel = saved_p;
                 }
@@ -1915,21 +1998,38 @@ static void tabs_load(const char* fallback) {
         }
         fclose(f);
     }
-    /* Ensure panel 0 has at least one tab */
-    if (g_app.panels[0].tab_count == 0) {
-        int sp = g_app.active_panel;
-        g_app.active_panel = 0;
-        new_tab(fallback);
-        g_app.active_panel = sp;
+    if (has_nodes && layout_valid(&L)) {
+        g_app.layout = L;
+    } else {
+        layout_init(&g_app.layout, 0);
+        if (old_split && g_app.panels[1].tab_count > 0 &&
+            layout_split(&g_app.layout, 0, 1, 1, 0) >= 0) {
+            float r = (old_ratio > 0.1f && old_ratio < 0.9f) ? old_ratio : 0.5f;
+            g_app.layout.n[layout_leaf(&g_app.layout, 0)].ratio = r;
+            g_app.layout.n[layout_leaf(&g_app.layout, 1)].ratio = 1.0f - r;
+        }
     }
-    if (saved_active0 >= 0 && saved_active0 < g_app.panels[0].tab_count)
-        g_app.panels[0].active_tab = saved_active0;
-    if (saved_active1 >= 0 && saved_active1 < g_app.panels[1].tab_count)
-        g_app.panels[1].active_tab = saved_active1;
-    g_app.split_active = saved_split;
-    g_app.split_ratio  = (saved_ratio > 0.1f && saved_ratio < 0.9f) ? saved_ratio : 0.5f;
-    if (saved_active_panel == 0 || saved_active_panel == 1)
-        g_app.active_panel = saved_active_panel;
+    /* Panels in the layout need a tab; tabs of panels outside it are dropped. */
+    for (int p = 0; p < MAX_PANELS; p++) {
+        Panel* P = &g_app.panels[p];
+        if (layout_leaf(&g_app.layout, p) < 0) {
+            for (int i = 0; i < P->tab_count; i++) tab_free_buffers(&P->tabs[i]);
+            memset(P, 0, sizeof(*P));
+            P->last_click_item = -1;
+            continue;
+        }
+        if (P->tab_count == 0) {
+            int sp = g_app.active_panel;
+            g_app.active_panel = p;
+            new_tab(fallback);
+            g_app.active_panel = sp;
+        }
+        if (saved_active[p] >= 0 && saved_active[p] < P->tab_count)
+            P->active_tab = saved_active[p];
+    }
+    g_app.active_panel = layout_leaf(&g_app.layout, saved_active_panel) >= 0
+                       ? saved_active_panel : layout_panel_step(&g_app.layout, -1, 0);
+    g_tabs_loading = 0;
     tabs_save();
 }
 
@@ -1973,20 +2073,26 @@ static void bookmarks_filepath(char* out, int n) {
 }
 
 static void tabs_save(void) {
+    if (g_tabs_loading) return;
     char fp[MAX_PATH];
     app_data_file("tabs.txt", fp, MAX_PATH);
     FILE* f = u8_fopen(fp, "wb");
     if (!f) return;
-    fprintf(f, "active=%d\n", g_app.panels[0].active_tab);
-    for (int i = 0; i < g_app.panels[0].tab_count; i++)
-        fprintf(f, "%s\n", g_app.panels[0].tabs[i].path);
-    if (g_app.split_active || g_app.panels[1].tab_count > 0) {
-        fprintf(f, "split_active=%d\n", g_app.split_active);
-        fprintf(f, "split_ratio=%.3f\n", g_app.split_ratio);
-        fprintf(f, "active_panel=%d\n", g_app.active_panel);
-        fprintf(f, "panel1_active=%d\n", g_app.panels[1].active_tab);
-        for (int i = 0; i < g_app.panels[1].tab_count; i++)
-            fprintf(f, "%s\n", g_app.panels[1].tabs[i].path);
+    const Layout* L = &g_app.layout;
+    fprintf(f, "layout=%d\n", L->root);
+    for (int i = 0; i < MAX_LNODES; i++) {
+        const LNode* n = &L->n[i];
+        if (!n->used) continue;
+        fprintf(f, "node=%d %d %d %d %d %d %d %.4f\n", i, n->parent, n->child,
+                n->next, n->prev, n->panel, n->vertical, n->ratio);
+    }
+    fprintf(f, "active_panel=%d\n", g_app.active_panel);
+    for (int p = 0; p < MAX_PANELS; p++) {
+        const Panel* P = &g_app.panels[p];
+        if (P->tab_count == 0) continue;
+        fprintf(f, "panel=%d active=%d\n", p, P->active_tab);
+        for (int i = 0; i < P->tab_count; i++)
+            fprintf(f, "%s\n", P->tabs[i].path);
     }
     fclose(f);
 }
@@ -2711,12 +2817,11 @@ static void inline_rename_start(int idx) {
     g_edit_panel = g_app.active_panel;
 
     /* Compute position of the name cell */
-    float lx = SIDEBAR_W;
-    float ly = CONTENT_TOP + COL_HDR_H;
+    float lx = prect(g_app.active_panel)->x;
+    float ly = P_CONTENT(g_app.active_panel) + COL_HDR_H;
     float ry = ly + idx * ROW_H - t->scroll_y;
     float name_x = lx + 23;
-    float right = lx + (g_width - SIDEBAR_W) - 10;
-    float type_x = right - COLW_SIZE - COLW_DATE - COLW_TYPE;
+    float type_x = details_type_x(lx, prect(g_app.active_panel)->w);
     float name_w = type_x - name_x - 2;
 
     WCHAR wname[MAX_PATH];
@@ -2894,7 +2999,7 @@ static void fileop_start(UINT func, WList* from, WList* to, FILEOP_FLAGS flags) 
 }
 
 static void fileop_on_done(void) {
-    for (int p = 0; p < 2; p++) {
+    for (int p = 0; p < MAX_PANELS; p++) {
         Panel* pn = &g_app.panels[p];
         if (pn->tab_count <= 0) continue;
         scan_directory_async(&pn->tabs[pn->active_tab]);
@@ -3101,6 +3206,176 @@ static void batch_rename_cancel(void) {
     g_batch_chop_left = 0;
     g_batch_focus = 0;
     g_needs_redraw = 1;
+}
+
+/* Split the active panel (File Pilot: Split Right / Split Bottom); the new
+   panel opens on the same folder and takes focus. */
+static int panel_free_slot(void) {
+    for (int p = 0; p < MAX_PANELS; p++)
+        if (g_app.panels[p].tab_count == 0) return p;
+    return -1;
+}
+
+/* Split panel only while every panel still gets its minimum size in the
+   window. */
+static int panel_split_try(Layout* out, int panel, int vertical, int before, int np) {
+    if (np < 0) return 0;
+    Layout tmp = g_app.layout;
+    if (layout_split(&tmp, panel, vertical, np, before) < 0) return 0;
+    float w, h;
+    layout_min_size(&tmp, PANEL_MIN_W, PANEL_MIN_H, &w, &h);
+    if (w > g_width - SIDEBAR_W || h > g_height) return 0;
+    if (out) *out = tmp;
+    return 1;
+}
+
+static void panel_split(int vertical) {
+    if (g_in_panel_loop) {
+        g_panel_op = vertical ? 1 : 2;
+        g_panel_op_panel = g_app.active_panel;
+        g_needs_redraw = 1;
+        return;
+    }
+    int np = panel_free_slot();
+    Layout split;
+    if (!panel_split_try(&split, g_app.active_panel, vertical, 0, np)) return;
+    char path[MAX_PATH];
+    strncpy(path, active_tab()->path, MAX_PATH - 1);
+    path[MAX_PATH - 1] = 0;
+    g_app.layout = split;
+    g_app.active_panel = np;
+    g_zoom_panel = -1;
+    g_app.panels[np].last_click_item = -1;
+    new_tab(path);
+    layout_update();
+    g_needs_redraw = 1;
+}
+
+/* Inline edits and the finder point at a panel's active tab. */
+static void panel_cancel_edits(int p) {
+    if (g_edit_hwnd && g_edit_panel == p) inline_rename_cancel();
+    if (g_addr_hwnd && g_addr_panel == p) addr_edit_cancel();
+    if (g_batch_active && g_batch_panel == p) batch_rename_cancel();
+    if (g_ff_panel == p) { g_ff_active = 0; g_ff_panel = -1; }
+}
+
+static void panel_close(int p) {
+    if (g_in_panel_loop) {
+        g_panel_op = 3;
+        g_panel_op_panel = p;
+        g_needs_redraw = 1;
+        return;
+    }
+    if (layout_panel_count(&g_app.layout) <= 1) return;
+    panel_cancel_edits(p);
+    Panel* P = &g_app.panels[p];
+    for (int i = 0; i < P->tab_count; i++) {
+        closed_stack_push(P->tabs[i].path);
+        tab_free_buffers(&P->tabs[i]);
+    }
+    memset(P, 0, sizeof(*P));
+    P->last_click_item = -1;
+    int next = layout_panel_step(&g_app.layout, p, -1);
+    layout_remove(&g_app.layout, p);
+    if (g_app.active_panel == p) g_app.active_panel = next;
+    g_zoom_panel = -1;
+    layout_update();
+    tabs_save();
+    g_needs_redraw = 1;
+}
+
+/* Where a tab of panel src dropped at the cursor would go; -1 if nowhere
+   (or nowhere it would change anything). */
+static int tab_dock_target(int src, int* zone) {
+    *zone = DOCK_NONE;
+    int dst = layout_panel_at(&g_app.layout, (float)g_mouse_x, (float)g_mouse_y);
+    if (dst < 0) return -1;
+    LNode* n = prect(dst);
+    int z = DOCK_INTO;
+    if (g_mouse_y >= n->y + TAB_BAR_H) {
+        /* The nearest edge within a quarter of the panel splits it. */
+        float fx = (g_mouse_x - n->x) / n->w, fy = (g_mouse_y - n->y) / n->h;
+        float d[4] = { fx, 1 - fx, fy, 1 - fy };
+        int k = 0;
+        for (int i = 1; i < 4; i++) if (d[i] < d[k]) k = i;
+        if (d[k] < 0.25f) z = DOCK_LEFT + k;
+    }
+    if (dst == src && (z == DOCK_INTO || g_app.panels[src].tab_count < 2)) return -1;
+    if (z == DOCK_INTO ? g_app.panels[dst].tab_count >= MAX_TABS
+                       : !panel_split_try(NULL, dst, z <= DOCK_RIGHT,
+                                          z == DOCK_LEFT || z == DOCK_TOP, panel_free_slot()))
+        return -1;
+    *zone = z;
+    return dst;
+}
+
+/* Move tab idx of src into dst, or into a new panel split off dst. The Tab
+   moves as is (buffers, scan, history), like a reorder does. */
+static void tab_dock(int src, int idx, int dst, int zone) {
+    Panel* S = &g_app.panels[src];
+    if (idx < 0 || idx >= S->tab_count || layout_leaf(&g_app.layout, dst) < 0) return;
+    panel_cancel_edits(src);
+    panel_cancel_edits(dst);
+    if (zone != DOCK_INTO) {
+        int np = panel_free_slot();
+        Layout split;
+        if (!panel_split_try(&split, dst, zone <= DOCK_RIGHT,
+                             zone == DOCK_LEFT || zone == DOCK_TOP, np)) return;
+        g_app.layout = split;
+        dst = np;
+    }
+    Panel* D = &g_app.panels[dst];
+    if (D->tab_count >= MAX_TABS) return;
+    D->tabs[D->tab_count] = S->tabs[idx];
+    D->active_tab = D->tab_count++;
+    for (int i = idx; i < S->tab_count - 1; i++) S->tabs[i] = S->tabs[i + 1];
+    memset(&S->tabs[--S->tab_count], 0, sizeof(Tab));
+    if (S->active_tab > idx || S->active_tab >= S->tab_count) S->active_tab--;
+    if (S->active_tab < 0) S->active_tab = 0;
+    g_app.active_panel = dst;
+    g_zoom_panel = -1;
+    if (S->tab_count == 0) panel_close(src);
+    layout_update();
+    tabs_save();
+    g_needs_redraw = 1;
+}
+
+static void panel_zoom_toggle(void) {
+    if (g_in_panel_loop) {
+        g_panel_op = 5;
+        g_panel_op_panel = g_app.active_panel;
+        g_needs_redraw = 1;
+        return;
+    }
+    if (layout_panel_count(&g_app.layout) < 2) return;
+    g_zoom_panel = g_zoom_panel >= 0 ? -1 : g_app.active_panel;
+    layout_update();
+    g_needs_redraw = 1;
+}
+
+/* Ctrl+Alt+arrow: focus the panel on that side of the active one. */
+static void panel_focus_dir(int dx, int dy) {
+    if (g_zoom_panel >= 0) { g_zoom_panel = -1; layout_update(); }
+    int p = layout_panel_dir(&g_app.layout, g_app.active_panel, dx, dy);
+    if (p < 0) return;
+    g_app.active_panel = p;
+    tabs_save();
+    g_needs_redraw = 1;
+}
+
+static void panel_op_flush(void) {
+    int op = g_panel_op, p = g_panel_op_panel;
+    g_panel_op = 0;
+    if (op == 3) panel_close(p);
+    else if (op == 4) tab_dock(p, g_dock_op_tab, g_dock_op_dst, g_dock_op_zone);
+    else if (op == 5 && layout_leaf(&g_app.layout, p) >= 0) {
+        g_app.active_panel = p;
+        panel_zoom_toggle();
+    }
+    else if (op && layout_leaf(&g_app.layout, p) >= 0) {
+        g_app.active_panel = p;
+        panel_split(op == 1);
+    }
 }
 
 static void batch_rename_commit(void) {
@@ -5053,13 +5328,20 @@ static int entry_to_row(Tab* t, int idx) {
     return -1;
 }
 
+static int tab_panel(const Tab* t) {
+    for (int p = 0; p < MAX_PANELS; p++)
+        if (t >= g_app.panels[p].tabs && t < g_app.panels[p].tabs + MAX_TABS) return p;
+    return g_app.active_panel;
+}
+
 static void scroll_to_entry(Tab* t, int idx) {
     if (idx < 0 || idx >= t->entry_count) return;
     if (t->use_groups && strcmp(t->entries[idx].name, "..") != 0) {
         int gi = t->entries[idx].group;
         if (t->group_collapsed[gi]) t->group_collapsed[gi] = 0;
     }
-    float lh = (float)(g_height - CONTENT_TOP - COL_HDR_H - STATUS_BAR_H);
+    int tp = tab_panel(t);
+    float lh = P_STATUS(tp) - P_CONTENT(tp) - COL_HDR_H;
     if (t->view_mode != VM_DETAILS) {
         /* Icon grids lay items out in rows of grid_cols (".." hidden), each
            item_h tall — Details row math lands on the wrong item, badly so
@@ -5405,25 +5687,22 @@ static void show_context_menu(HWND hwnd, int mx, int my) {
     /* Focus follows right-click: in split mode, right-clicking on the inactive
        panel needs to switch the active panel BEFORE we resolve active_tab(),
        otherwise the hit-test would index the wrong panel's entries. */
-    float split_x_full = SIDEBAR_W + g_app.split_ratio * (g_width - SIDEBAR_W);
-    if (g_app.split_active && mx >= SIDEBAR_W && my >= TAB_BAR_H) {
-        g_app.active_panel = (mx < split_x_full) ? 0 : 1;
+    {
+        int hit = layout_panel_at(&g_app.layout, (float)mx, (float)my);
+        if (hit >= 0) g_app.active_panel = hit;
     }
     Tab* t = active_tab();
     /* Per-panel file-list bounds */
-    float lx = SIDEBAR_W;
-    float lw = (float)g_width - SIDEBAR_W;
-    if (g_app.split_active) {
-        if (g_app.active_panel == 0) { lw = split_x_full - SIDEBAR_W; }
-        else                         { lx = split_x_full; lw = g_width - split_x_full; }
-    }
-    float ly = CONTENT_TOP + COL_HDR_H;
-    float lh = (float)g_height - CONTENT_TOP - COL_HDR_H - STATUS_BAR_H;
+    int ap = g_app.active_panel;
+    float lx = prect(ap)->x;
+    float lw = prect(ap)->w;
+    float ly = P_CONTENT(ap) + COL_HDR_H;
+    float lh = P_STATUS(ap) - ly;
     /* In icon view modes there's no column header — the file list starts at
-       CONTENT_TOP directly. */
+       the content top directly. */
     if (t->view_mode != VM_DETAILS) {
-        ly = CONTENT_TOP;
-        lh = (float)g_height - CONTENT_TOP - STATUS_BAR_H;
+        ly = P_CONTENT(ap);
+        lh = P_STATUS(ap) - ly;
     }
 
     /* Sidebar bookmark right-click */
@@ -5600,11 +5879,11 @@ static void build_window_buttons(void) {
 
 /* Render tab strip for current panel into [tabs_xmin, tabs_xmax] horizontal range.
    `tabs_xmax` is the rightmost coordinate available (window buttons / split edge). */
-static void build_tab_bar(float tabs_xmin, float tabs_xmax) {
+static void build_tab_bar(float tabs_xmin, float tabs_xmax, float ty) {
     Renderer* r = &g_renderer;
 
     /* Background for this panel's strip */
-    render_quad(r, tabs_xmin, 0, tabs_xmax - tabs_xmin, TAB_BAR_H, COL_MANTLE);
+    render_quad(r, tabs_xmin, ty, tabs_xmax - tabs_xmin, TAB_BAR_H, COL_MANTLE);
 
     /* ---- Tabs ---- */
     float tabs_x0  = tabs_xmin;
@@ -5638,13 +5917,21 @@ static void build_tab_bar(float tabs_xmin, float tabs_xmax) {
     int drag_here = (g_tab_drag_panel == g_app.active_panel);
     int drag_target = g_tab_drag_idx;
     if (drag_here && g_tab_drag_idx >= 0 && g_tab_drag_active) {
+        /* Off this strip the tab docks (see tab_dock_target) instead of
+           reordering; it stays lifted out of the strip meanwhile. */
+        g_tab_drag_docking = g_mouse_y < ty || g_mouse_y >= ty + TAB_BAR_H ||
+                             g_mouse_x < tabs_xmin || g_mouse_x >= tabs_xmax;
+        g_dock_panel = g_tab_drag_docking
+                     ? tab_dock_target(g_app.active_panel, &g_dock_zone) : -1;
+    }
+    if (drag_here && g_tab_drag_idx >= 0 && g_tab_drag_active && !g_tab_drag_docking) {
         float lx = (float)g_mouse_x - (float)g_tab_drag_offset - tabs_x0 + g_app.panels[g_app.active_panel].tab_scroll;
         drag_target = (int)((lx + (tab_w + tab_gap) / 2.0f) / (tab_w + tab_gap));
         if (drag_target < 0) drag_target = 0;
         if (drag_target >= g_app.panels[g_app.active_panel].tab_count) drag_target = g_app.panels[g_app.active_panel].tab_count - 1;
     }
 
-    render_scissor(r, (int)tabs_x0, 0, (int)visible_w, TAB_BAR_H);
+    render_scissor(r, (int)tabs_x0, (int)ty, (int)visible_w, TAB_BAR_H);
     int last_tab_right = (int)tabs_x0;
     for (int i = 0; i < g_app.panels[g_app.active_panel].tab_count; i++) {
         if (drag_here && g_tab_drag_active && i == g_tab_drag_idx) continue;
@@ -5677,7 +5964,7 @@ static void build_tab_bar(float tabs_xmin, float tabs_xmax) {
             mx_was_masked = 1;
         }
         uint32_t accent = (g_app.active_panel == g_focused_panel) ? COL_ACCENT : COL_DIM;
-        int res = ui_tab(&g_ui, UIID(100 + i), tx, 2, tab_w, TAB_BAR_H - 2,
+        int res = ui_tab(&g_ui, UIID(100 + i), tx, ty + 2, tab_w, TAB_BAR_H - 2,
                          g_app.panels[g_app.active_panel].tabs[i].title,
                          i == g_app.panels[g_app.active_panel].active_tab,
                          get_file_icon("folder", 1),
@@ -5690,7 +5977,7 @@ static void build_tab_bar(float tabs_xmin, float tabs_xmax) {
         if (is_partial_right && !(drag_here && g_tab_drag_active)) {
             float vis_w = (float)((int)tabs_x1 - (int)tx);
             if (vis_w > 0 && ui_clicked(&g_ui, UIID(100 + i),
-                                        tx, 2, vis_w, TAB_BAR_H - 2)) {
+                                        tx, ty + 2, vis_w, TAB_BAR_H - 2)) {
                 res = 1;
             }
         }
@@ -5719,20 +6006,22 @@ static void build_tab_bar(float tabs_xmin, float tabs_xmax) {
             if (r_end > last_tab_right) last_tab_right = r_end;
         }
 
-        int hov = ui_hover(&g_ui, tx, 2, tab_w, TAB_BAR_H - 2);
+        int hov = ui_hover(&g_ui, tx, ty + 2, tab_w, TAB_BAR_H - 2);
         if (hov && g_ui.input.mouse_clicked && g_tab_drag_idx < 0 && !mx_was_masked) {
             g_tab_drag_idx    = i;
             g_tab_drag_panel  = g_app.active_panel;
             g_tab_drag_x0     = g_mouse_x;
+            g_tab_drag_y0     = g_mouse_y;
             g_tab_drag_offset = g_mouse_x - (int)tx;
         }
     }
 
-    if (drag_here && g_tab_drag_active && g_tab_drag_idx >= 0 && g_tab_drag_idx < g_app.panels[g_app.active_panel].tab_count) {
+    if (drag_here && g_tab_drag_active && !g_tab_drag_docking &&
+        g_tab_drag_idx >= 0 && g_tab_drag_idx < g_app.panels[g_app.active_panel].tab_count) {
         float drag_tx = (float)(g_mouse_x - g_tab_drag_offset);
         int saved_mx = g_ui.input.mouse_x;
         g_ui.input.mouse_x = -10000;
-        ui_tab(&g_ui, UIID(9999), drag_tx, 2, tab_w, TAB_BAR_H - 2,
+        ui_tab(&g_ui, UIID(9999), drag_tx, ty + 2, tab_w, TAB_BAR_H - 2,
                g_app.panels[g_app.active_panel].tabs[g_tab_drag_idx].title,
                g_tab_drag_idx == g_app.panels[g_app.active_panel].active_tab,
                get_file_icon("folder", 1),
@@ -5741,41 +6030,41 @@ static void build_tab_bar(float tabs_xmin, float tabs_xmax) {
         g_needs_redraw = 1;
     }
     render_scissor_reset(r);
-    g_tab_bar_tabs_end_x = last_tab_right;
+    g_tab_bar_tabs_end_x[g_app.active_panel] = last_tab_right;
 
     /* Right-side controls: scroll arrows (if overflow) + "+" */
     float bx = tabs_x1 + 2;
-    g_tab_bar_btns_start_x = (int)bx;
+    g_tab_bar_btns_start_x[g_app.active_panel] = (int)bx;
     float step = tab_w + tab_gap;
     if (overflow) {
-        if (ui_mdl2_btn(&g_ui, UIID(197), bx, 5, btn_w, TAB_BAR_H - 10, ICON_CHEVRON_LEFT, 10,
+        if (ui_mdl2_btn(&g_ui, UIID(197), bx, ty + 5, btn_w, TAB_BAR_H - 10, ICON_CHEVRON_LEFT, 10,
                         g_app.panels[g_app.active_panel].tab_scroll_target > 0)) {
             g_app.panels[g_app.active_panel].tab_scroll_target -= step;
             if (g_app.panels[g_app.active_panel].tab_scroll_target < 0) g_app.panels[g_app.active_panel].tab_scroll_target = 0;
             g_needs_redraw = 1;
         }
-        if (ui_hover(&g_ui, bx, 5, btn_w, TAB_BAR_H - 10))
-            tt_set("Scroll tabs left", (int)(bx + btn_w/2), 5);
+        if (ui_hover(&g_ui, bx, ty + 5, btn_w, TAB_BAR_H - 10))
+            tt_set("Scroll tabs left", (int)(bx + btn_w/2), (int)ty + 5);
         bx += btn_w;
-        if (ui_mdl2_btn(&g_ui, UIID(198), bx, 5, btn_w, TAB_BAR_H - 10, ICON_CHEVRON_RIGHT, 10,
+        if (ui_mdl2_btn(&g_ui, UIID(198), bx, ty + 5, btn_w, TAB_BAR_H - 10, ICON_CHEVRON_RIGHT, 10,
                         g_app.panels[g_app.active_panel].tab_scroll_target < max_scroll)) {
             g_app.panels[g_app.active_panel].tab_scroll_target += step;
             if (g_app.panels[g_app.active_panel].tab_scroll_target > max_scroll) g_app.panels[g_app.active_panel].tab_scroll_target = max_scroll;
             g_needs_redraw = 1;
         }
-        if (ui_hover(&g_ui, bx, 5, btn_w, TAB_BAR_H - 10))
-            tt_set("Scroll tabs right", (int)(bx + btn_w/2), 5);
+        if (ui_hover(&g_ui, bx, ty + 5, btn_w, TAB_BAR_H - 10))
+            tt_set("Scroll tabs right", (int)(bx + btn_w/2), (int)ty + 5);
         bx += btn_w + 4;
     }
-    if (ui_mdl2_btn(&g_ui, UIID(199), bx, 5, 24, TAB_BAR_H - 10, ICON_ADD, 10, 1))
+    if (ui_mdl2_btn(&g_ui, UIID(199), bx, ty + 5, 24, TAB_BAR_H - 10, ICON_ADD, 10, 1))
         new_tab(active_tab()->path);
-    if (ui_hover(&g_ui, bx, 5, 24, TAB_BAR_H - 10))
-        tt_set("New tab in current folder  (Ctrl+T)", (int)(bx + 12), 5);
-    g_tab_bar_btn_end_x = (int)(bx + 24);
+    if (ui_hover(&g_ui, bx, ty + 5, 24, TAB_BAR_H - 10))
+        tt_set("New tab in current folder  (Ctrl+T)", (int)(bx + 12), (int)ty + 5);
+    g_tab_bar_btn_end_x[g_app.active_panel] = (int)(bx + 24);
 
     /* Wheel over tab area scrolls horizontally */
     if (overflow &&
-        g_mouse_y >= 0 && g_mouse_y < TAB_BAR_H &&
+        g_mouse_y >= ty && g_mouse_y < ty + TAB_BAR_H &&
         g_mouse_x >= tabs_x0 && g_mouse_x < tabs_x1 + btns_w &&
         g_scroll_delta != 0) {
         g_app.panels[g_app.active_panel].tab_scroll_target -= g_scroll_delta * step;
@@ -5785,8 +6074,12 @@ static void build_tab_bar(float tabs_xmin, float tabs_xmax) {
         g_needs_redraw = 1;
     }
 
-    /* Auto-scroll active tab into view ONLY when active tab actually changes. */
-    if (overflow && g_app.panels[g_app.active_panel].active_tab >= 0 && g_app.panels[g_app.active_panel].active_tab != g_app.panels[g_app.active_panel].tab_scroll_last_active) {
+    /* Auto-scroll active tab into view when the active tab changes or the
+       strip is resized (panel split/close, splitter drag, window resize);
+       otherwise leave the user's arrow/wheel scrolling alone. */
+    if (overflow && g_app.panels[g_app.active_panel].active_tab >= 0 &&
+        (g_app.panels[g_app.active_panel].active_tab != g_app.panels[g_app.active_panel].tab_scroll_last_active ||
+         visible_w != g_app.panels[g_app.active_panel].tab_strip_last_w)) {
         float a_x = tabs_x0 - g_app.panels[g_app.active_panel].tab_scroll_target + g_app.panels[g_app.active_panel].active_tab * step;
         if (a_x < tabs_x0) g_app.panels[g_app.active_panel].tab_scroll_target -= (tabs_x0 - a_x);
         else if (a_x + tab_w > tabs_x1) g_app.panels[g_app.active_panel].tab_scroll_target += (a_x + tab_w - tabs_x1);
@@ -5794,12 +6087,13 @@ static void build_tab_bar(float tabs_xmin, float tabs_xmax) {
         if (g_app.panels[g_app.active_panel].tab_scroll_target > max_scroll) g_app.panels[g_app.active_panel].tab_scroll_target = max_scroll;
     }
     g_app.panels[g_app.active_panel].tab_scroll_last_active = g_app.panels[g_app.active_panel].active_tab;
+    g_app.panels[g_app.active_panel].tab_strip_last_w = visible_w;
 
     /* Drag threshold + commit logic only for the panel where drag started */
     if (drag_here) {
         if (g_tab_drag_idx >= 0 && g_mouse_down && !g_tab_drag_active) {
-            int dx = g_mouse_x - g_tab_drag_x0;
-            if (dx*dx > 25) { g_tab_drag_active = 1; g_needs_redraw = 1; }
+            int dx = g_mouse_x - g_tab_drag_x0, dy = g_mouse_y - g_tab_drag_y0;
+            if (dx*dx + dy*dy > 25) { g_tab_drag_active = 1; g_needs_redraw = 1; }
         }
         if (!g_mouse_down && g_tab_drag_idx >= 0) {
             if (g_tab_drag_active && drag_target != g_tab_drag_idx &&
@@ -5821,9 +6115,21 @@ static void build_tab_bar(float tabs_xmin, float tabs_xmax) {
                     g_app.panels[g_app.active_panel].active_tab++;
                 tabs_save();
             }
+            if (g_tab_drag_active && g_tab_drag_docking && g_dock_panel >= 0) {
+                /* Dropped on a dock target: moving it changes the layout,
+                   so it runs before the next frame's panels. */
+                g_panel_op       = 4;
+                g_panel_op_panel = g_app.active_panel;
+                g_dock_op_tab    = g_tab_drag_idx;
+                g_dock_op_dst    = g_dock_panel;
+                g_dock_op_zone   = g_dock_zone;
+                g_needs_redraw   = 1;
+            }
             g_tab_drag_idx    = -1;
             g_tab_drag_panel  = -1;
             g_tab_drag_active = 0;
+            g_tab_drag_docking = 0;
+            g_dock_panel      = -1;
         }
     }
 }
@@ -5831,7 +6137,7 @@ static void build_tab_bar(float tabs_xmin, float tabs_xmax) {
 static void build_toolbar(float x0, float x1) {
     Renderer* r = &g_renderer;
     Tab* t = active_tab();
-    float y = TAB_BAR_H;
+    float y = P_TOP(g_app.active_panel) + TAB_BAR_H;
     float w = x1 - x0;
 
     render_quad(r, x0, y, w, TOOLBAR_H, COL_HEADER);
@@ -6096,10 +6402,10 @@ static void build_sidebar(void) {
 static void build_column_headers(float lx, float ly, float lw) {
     Renderer* r = &g_renderer;
     render_quad(r, lx, ly, lw, COL_HDR_H, COL_HEADER);
-    float right = lx + lw - 10;
-    float size_x = right - COLW_SIZE;
-    float date_x = size_x - COLW_DATE;
-    float type_x = date_x - COLW_TYPE;
+    float type_x = details_type_x(lx, lw);
+    float date_x = type_x + COLW_TYPE;
+    float size_x = date_x + COLW_DATE;
+    render_scissor(r, (int)lx, (int)ly, (int)lw, COL_HDR_H);
     float ty = ly + (COL_HDR_H - g_renderer.font_height) / 2;
 
     struct { const char* label; float x, w; int col; } cols[] = {
@@ -6107,6 +6413,9 @@ static void build_column_headers(float lx, float ly, float lw) {
         {"Date Modified", date_x, COLW_DATE, 2}, {"Size", size_x, COLW_SIZE, 5},
     };
     for (int i = 0; i < 4; i++) {
+        /* columns pushed past the panel edge must not catch the neighbour's clicks */
+        if (cols[i].x + cols[i].w > lx + lw) cols[i].w = lx + lw - cols[i].x;
+        if (cols[i].w <= 0) break;
         int hov = ui_hover(&g_ui, cols[i].x, ly, cols[i].w, COL_HDR_H);
         render_text(r, cols[i].label, cols[i].x+4, ty, hov ? COL_TEXT : COL_SUBTEXT);
         if (g_app.sort_col == cols[i].col) {
@@ -6126,6 +6435,7 @@ static void build_column_headers(float lx, float ly, float lw) {
         }
         if (i > 0) render_quad(r, cols[i].x-1, ly+4, 1, COL_HDR_H-8, COL_BORDER);
     }
+    render_scissor_reset(r);
     render_quad(r, lx, ly+COL_HDR_H-1, lw, 1, COL_BORDER);
 }
 
@@ -6542,10 +6852,9 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
     if (t->target_scroll - t->scroll_y > 0.5f || t->target_scroll - t->scroll_y < -0.5f)
         g_needs_redraw = 1;
 
-    float right = lx + lw - 10;
-    float size_x = right - COLW_SIZE;
-    float date_x = size_x - COLW_DATE;
-    float type_x = date_x - COLW_TYPE;
+    float type_x = details_type_x(lx, lw);
+    float date_x = type_x + COLW_TYPE;
+    float size_x = date_x + COLW_DATE;
 
     int first = (int)(t->scroll_y / ROW_H);
     int last = first + (int)(lh / ROW_H) + 2;
@@ -6857,26 +7166,38 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
     float btn_y  = y + 1;
     float btn_x  = x1 - btn_w - 4;
 
-    /* Right-most button: split toggle on both panels, so the right panel's
-       corner closes split view too. */
+    /* Right-most button: panel menu (split right / bottom, even, close). */
     {
+        int multi = layout_panel_count(&g_app.layout) > 1;
         int hov = ui_hover(&g_ui, btn_x, btn_y, btn_w, btn_h);
         if (hov) render_quad(r, btn_x, btn_y, btn_w, btn_h, COL_HOVER);
-        uint32_t col = g_app.split_active ? COL_ACCENT : (hov ? COL_TEXT : COL_SUBTEXT);
+        uint32_t col = multi ? COL_ACCENT : (hov ? COL_TEXT : COL_SUBTEXT);
         draw_split_icon(r, btn_x + btn_pad, btn_y + (btn_h - btn_sz) / 2, btn_sz, col, COL_HEADER);
-        if (hov) tt_set(g_app.split_active ? "Close split view  (Ctrl+\\)"
-                                           : "Split view  (Ctrl+\\)",
+        if (hov) tt_set(g_zoom_panel >= 0 ? "Panel (maximized)" : "Panel",
                         (int)(btn_x + btn_w / 2), (int)btn_y);
-        if (ui_clicked(&g_ui, panel_idx ? 603 : 600, btn_x, btn_y, btn_w, btn_h)) {
-            g_app.split_active = !g_app.split_active;
-            if (g_app.split_active && g_app.panels[1].tab_count == 0) {
-                int saved = g_app.active_panel;
-                g_app.active_panel = 1;
-                new_tab(g_app.panels[0].tabs[g_app.panels[0].active_tab].path);
-                g_app.active_panel = saved;
-            }
-            if (!g_app.split_active && g_app.active_panel == 1) g_app.active_panel = 0;
-            tabs_save();
+        if (ui_clicked(&g_ui, UIID(600), btn_x, btn_y, btn_w, btn_h)) {
+            /* Gray out a split with no free slot or no room left (the panel
+               loop has already made panel_idx the active panel). */
+            int room_r = panel_split_try(NULL, panel_idx, 1, 0, panel_free_slot());
+            int room_b = panel_split_try(NULL, panel_idx, 0, 0, panel_free_slot());
+            HMENU pm = CreatePopupMenu();
+            AppendMenuA(pm, MF_STRING | (room_r ? 0 : MF_GRAYED), 1, "Split Right\tCtrl+\\");
+            AppendMenuA(pm, MF_STRING | (room_b ? 0 : MF_GRAYED), 2, "Split Bottom\tCtrl+Shift+\\");
+            AppendMenuA(pm, MF_SEPARATOR, 0, NULL);
+            AppendMenuA(pm, MF_STRING | (multi ? 0 : MF_GRAYED) |
+                        (g_zoom_panel == panel_idx ? MF_CHECKED : 0), 5, "Maximize Panel\tCtrl+Shift+M");
+            AppendMenuA(pm, MF_STRING | (multi ? 0 : MF_GRAYED), 3, "Even Panel Siblings");
+            AppendMenuA(pm, MF_STRING | (multi ? 0 : MF_GRAYED), 4, "Close Panel\tCtrl+Shift+W");
+            POINT pt = { (int)btn_x, (int)btn_y };
+            ClientToScreen(g_hwnd, &pt);
+            int cmd = TrackPopupMenu(pm, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
+                                     pt.x, pt.y, 0, g_hwnd, NULL);
+            DestroyMenu(pm);
+            g_app.active_panel = panel_idx;
+            if (cmd == 1 || cmd == 2) panel_split(cmd == 1);
+            if (cmd == 3) { layout_even(&g_app.layout, panel_idx); tabs_save(); }
+            if (cmd == 4) panel_close(panel_idx);
+            if (cmd == 5) panel_zoom_toggle();
             g_needs_redraw = 1;
         }
     }
@@ -6895,7 +7216,7 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
                                                "View: Large Icons  (click to change)";
         tt_set(label, (int)(vx + btn_w / 2), (int)btn_y);
     }
-    if (ui_clicked(&g_ui, 602 + panel_idx * 100, vx, btn_y, btn_w, btn_h)) {
+    if (ui_clicked(&g_ui, UIID(602), vx, btn_y, btn_w, btn_h)) {
         HMENU vm = CreatePopupMenu();
         AppendMenuA(vm, MF_STRING | (t->view_mode == VM_LARGE_ICONS ? MF_CHECKED : 0),
                     IDM_VIEW_LARGE,   "Large Icons");
@@ -6921,24 +7242,24 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
         }
     }
 
-    /* Sync-scroll toggle (right panel only), left of the view-mode button */
-    if (panel_idx == 1) {
+    /* Sync-scroll toggle (when split), left of the view-mode button */
+    if (layout_panel_count(&g_app.layout) > 1) {
         float sx = vx - btn_w - 2;
         int hov = ui_hover(&g_ui, sx, btn_y, btn_w, btn_h);
         if (hov) render_quad(r, sx, btn_y, btn_w, btn_h, COL_HOVER);
         uint32_t col = g_sync_scroll ? COL_ACCENT : (hov ? COL_TEXT : COL_SUBTEXT);
         render_mdl2(r, ICON_LINK, sx + btn_pad, btn_y + (btn_h - btn_sz) / 2, btn_sz, col);
-        if (hov) tt_set(g_sync_scroll ? "Sync scroll: on (both panels scroll together)"
+        if (hov) tt_set(g_sync_scroll ? "Sync scroll: on (all panels scroll together)"
                                       : "Sync scroll: off",
                         (int)(sx + btn_w / 2), (int)btn_y);
-        if (ui_clicked(&g_ui, 601, sx, btn_y, btn_w, btn_h)) {
+        if (ui_clicked(&g_ui, UIID(601), sx, btn_y, btn_w, btn_h)) {
             g_sync_scroll = !g_sync_scroll;
             g_needs_redraw = 1;
         }
     }
 
-    /* Thumbnail progress (only on panel 0 status, right of counts) */
-    if (panel_idx == 0) {
+    /* Thumbnail progress (focused panel's status only, right of counts) */
+    if (panel_idx == g_focused_panel) {
         int pending = 0;
         EnterCriticalSection(&g_thumb_cs);
         pending = (g_thumb_req_tail - g_thumb_req_head + THUMB_Q_CAP) % THUMB_Q_CAP;
@@ -6959,15 +7280,10 @@ static void build_fuzzy_finder(void) {
     Renderer* r = &g_renderer;
 
     /* Panel bounds (active panel content area) */
-    float panel_x = SIDEBAR_W;
-    float panel_w = (float)g_width - SIDEBAR_W;
-    if (g_app.split_active) {
-        float split_x = floorf(SIDEBAR_W + g_app.split_ratio * (g_width - SIDEBAR_W));
-        if (g_app.active_panel == 0) { panel_w = split_x - SIDEBAR_W; }
-        else                         { panel_x = split_x; panel_w = g_width - split_x; }
-    }
-    float panel_y = CONTENT_TOP;
-    float panel_h = (float)g_height - CONTENT_TOP - STATUS_BAR_H;
+    float panel_x = prect(g_app.active_panel)->x;
+    float panel_w = prect(g_app.active_panel)->w;
+    float panel_y = P_CONTENT(g_app.active_panel);
+    float panel_h = P_STATUS(g_app.active_panel) - panel_y;
 
     /* Panel dimensions */
     float ff_w = panel_w * 0.62f; if (ff_w < 420) ff_w = 420; if (ff_w > 900) ff_w = 900;
@@ -7411,8 +7727,14 @@ static void build_settings_modal(void) {
             { NULL,         "Ctrl+N",           "New file"                         },
             { NULL,         "Ctrl+Shift+N",     "New folder"                       },
             { NULL,         "F5",               "Refresh + clear thumbnail cache"  },
-            { "Panels",     "Ctrl+\\",          "Toggle split view"                },
-            { NULL,         "Tab (in split)",   "Switch active panel"              },
+            { "Panels",     "Ctrl+\\",          "Split right"                      },
+            { NULL,         "Ctrl+Shift+\\",    "Split bottom"                     },
+            { NULL,         "Ctrl+Shift+W",     "Close panel"                      },
+            { NULL,         "Ctrl+Shift+M",     "Maximize / restore panel"         },
+            { NULL,         "Tab (in split)",   "Next panel"                       },
+            { NULL,         "Ctrl+Alt+arrows",  "Focus panel in that direction"   },
+            { NULL,         "Drag tab",         "Onto a panel / its edge to dock"  },
+            { NULL,         "Dbl-click splitter","Even out panel sizes"            },
             { "Search",     "Ctrl+F",           "Fuzzy find in current folder"     },
             { NULL,         "Ctrl+R",           "Toggle recursive (in fuzzy)"      },
             { NULL,         "Ctrl+.",           "Stop recursive scan"              },
@@ -7499,21 +7821,13 @@ static void build_settings_modal(void) {
                       lx, py + ph - 28, COL_DIM);
 }
 
-static void build_status_bar(void) {
+static void build_panel_status(int p) {
     Renderer* r = &g_renderer;
-    float y = (float)g_height - STATUS_BAR_H;
-    float w = (float)g_width;
-    /* Status bar covers panel area only — sidebar extends full height below */
-    render_quad(r, SIDEBAR_W, y, w - SIDEBAR_W, STATUS_BAR_H, COL_HEADER);
-    render_quad(r, SIDEBAR_W, y, w - SIDEBAR_W, 1, COL_BORDER);
-    if (g_app.split_active) {
-        float split_x = floorf(SIDEBAR_W + g_app.split_ratio * (g_width - SIDEBAR_W));
-        render_panel_status(r, 0, SIDEBAR_W, split_x, y);
-        render_panel_status(r, 1, split_x, w, y);
-        render_quad(r, split_x - 1, y, 2, STATUS_BAR_H, COL_BORDER);
-    } else {
-        render_panel_status(r, 0, SIDEBAR_W, w, y);
-    }
+    LNode* n = prect(p);
+    float y = P_STATUS(p);
+    render_quad(r, n->x, y, n->w, STATUS_BAR_H, COL_HEADER);
+    render_quad(r, n->x, y, n->w, 1, COL_BORDER);
+    render_panel_status(r, p, n->x, n->x + n->w, y);
 }
 
 static void build_ui(void) {
@@ -7560,58 +7874,64 @@ static void build_ui(void) {
         g_scroll_delta = 0;
     }
 
-    /* Focus follows click: in split mode, clicking in either panel makes it active */
-    if (g_app.split_active && g_mouse_clicked && g_mouse_x >= SIDEBAR_W &&
-        g_mouse_y >= TAB_BAR_H) {
-        float split_x = SIDEBAR_W + g_app.split_ratio * (g_width - SIDEBAR_W);
-        g_app.active_panel = (g_mouse_x < split_x) ? 0 : 1;
+    panel_op_flush();
+    layout_update();
+
+    /* Focus follows click: clicking in any panel makes it active */
+    if (g_mouse_clicked && g_splitter_drag < 0) {
+        int hit = layout_panel_at(&g_app.layout, (float)g_mouse_x, (float)g_mouse_y);
+        if (hit >= 0 && layout_splitter_at(&g_app.layout, (float)g_mouse_x, (float)g_mouse_y,
+                                           SPLITTER_HIT_W / 2.0f, TAB_BAR_H) < 0)
+            g_app.active_panel = hit;
     }
 
     /* Sidebar + window buttons rendered once (shared) */
     build_sidebar();
     build_window_buttons();
 
-    int win_btns_left = g_width - WIN_BTN_W * 3;
-    float content_left = SIDEBAR_W;
-    float content_right = (float)g_width;
-    /* Snap to integer pixel so the right panel renders at whole-pixel x —
-       otherwise text glyphs land at fractional positions and bilinear
-       sampling on the font atlas makes them look fuzzy. */
-    float split_x = floorf(content_left + g_app.split_ratio * (content_right - content_left));
-    if (!g_app.split_active) split_x = content_right;
+    /* A press on a splitter belongs to the splitter (handled after the
+       panels): keep it from also clicking the list underneath, which
+       cleared the selection on a splitter double-click. */
+    int on_splitter = !overlay_open && g_zoom_panel < 0 &&
+        layout_splitter_at(&g_app.layout, (float)g_ui.input.mouse_x, (float)g_ui.input.mouse_y,
+                           SPLITTER_HIT_W / 2.0f, TAB_BAR_H) >= 0;
+    int split_clk = g_ui.input.mouse_clicked, split_dbl = g_ui.input.mouse_dblclick;
+    if (on_splitter) g_ui.input.mouse_clicked = g_ui.input.mouse_dblclick = 0;
 
-    /* Tab bar tabs_xmin = 38 (after logo) for panel 0, split_x for panel 1.
-       For tabs_xmax: stop before window buttons OR at split_x. */
-    int n_panels = g_app.split_active ? 2 : 1;
+    int win_btns_left = g_width - WIN_BTN_W * 3;
     int saved_active = g_app.active_panel;
     g_focused_panel = saved_active;
-    for (int p = 0; p < n_panels; p++) {
+    g_in_panel_loop = 1;
+    for (int p = 0; p < MAX_PANELS; p++) {
+        if (g_app.panels[p].tab_count == 0 || layout_leaf(&g_app.layout, p) < 0) continue;
+        if (prect(p)->w <= 0) continue;   /* hidden behind a maximized panel */
         g_app.active_panel = p;
         g_ui_id_base = p * 10000;
-        float panel_x  = (p == 0) ? content_left : split_x;
-        float panel_w  = (p == 0) ? (split_x - content_left) : (content_right - split_x);
-        float tabs_xmin = (p == 0) ? 38.0f : split_x;
-        float tabs_xmax = (g_app.split_active && p == 0) ? split_x : (float)win_btns_left;
-        if (tabs_xmax > tabs_xmin + 40) tabs_xmax -= 0; /* keep flush */
-
-        build_tab_bar(tabs_xmin, tabs_xmax);
+        LNode* n = prect(p);
+        float panel_x = n->x, panel_w = n->w, top = n->y;
+        /* Top-row panels share the title bar: the leftmost starts after the
+           logo, the rightmost stops before the window buttons. */
+        float tabs_xmin = (top == 0 && panel_x <= SIDEBAR_W) ? 38.0f : panel_x;
+        float tabs_xmax = (top == 0 && panel_x + panel_w >= g_width) ? (float)win_btns_left
+                                                                      : panel_x + panel_w;
+        build_tab_bar(tabs_xmin, tabs_xmax, top);
         build_toolbar(panel_x, panel_x + panel_w);
-        build_column_headers(panel_x, CONTENT_TOP, panel_w);
-        build_file_list(panel_x, CONTENT_TOP + COL_HDR_H,
-                        panel_w, g_height - CONTENT_TOP - COL_HDR_H - STATUS_BAR_H);
+        build_column_headers(panel_x, P_CONTENT(p), panel_w);
+        build_file_list(panel_x, P_CONTENT(p) + COL_HDR_H,
+                        panel_w, P_STATUS(p) - P_CONTENT(p) - COL_HDR_H);
+        build_panel_status(p);
     }
+    g_in_panel_loop = 0;
     g_app.active_panel = saved_active;
     g_ui_id_base = 0;
 
     /* Drop target highlight: outline panel under cursor during drag-in */
     if (g_drop_hover_panel >= 0) {
         Renderer* r = &g_renderer;
-        float dx = (g_drop_hover_panel == 0) ? content_left : split_x;
-        float dw = (g_drop_hover_panel == 0 && g_app.split_active) ? (split_x - content_left)
-                 : (g_drop_hover_panel == 1) ? (content_right - split_x)
-                 : (content_right - content_left);
-        float dy = CONTENT_TOP;
-        float dh = (float)(g_height - CONTENT_TOP - STATUS_BAR_H);
+        float dx = prect(g_drop_hover_panel)->x;
+        float dw = prect(g_drop_hover_panel)->w;
+        float dy = P_CONTENT(g_drop_hover_panel);
+        float dh = P_STATUS(g_drop_hover_panel) - dy;
         /* 2px outline */
         render_quad(r, dx, dy, dw, 2, COL_ACCENT);
         render_quad(r, dx, dy+dh-2, dw, 2, COL_ACCENT);
@@ -7619,33 +7939,74 @@ static void build_ui(void) {
         render_quad(r, dx+dw-2, dy, 2, dh, COL_ACCENT);
     }
 
-    /* Splitter handle (drag to resize) */
-    if (g_app.split_active) {
+    /* Tab dragged off its strip: shade where it would land, and carry the
+       tab under the cursor. */
+    if (g_tab_drag_active && g_tab_drag_docking) {
         Renderer* r = &g_renderer;
-        float hit_x = split_x - SPLITTER_HIT_W / 2.0f;
-        int hov = ui_hover(&g_ui, hit_x, TAB_BAR_H,
-                            (float)SPLITTER_HIT_W, (float)(g_height - TAB_BAR_H - STATUS_BAR_H));
-        if (hov && g_ui.input.mouse_clicked) g_splitter_dragging = 1;
-        if (g_splitter_dragging && !g_ui.input.mouse_down) {
-            g_splitter_dragging = 0;
-            tabs_save();
+        if (g_dock_panel >= 0) {
+            LNode* n = prect(g_dock_panel);
+            float dx = n->x, dy = n->y, dw = n->w, dh = n->h;
+            if (g_dock_zone == DOCK_LEFT || g_dock_zone == DOCK_RIGHT) {
+                dw = floorf(dw / 2);
+                if (g_dock_zone == DOCK_RIGHT) dx = n->x + n->w - dw;
+            } else if (g_dock_zone == DOCK_TOP || g_dock_zone == DOCK_BOTTOM) {
+                dh = floorf(dh / 2);
+                if (g_dock_zone == DOCK_BOTTOM) dy = n->y + n->h - dh;
+            }
+            render_quad(r, dx, dy, dw, dh, (COL_ACCENT & 0x00FFFFFF) | 0x30000000);
+            render_quad(r, dx, dy, dw, 2, COL_ACCENT);
+            render_quad(r, dx, dy+dh-2, dw, 2, COL_ACCENT);
+            render_quad(r, dx, dy, 2, dh, COL_ACCENT);
+            render_quad(r, dx+dw-2, dy, 2, dh, COL_ACCENT);
         }
-        if (g_splitter_dragging) {
-            float content_left  = SIDEBAR_W;
-            float content_right = (float)g_width;
-            float new_x = (float)g_mouse_x;
-            float min_x = content_left + 200;
-            float max_x = content_right - 200;
-            if (new_x < min_x) new_x = min_x;
-            if (new_x > max_x) new_x = max_x;
-            g_app.split_ratio = (new_x - content_left) / (content_right - content_left);
-            g_needs_redraw = 1;
+        Panel* S = &g_app.panels[g_tab_drag_panel >= 0 ? g_tab_drag_panel : 0];
+        if (g_tab_drag_idx >= 0 && g_tab_drag_idx < S->tab_count) {
+            int saved_mx = g_ui.input.mouse_x;
+            g_ui.input.mouse_x = -10000;
+            ui_tab(&g_ui, 9998, (float)(g_mouse_x - g_tab_drag_offset),
+                   (float)g_mouse_y - TAB_BAR_H / 2, 160, TAB_BAR_H - 2,
+                   S->tabs[g_tab_drag_idx].title, 1, get_file_icon("folder", 1), COL_ACCENT);
+            g_ui.input.mouse_x = saved_mx;
         }
-        uint32_t col = (hov || g_splitter_dragging) ? COL_ACCENT : COL_BORDER;
-        render_quad(r, split_x - 1, TAB_BAR_H, 2, g_height - TAB_BAR_H - STATUS_BAR_H, col);
     }
 
-    build_status_bar();
+    /* Splitters: a line between every pair of neighbouring panels; drag to
+       move the share between those two (File Pilot keeps siblings' ratios). */
+    if (on_splitter) { g_ui.input.mouse_clicked = split_clk; g_ui.input.mouse_dblclick = split_dbl; }
+    {
+        Renderer* r = &g_renderer;
+        /* A maximized panel has no neighbours on screen, so no splitters. */
+        int hov = g_zoom_panel >= 0 ? -1
+                : layout_splitter_at(&g_app.layout, (float)g_ui.input.mouse_x,
+                                     (float)g_ui.input.mouse_y, SPLITTER_HIT_W / 2.0f, TAB_BAR_H);
+        if (hov >= 0 && g_ui.input.mouse_dblclick) {
+            /* Double-click evens out the panels on that splitter's line. */
+            layout_even_siblings(&g_app.layout, hov);
+            layout_update();
+            tabs_save();
+            g_needs_redraw = 1;
+        } else if (hov >= 0 && g_ui.input.mouse_clicked) g_splitter_drag = hov;
+        if (g_splitter_drag >= 0 && !g_ui.input.mouse_down) {
+            g_splitter_drag = -1;
+            tabs_save();
+        }
+        if (g_splitter_drag >= 0) {
+            layout_splitter_drag(&g_app.layout, g_splitter_drag,
+                                 (float)g_mouse_x, (float)g_mouse_y, PANEL_MIN_W, PANEL_MIN_H);
+            layout_update();
+            g_needs_redraw = 1;
+        }
+        for (int c = 0; c < MAX_LNODES && g_zoom_panel < 0; c++) {
+            LNode* a = &g_app.layout.n[c];
+            if (!a->used || a->next < 0 || a->parent < 0) continue;
+            uint32_t col = (c == hov || c == g_splitter_drag) ? COL_ACCENT : COL_BORDER;
+            if (g_app.layout.n[a->parent].vertical)
+                render_quad(r, a->x + a->w - 1, a->y + TAB_BAR_H, 2, a->h - TAB_BAR_H, col);
+            else
+                render_quad(r, a->x, a->y + a->h - 1, a->w, 2, col);
+        }
+    }
+
     /* Restore real input BEFORE the overlays render so their own widgets
        see clicks / hover. */
     if (overlay_open) {
@@ -7712,9 +8073,13 @@ static LRESULT handle_nchittest(HWND hwnd, LPARAM lp) {
         int min_x = w - WIN_BTN_W * 3;   /* left edge of window buttons */
         if (pt.x >= min_x)                          return HTCLIENT;   /* min/max/close */
         if (pt.x < 38)                              return HTCAPTION;  /* logo grip */
-        if (pt.x < g_tab_bar_tabs_end_x)            return HTCLIENT;   /* over a tab */
-        if (pt.x < g_tab_bar_btns_start_x)          return HTCAPTION;  /* gap between tabs and buttons */
-        if (pt.x < g_tab_bar_btn_end_x)             return HTCLIENT;   /* chevrons + "+" */
+        /* Top-row panel under the cursor (the logo strip belongs to the
+           leftmost one). */
+        int tp = layout_panel_at(&g_app.layout, (float)(pt.x < SIDEBAR_W ? SIDEBAR_W : pt.x), 0);
+        if (tp < 0) return HTCAPTION;
+        if (pt.x < g_tab_bar_tabs_end_x[tp])        return HTCLIENT;   /* over a tab */
+        if (pt.x < g_tab_bar_btns_start_x[tp])      return HTCAPTION;  /* gap between tabs and buttons */
+        if (pt.x < g_tab_bar_btn_end_x[tp])         return HTCLIENT;   /* chevrons + "+" */
         return HTCAPTION;                                                /* gap before window buttons */
     }
 
@@ -7752,16 +8117,14 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SetCursor(LoadCursor(NULL, IDC_SIZEALL));
                 return TRUE;
             }
-            if (g_splitter_dragging) {
-                SetCursor(LoadCursor(NULL, IDC_SIZEWE));
-                return TRUE;
-            }
-            if (g_app.split_active) {
+            {
                 POINT pt; GetCursorPos(&pt); ScreenToClient(g_hwnd, &pt);
-                float split_x = SIDEBAR_W + g_app.split_ratio * (g_width - SIDEBAR_W);
-                if (pt.x >= split_x - 3 && pt.x < split_x + 3 &&
-                    pt.y >= TAB_BAR_H && pt.y < g_height - STATUS_BAR_H) {
-                    SetCursor(LoadCursor(NULL, IDC_SIZEWE));
+                int c = g_splitter_drag >= 0 ? g_splitter_drag
+                      : layout_splitter_at(&g_app.layout, (float)pt.x, (float)pt.y,
+                                           SPLITTER_HIT_W / 2.0f, TAB_BAR_H);
+                if (c >= 0) {
+                    int v = g_app.layout.n[g_app.layout.n[c].parent].vertical;
+                    SetCursor(LoadCursor(NULL, v ? IDC_SIZEWE : IDC_SIZENS));
                     return TRUE;
                 }
             }
@@ -7778,6 +8141,12 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         MINMAXINFO* mmi = (MINMAXINFO*)lp;
         mmi->ptMinTrackSize.x = 640;
         mmi->ptMinTrackSize.y = 400;
+        /* Don't let the window shrink below what the open panels need (the
+           client area is the whole window, see handle_nccalcsize). */
+        float lw, lh;
+        layout_min_size(&g_app.layout, PANEL_MIN_W, PANEL_MIN_H, &lw, &lh);
+        if (SIDEBAR_W + (int)lw > mmi->ptMinTrackSize.x) mmi->ptMinTrackSize.x = SIDEBAR_W + (int)lw;
+        if ((int)lh > mmi->ptMinTrackSize.y) mmi->ptMinTrackSize.y = (int)lh;
         return 0;
     }
 
@@ -8119,23 +8488,23 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
-        else if (wp == VK_TAB && g_app.split_active && !ctrl && !shift) {
-            g_app.active_panel = 1 - g_app.active_panel;
+        else if (wp == VK_TAB && layout_panel_count(&g_app.layout) > 1 && !ctrl && !shift) {
+            g_app.active_panel = layout_panel_step(&g_app.layout, g_app.active_panel, 1);
+            /* Maximized: the next panel takes over the whole area. */
+            if (g_zoom_panel >= 0) { g_zoom_panel = g_app.active_panel; layout_update(); }
             tabs_save();
             g_needs_redraw = 1;
             return 0;
         }
-        else if (wp==VK_OEM_5 && ctrl) {  /* Ctrl+\ → toggle split */
-            g_app.split_active = !g_app.split_active;
-            if (g_app.split_active && g_app.panels[1].tab_count == 0) {
-                int saved = g_app.active_panel;
-                g_app.active_panel = 1;
-                new_tab(g_app.panels[0].tabs[g_app.panels[0].active_tab].path);
-                g_app.active_panel = saved;
-            }
-            if (!g_app.split_active && g_app.active_panel == 1) g_app.active_panel = 0;
-            tabs_save();
-            g_needs_redraw = 1;
+        else if (wp==VK_OEM_5 && ctrl) {  /* Ctrl+\ split right, Ctrl+Shift+\ split bottom */
+            panel_split(!shift);
+        }
+        else if (wp=='W' && ctrl && shift) { panel_close(g_app.active_panel); }
+        else if (wp=='M' && ctrl && shift) { panel_zoom_toggle(); }
+        else if ((wp==VK_UP || wp==VK_DOWN || wp==VK_LEFT || wp==VK_RIGHT) &&
+                 ctrl && GetKeyState(VK_MENU) < 0) {
+            panel_focus_dir(wp == VK_RIGHT ? 1 : wp == VK_LEFT ? -1 : 0,
+                            wp == VK_DOWN  ? 1 : wp == VK_UP   ? -1 : 0);
         }
         else if (wp=='W' && ctrl) { close_tab(g_app.panels[g_app.active_panel].active_tab); g_needs_redraw=1; }
         else if (wp==VK_UP || wp==VK_DOWN || wp==VK_LEFT || wp==VK_RIGHT) {
@@ -8319,6 +8688,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int cmdShow)
     g_cf_drop_effect = RegisterClipboardFormatA("Preferred DropEffect");
     /* Preferences must load before font creation so font_size applies. */
     settings_load();
+    /* WM_GETMINMAXINFO arrives inside CreateWindowExW, before tabs_load
+       builds the real layout; a zeroed layout recurses forever. */
+    layout_init(&g_app.layout, 0);
 
     WNDCLASSEXW wc = {0};
     wc.cbSize = sizeof(wc);
@@ -8394,9 +8766,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int cmdShow)
     ui_init(&g_ui, &g_renderer);
     g_logo_tex = load_logo_texture(hInst);
     g_app.sort_asc = 1;
-    g_app.split_ratio = 0.5f;
-    g_app.panels[0].last_click_item = -1;
-    g_app.panels[1].last_click_item = -1;
+    for (int p = 0; p < MAX_PANELS; p++) g_app.panels[p].last_click_item = -1;
     sort_prefs_load();
     view_prefs_load();
     theme_load();

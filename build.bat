@@ -14,7 +14,7 @@ rc /nologo /fo build\resource.res src\resource.rc
 
 echo Building FilePathX...
 cl /nologo /O2 /W3 /WX- ^
-    src\main.c src\render.c src\ui.c src\update.c ^
+    src\main.c src\layout.c src\render.c src\ui.c src\update.c ^
     /I src ^
     /Fe:build\FilePathX.exe ^
     /Fo:build\ ^
