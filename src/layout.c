@@ -120,22 +120,82 @@ void layout_remove(Layout* L, int panel) {
     L->n[p].used = 0;
 }
 
-static void compute(Layout* L, int i, float x, float y, float w, float h) {
-    LNode* n = &L->n[i];
-    n->x = x; n->y = y; n->w = w; n->h = h;
-    float acc = 0, ext = n->vertical ? w : h, start = n->vertical ? x : y;
+/* Smallest size node i can take when every leaf needs at least mw x mh. */
+static void min_size(const Layout* L, int i, float mw, float mh, float* w, float* h) {
+    const LNode* n = &L->n[i];
+    if (n->child < 0) { *w = mw; *h = mh; return; }
+    *w = *h = 0;
     for (int c = n->child; c >= 0; c = L->n[c].next) {
-        /* Snap edges to whole pixels; the last child takes the remainder. */
-        float a = floorf(start + ext * acc);
-        acc += L->n[c].ratio;
-        float b = L->n[c].next >= 0 ? floorf(start + ext * acc) : start + ext;
-        if (n->vertical) compute(L, c, a, y, b - a, h);
-        else             compute(L, c, x, a, w, b - a);
+        float cw, ch;
+        min_size(L, c, mw, mh, &cw, &ch);
+        if (n->vertical) { *w += cw; if (ch > *h) *h = ch; }
+        else             { *h += ch; if (cw > *w) *w = cw; }
     }
 }
 
-void layout_compute(Layout* L, float x, float y, float w, float h) {
-    compute(L, L->root, x, y, w, h);
+static float min_extent(const Layout* L, int c, int vertical, float mw, float mh) {
+    float w, h;
+    min_size(L, c, mw, mh, &w, &h);
+    return vertical ? w : h;
+}
+
+void layout_min_size(const Layout* L, float mw, float mh, float* w, float* h) {
+    min_size(L, L->root, mw, mh, w, h);
+}
+
+static void compute(Layout* L, int i, float x, float y, float w, float h, float mw, float mh) {
+    LNode* n = &L->n[i];
+    n->x = x; n->y = y; n->w = w; n->h = h;
+    float ext = n->vertical ? w : h, start = n->vertical ? x : y;
+    int ids[MAX_LNODES], pinned[MAX_LNODES] = {0}, k = 0;
+    float sz[MAX_LNODES], mn[MAX_LNODES], mn_total = 0;
+    for (int c = n->child; c >= 0; c = L->n[c].next) {
+        ids[k] = c;
+        mn[k] = min_extent(L, c, n->vertical, mw, mh);
+        mn_total += mn[k++];
+    }
+    /* Children share ext by ratio; one that would fall below its minimum is
+       pinned there and the rest re-share what is left. The ratios are left
+       alone, so the layout comes back when the window grows again. */
+    for (int changed = mn_total <= ext; changed; ) {
+        float free_ext = ext, free_ratio = 0;
+        for (int j = 0; j < k; j++) {
+            if (pinned[j]) free_ext -= mn[j];
+            else           free_ratio += L->n[ids[j]].ratio;
+        }
+        changed = 0;
+        for (int j = 0; j < k; j++) {
+            if (pinned[j]) continue;
+            float s = free_ratio > 0 ? free_ext * L->n[ids[j]].ratio / free_ratio : 0;
+            if (s < mn[j]) pinned[j] = changed = 1;
+        }
+    }
+    int any_pinned = 0;
+    for (int j = 0; j < k; j++) any_pinned |= pinned[j];
+    if (any_pinned) {
+        float free_ext = ext, free_ratio = 0;
+        for (int j = 0; j < k; j++) {
+            if (pinned[j]) free_ext -= mn[j];
+            else           free_ratio += L->n[ids[j]].ratio;
+        }
+        for (int j = 0; j < k; j++)
+            sz[j] = pinned[j] ? mn[j] : free_ext * L->n[ids[j]].ratio / free_ratio;
+    } else {
+        for (int j = 0; j < k; j++) sz[j] = ext * L->n[ids[j]].ratio;
+    }
+    float acc = 0;
+    for (int j = 0; j < k; j++) {
+        /* Snap edges to whole pixels; the last child takes the remainder. */
+        float a = floorf(start + acc);
+        acc += sz[j];
+        float b = j + 1 < k ? floorf(start + acc) : start + ext;
+        if (n->vertical) compute(L, ids[j], a, y, b - a, h, mw, mh);
+        else             compute(L, ids[j], x, a, w, b - a, mw, mh);
+    }
+}
+
+void layout_compute(Layout* L, float x, float y, float w, float h, float min_w, float min_h) {
+    compute(L, L->root, x, y, w, h, min_w, min_h);
 }
 
 int layout_panel_at(const Layout* L, float x, float y) {
@@ -177,19 +237,22 @@ int layout_splitter_at(const Layout* L, float x, float y, float slop) {
     return -1;
 }
 
-void layout_splitter_drag(Layout* L, int c, float mx, float my, float min_px) {
+void layout_splitter_drag(Layout* L, int c, float mx, float my, float min_w, float min_h) {
     if (c < 0 || !L->n[c].used || L->n[c].next < 0) return;
     LNode* a = &L->n[c];
     LNode* b = &L->n[a->next];
-    LNode* g = &L->n[a->parent];
-    float ext  = g->vertical ? g->w : g->h;
-    float pos  = g->vertical ? mx - a->x : my - a->y;
+    int v = L->n[a->parent].vertical;
+    /* Work in the pixels the two panels have now, so a neighbour pinned at
+       its minimum by layout_compute doesn't skew the drag. */
+    float span  = v ? a->w + b->w : a->h + b->h;
+    float pos   = v ? mx - a->x : my - a->y;
+    float min_a = min_extent(L, c, v, min_w, min_h);
+    float min_b = min_extent(L, a->next, v, min_w, min_h);
+    if (span <= 0 || span < min_a + min_b) return;
+    if (pos < min_a) pos = min_a;
+    if (pos > span - min_b) pos = span - min_b;
     float total = a->ratio + b->ratio;
-    float span = total * ext;
-    if (ext <= 0 || span < 2 * min_px) return;
-    if (pos < min_px) pos = min_px;
-    if (pos > span - min_px) pos = span - min_px;
-    a->ratio = pos / ext;
+    a->ratio = total * pos / span;
     b->ratio = total - a->ratio;
 }
 

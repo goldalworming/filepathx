@@ -183,8 +183,12 @@ static LNode* prect(int p) {
 #define P_TOP(p)     (prect(p)->y)
 #define P_CONTENT(p) (prect(p)->y + TAB_BAR_H + TOOLBAR_H)
 #define P_STATUS(p)  (prect(p)->y + prect(p)->h - STATUS_BAR_H)
+/* Smallest panel: room for the toolbar and a few rows of the list. */
+#define PANEL_MIN_W  160
+#define PANEL_MIN_H  (TAB_BAR_H + TOOLBAR_H + COL_HDR_H + STATUS_BAR_H + 60)
 static void layout_update(void) {
-    layout_compute(&g_app.layout, SIDEBAR_W, 0, (float)g_width - SIDEBAR_W, (float)g_height);
+    layout_compute(&g_app.layout, SIDEBAR_W, 0, (float)g_width - SIDEBAR_W, (float)g_height,
+                   PANEL_MIN_W, PANEL_MIN_H);
 }
 
 static int      g_mouse_x, g_mouse_y, g_mouse_down;
@@ -3174,15 +3178,32 @@ static void batch_rename_cancel(void) {
 
 /* Split the active panel (File Pilot: Split Right / Split Bottom); the new
    panel opens on the same folder and takes focus. */
+static int panel_free_slot(void) {
+    for (int p = 0; p < MAX_PANELS; p++)
+        if (g_app.panels[p].tab_count == 0) return p;
+    return -1;
+}
+
+/* Split only while every panel still gets its minimum size in the window. */
+static int panel_split_try(Layout* out, int vertical, int np) {
+    if (np < 0) return 0;
+    Layout tmp = g_app.layout;
+    if (layout_split(&tmp, g_app.active_panel, vertical, np) < 0) return 0;
+    float w, h;
+    layout_min_size(&tmp, PANEL_MIN_W, PANEL_MIN_H, &w, &h);
+    if (w > g_width - SIDEBAR_W || h > g_height) return 0;
+    if (out) *out = tmp;
+    return 1;
+}
+
 static void panel_split(int vertical) {
-    int np = -1;
-    for (int p = 0; p < MAX_PANELS && np < 0; p++)
-        if (g_app.panels[p].tab_count == 0) np = p;
-    if (np < 0) return;
+    int np = panel_free_slot();
+    Layout split;
+    if (!panel_split_try(&split, vertical, np)) return;
     char path[MAX_PATH];
     strncpy(path, active_tab()->path, MAX_PATH - 1);
     path[MAX_PATH - 1] = 0;
-    if (layout_split(&g_app.layout, g_app.active_panel, vertical, np) < 0) return;
+    g_app.layout = split;
     g_app.active_panel = g_focus_next = np;
     g_app.panels[np].last_click_item = -1;
     new_tab(path);
@@ -6978,10 +6999,13 @@ static void render_panel_status(Renderer* r, int panel_idx, float x0, float x1, 
         draw_split_icon(r, btn_x + btn_pad, btn_y + (btn_h - btn_sz) / 2, btn_sz, col, COL_HEADER);
         if (hov) tt_set("Split panel", (int)(btn_x + btn_w / 2), (int)btn_y);
         if (ui_clicked(&g_ui, UIID(600), btn_x, btn_y, btn_w, btn_h)) {
-            int room = layout_panel_count(&g_app.layout) < MAX_PANELS;
+            /* Gray out a split with no free slot or no room left (the panel
+               loop has already made panel_idx the active panel). */
+            int room_r = panel_split_try(NULL, 1, panel_free_slot());
+            int room_b = panel_split_try(NULL, 0, panel_free_slot());
             HMENU pm = CreatePopupMenu();
-            AppendMenuA(pm, MF_STRING | (room ? 0 : MF_GRAYED), 1, "Split Right\tCtrl+\\");
-            AppendMenuA(pm, MF_STRING | (room ? 0 : MF_GRAYED), 2, "Split Bottom\tCtrl+Shift+\\");
+            AppendMenuA(pm, MF_STRING | (room_r ? 0 : MF_GRAYED), 1, "Split Right\tCtrl+\\");
+            AppendMenuA(pm, MF_STRING | (room_b ? 0 : MF_GRAYED), 2, "Split Bottom\tCtrl+Shift+\\");
             AppendMenuA(pm, MF_SEPARATOR, 0, NULL);
             AppendMenuA(pm, MF_STRING | (multi ? 0 : MF_GRAYED), 3, "Even Panel Siblings");
             AppendMenuA(pm, MF_STRING | (multi ? 0 : MF_GRAYED), 4, "Close Panel\tCtrl+Shift+W");
@@ -7733,7 +7757,7 @@ static void build_ui(void) {
         }
         if (g_splitter_drag >= 0) {
             layout_splitter_drag(&g_app.layout, g_splitter_drag,
-                                 (float)g_mouse_x, (float)g_mouse_y, 160.0f);
+                                 (float)g_mouse_x, (float)g_mouse_y, PANEL_MIN_W, PANEL_MIN_H);
             layout_update();
             g_needs_redraw = 1;
         }
@@ -7882,6 +7906,12 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         MINMAXINFO* mmi = (MINMAXINFO*)lp;
         mmi->ptMinTrackSize.x = 640;
         mmi->ptMinTrackSize.y = 400;
+        /* Don't let the window shrink below what the open panels need (the
+           client area is the whole window, see handle_nccalcsize). */
+        float lw, lh;
+        layout_min_size(&g_app.layout, PANEL_MIN_W, PANEL_MIN_H, &lw, &lh);
+        if (SIDEBAR_W + (int)lw > mmi->ptMinTrackSize.x) mmi->ptMinTrackSize.x = SIDEBAR_W + (int)lw;
+        if ((int)lh > mmi->ptMinTrackSize.y) mmi->ptMinTrackSize.y = (int)lh;
         return 0;
     }
 
