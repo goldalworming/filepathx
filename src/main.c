@@ -255,8 +255,12 @@ static void path_join_w(const char* dir, const char* name, WCHAR* out, int outn)
 }
 
 /* ---- Folder change watcher (auto-refresh when files change) ---- */
-static HANDLE g_watch_handle = INVALID_HANDLE_VALUE;
-static char   g_watch_path[MAX_PATH] = {0};
+/* One handle per open panel, following that panel's active tab. watch_sync()
+   runs every message-loop pass and reconciles the handles with whatever the
+   panels show, so tab/panel switches, splits and startup need no hooks. */
+static HANDLE g_watch_handle[MAX_PANELS];
+static char   g_watch_path[MAX_PANELS][MAX_PATH];
+static unsigned g_watch_dirty = 0;        /* panels with unhandled changes */
 
 /* Change notifications arrive in bursts (a download or copy fires dozens
    per second), so they're debounced: each one re-arms a short timer and
@@ -272,31 +276,32 @@ static void watch_cancel_pending(void) {
         KillTimer(g_hwnd, TIMER_WATCH_DEBOUNCE);
         g_watch_pending_since = 0;
     }
+    g_watch_dirty = 0;
 }
 
-static void watch_stop(void) {
-    watch_cancel_pending();
-    if (g_watch_handle != INVALID_HANDLE_VALUE) {
-        FindCloseChangeNotification(g_watch_handle);
-        g_watch_handle = INVALID_HANDLE_VALUE;
-    }
-    g_watch_path[0] = 0;
+static int watch_ok(int p) {
+    return g_watch_handle[p] && g_watch_handle[p] != INVALID_HANDLE_VALUE;
 }
 
-static void watch_start(const char* path) {
-    if (!path || !path[0]) { watch_stop(); return; }
-    if (g_watch_handle != INVALID_HANDLE_VALUE &&
-        _stricmp(g_watch_path, path) == 0) return;
-    watch_stop();
-    WCHAR wp[MAX_PATH]; u8_to_w(path, wp, MAX_PATH);
-    g_watch_handle = FindFirstChangeNotificationW(wp, FALSE,
-        FILE_NOTIFY_CHANGE_FILE_NAME |
-        FILE_NOTIFY_CHANGE_DIR_NAME  |
-        FILE_NOTIFY_CHANGE_SIZE      |
-        FILE_NOTIFY_CHANGE_LAST_WRITE);
-    if (g_watch_handle != INVALID_HANDLE_VALUE) {
-        strncpy(g_watch_path, path, MAX_PATH-1);
-        g_watch_path[MAX_PATH-1] = 0;
+static void watch_sync(void) {
+    for (int p = 0; p < MAX_PANELS; p++) {
+        Panel* P = &g_app.panels[p];
+        const char* want = P->tab_count > 0 ? P->tabs[P->active_tab].path : "";
+        if (_stricmp(g_watch_path[p], want) == 0) continue;
+        if (watch_ok(p)) FindCloseChangeNotification(g_watch_handle[p]);
+        g_watch_handle[p] = INVALID_HANDLE_VALUE;
+        g_watch_dirty &= ~(1u << p);
+        /* Remember the path even if watching fails, so we don't retry
+           a non-folder every loop pass. */
+        strncpy(g_watch_path[p], want, MAX_PATH-1);
+        g_watch_path[p][MAX_PATH-1] = 0;
+        if (!want[0]) continue;
+        WCHAR wp[MAX_PATH]; u8_to_w(want, wp, MAX_PATH);
+        g_watch_handle[p] = FindFirstChangeNotificationW(wp, FALSE,
+            FILE_NOTIFY_CHANGE_FILE_NAME |
+            FILE_NOTIFY_CHANGE_DIR_NAME  |
+            FILE_NOTIFY_CHANGE_SIZE      |
+            FILE_NOTIFY_CHANGE_LAST_WRITE);
     }
 }
 
@@ -1784,7 +1789,6 @@ static void tab_navigate(Tab* tab, const char* path, int add_hist) {
     tab->scroll_y = 0;
     tab->pending_focus[0] = 0;
     scan_directory_async(tab);
-    watch_start(tab->path);
     tabs_save();
 }
 
@@ -1811,7 +1815,6 @@ static void tab_go_back(Tab* tab) {
         tab->scroll_y = 0;
         tab->pending_focus[0] = 0;
         scan_directory_async(tab);
-        watch_start(tab->path);
         tabs_save();
     }
 }
@@ -1828,7 +1831,6 @@ static void tab_go_forward(Tab* tab) {
         tab->scroll_y = 0;
         tab->pending_focus[0] = 0;
         scan_directory_async(tab);
-        watch_start(tab->path);
         tabs_save();
     }
 }
@@ -5990,7 +5992,6 @@ static void build_tab_bar(float tabs_xmin, float tabs_xmax, float ty) {
                 sort_prefs_lookup(nt->path, &sc, &sa);
                 g_app.sort_col = sc; g_app.sort_asc = sa;
             }
-            watch_start(nt->path);
             tabs_save();
             g_needs_redraw = 1;
         }
@@ -8088,13 +8089,18 @@ static LRESULT handle_nchittest(HWND hwnd, LPARAM lp) {
 
 /* ---- Directory watcher (debounced) ---- */
 static void watch_flush(void) {
+    unsigned dirty = g_watch_dirty;
     watch_cancel_pending();
-    scan_directory_async(active_tab());
+    for (int p = 0; p < MAX_PANELS; p++) {
+        Panel* P = &g_app.panels[p];
+        if ((dirty >> p & 1) && P->tab_count > 0) scan_directory_async(&P->tabs[P->active_tab]);
+    }
     g_needs_redraw = 1;
 }
 
-static void watch_on_change(void) {
+static void watch_on_change(int p) {
     DWORD now = GetTickCount();
+    g_watch_dirty |= 1u << p;
     if (!g_watch_pending_since) g_watch_pending_since = now ? now : 1;
     if (now - g_watch_pending_since >= WATCH_MAX_WAIT_MS) watch_flush();
     else SetTimer(g_hwnd, TIMER_WATCH_DEBOUNCE, WATCH_DEBOUNCE_MS, NULL);  /* re-arms */
@@ -8798,11 +8804,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int cmdShow)
         }
         /* Non-blocking watcher check — happens every iteration so we don't miss
            events when the loop is busy redrawing (mouse move etc.). */
-        if (g_watch_handle != INVALID_HANDLE_VALUE &&
-            WaitForSingleObject(g_watch_handle, 0) == WAIT_OBJECT_0) {
-            FindNextChangeNotification(g_watch_handle);
-            watch_on_change();
-        }
+        watch_sync();
+        for (int p = 0; p < MAX_PANELS; p++)
+            if (watch_ok(p) && WaitForSingleObject(g_watch_handle[p], 0) == WAIT_OBJECT_0) {
+                FindNextChangeNotification(g_watch_handle[p]);
+                watch_on_change(p);
+            }
         if (g_needs_redraw) {
             g_needs_redraw = 0;
             RECT rc; GetClientRect(g_hwnd, &rc);
@@ -8817,9 +8824,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int cmdShow)
             g_mouse_clicked = 0; g_mouse_released = 0;
             g_mouse_dblclick = 0; g_scroll_delta = 0;
         } else {
-            HANDLE handles[1];
+            HANDLE handles[MAX_PANELS];
             DWORD nh = 0;
-            if (g_watch_handle != INVALID_HANDLE_VALUE) handles[nh++] = g_watch_handle;
+            for (int p = 0; p < MAX_PANELS; p++) if (watch_ok(p)) handles[nh++] = g_watch_handle[p];
             if (nh > 0) MsgWaitForMultipleObjects(nh, handles, FALSE, INFINITE, QS_ALLINPUT);
             else        WaitMessage();
             /* Watcher event is handled by the top-of-loop non-blocking check */
