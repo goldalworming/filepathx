@@ -4,12 +4,12 @@
 /* Bump this together with the git tag when cutting a release (see
    docs/RELEASES.md). The auto-updater compares it against the latest
    GitHub release tag. */
-#define APP_VERSION "0.8.2"
+#define APP_VERSION "0.8.3"
 
 /* Same version in numeric form, for the VERSIONINFO block in resource.rc.
    Keep the three numbers in sync with APP_VERSION above. */
 #define APP_VERSION_MAJOR 0
 #define APP_VERSION_MINOR 8
-#define APP_VERSION_PATCH 2
+#define APP_VERSION_PATCH 3
 
 #endif
