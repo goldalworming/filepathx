@@ -6268,7 +6268,12 @@ static void build_toolbar(float x0, float x1) {
         int nc = parse_breadcrumbs(t->path, crumbs);
         float cx = bx, ty = y + (TOOLBAR_H - r->font_height) / 2;
 
-        render_scissor(r, (int)cx, (int)y, (int)(x1 - cx), TOOLBAR_H);
+        /* Too long: shift left so the current folder stays visible. */
+        float total = 0;
+        for (int i = 0; i < nc; i++) total += render_text_width(r, crumbs[i].label) + (i ? 16 : 0);
+        if (total > crumb_w) cx -= total - crumb_w;
+
+        render_scissor(r, (int)crumb_x0, (int)y, (int)crumb_w, TOOLBAR_H);
         for (int i = 0; i < nc; i++) {
             if (i > 0) {
                 cx += 4;
@@ -6280,7 +6285,7 @@ static void build_toolbar(float x0, float x1) {
             int hov = ui_hover(&g_ui, cx, y, (float)tw, TOOLBAR_H);
             render_text(r, crumbs[i].label, cx, ty,
                         is_last ? COL_TEXT : (hov ? COL_ACCENT : COL_SUBTEXT));
-            if (!is_last && ui_clicked(&g_ui, UIID(250 + i), cx, y, (float)tw, TOOLBAR_H))
+            if (!is_last && cx >= crumb_x0 && ui_clicked(&g_ui, UIID(250 + i), cx, y, (float)tw, TOOLBAR_H))
                 tab_navigate(t, crumbs[i].path, 1);
             cx += tw;
         }
