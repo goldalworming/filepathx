@@ -6492,6 +6492,9 @@ static int click_opens_entry(DWORD now, int i) {
 static void build_file_list(float lx, float ly, float lw, float lh) {
     Renderer* r = &g_renderer;
     Tab* t = active_tab();
+    /* Items cut off at the list edge still have full-size rects that reach
+       into the panel below; a press there must not start a drag here. */
+    int press_in_list = ui_hover(&g_ui, lx, ly, lw, lh);
 
     render_quad(r, lx, ly, lw, lh, COL_BG);
     render_scissor(r, (int)lx, (int)ly, (int)lw, (int)lh);
@@ -6650,7 +6653,7 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
             }
 
             /* Drag-press detection */
-            if (hov && g_ui.input.mouse_clicked && g_drag_idx < 0) {
+            if (hov && press_in_list && g_ui.input.mouse_clicked && g_drag_idx < 0) {
                 g_drag_idx   = i;
                 g_drag_panel = g_app.active_panel;
                 g_drag_x0    = g_mouse_x;
@@ -6956,7 +6959,7 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
 
         /* Record drag-start info on press so cursor movement past threshold
            can initiate DoDragDrop. Pre-select the file if it isn't already. */
-        if (hov && g_ui.input.mouse_clicked && g_drag_idx < 0) {
+        if (hov && press_in_list && g_ui.input.mouse_clicked && g_drag_idx < 0) {
             g_drag_idx   = i;
             g_drag_panel = g_app.active_panel;
             g_drag_x0    = g_mouse_x;
