@@ -138,6 +138,7 @@ typedef struct {
     int  loading;                   /* async scan in flight */
     int  scan_timed_out;            /* last scan stalled and was abandoned */
     char loaded_path[MAX_PATH];     /* folder the current entries[] came from */
+    DWORD loaded_tick;              /* GetTickCount when entries[] were loaded */
     char pending_focus[MAX_PATH];   /* entry to select once loading finishes */
 } Tab;
 
@@ -260,6 +261,7 @@ static void path_join_w(const char* dir, const char* name, WCHAR* out, int outn)
    panels show, so tab/panel switches, splits and startup need no hooks. */
 static HANDLE g_watch_handle[MAX_PANELS];
 static char   g_watch_path[MAX_PANELS][MAX_PATH];
+static int    g_watch_tab[MAX_PANELS];    /* active_tab index the path came from */
 static unsigned g_watch_dirty = 0;        /* panels with unhandled changes */
 
 /* Change notifications arrive in bursts (a download or copy fires dozens
@@ -269,6 +271,9 @@ static unsigned g_watch_dirty = 0;        /* panels with unhandled changes */
 #define TIMER_WATCH_DEBOUNCE 0x5741
 #define WATCH_DEBOUNCE_MS    200
 #define WATCH_MAX_WAIT_MS    1000
+/* A tab coming into view goes unwatched while hidden, so it's rescanned
+   unless it was loaded this recently (a navigation or startup just did). */
+#define WATCH_FRESH_MS       1000
 static DWORD g_watch_pending_since = 0;   /* GetTickCount of first unhandled change, 0 = none */
 
 static void watch_cancel_pending(void) {
@@ -283,11 +288,19 @@ static int watch_ok(int p) {
     return g_watch_handle[p] && g_watch_handle[p] != INVALID_HANDLE_VALUE;
 }
 
+static void scan_directory_async(Tab* tab);
+
 static void watch_sync(void) {
     for (int p = 0; p < MAX_PANELS; p++) {
         Panel* P = &g_app.panels[p];
-        const char* want = P->tab_count > 0 ? P->tabs[P->active_tab].path : "";
-        if (_stricmp(g_watch_path[p], want) == 0) continue;
+        Tab* t = P->tab_count > 0 ? &P->tabs[P->active_tab] : NULL;
+        const char* want = t ? t->path : "";
+        int same_path = _stricmp(g_watch_path[p], want) == 0;
+        if (same_path && g_watch_tab[p] == P->active_tab) continue;
+        g_watch_tab[p] = P->active_tab;
+        if (t && !t->loading && GetTickCount() - t->loaded_tick > WATCH_FRESH_MS)
+            scan_directory_async(t);
+        if (same_path) continue;
         if (watch_ok(p)) FindCloseChangeNotification(g_watch_handle[p]);
         g_watch_handle[p] = INVALID_HANDLE_VALUE;
         g_watch_dirty &= ~(1u << p);
@@ -1567,6 +1580,7 @@ static void scan_apply(Tab* tab, const ScanResult* res) {
     tab->view_mode   = view_prefs_lookup(tab->path);
     tab->loading     = 0;
     tab->scan_timed_out = 0;
+    tab->loaded_tick = GetTickCount();
     strncpy(tab->loaded_path, tab->path, MAX_PATH-1);
     tab->loaded_path[MAX_PATH-1] = 0;
     refresh_today();
