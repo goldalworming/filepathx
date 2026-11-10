@@ -51,6 +51,12 @@ void layout_even_siblings(Layout* L, int c);
    the rects from layout_compute; the one sharing the most edge wins. -1 if
    none. */
 int  layout_panel_dir(const Layout* L, int panel, int dx, int dy);
+/* Details view: Type/Date/Size (w[0..2]) sit against the panel's right edge
+   and Name takes what is left. Dragging the separator on the left edge of
+   column `col` (whose right edge is at `right`) to `x` gives that column the
+   width that keeps the separator under the cursor, between min_w and what
+   still fits in `avail` beside the other two. */
+void details_col_drag(int w[3], int col, float right, float x, float avail, int min_w);
 /* Validate a loaded tree; returns 1 if usable. */
 int  layout_valid(const Layout* L);
 

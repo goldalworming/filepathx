@@ -208,6 +208,7 @@ int  render_text_width_n(Renderer* r, const char* text, int n);
 int  render_text_small(Renderer* r, const char* text, float x, float y, uint32_t color);
 int  render_text_small_n(Renderer* r, const char* text, int maxchars, float x, float y, uint32_t color);
 int  render_text_width_small(Renderer* r, const char* text);
+int  render_text_width_small_n(Renderer* r, const char* text, int n);
 void render_folder_icon(Renderer* r, float x, float y, float size, uint32_t color);
 void render_file_icon(Renderer* r, float x, float y, float size, uint32_t color);
 void render_icon(Renderer* r, GLuint texture, float x, float y, float w, float h);

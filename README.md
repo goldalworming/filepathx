@@ -10,6 +10,7 @@ A fast, keyboard-friendly Windows file manager written in pure C with OpenGL 3.3
 - **Tabbed browsing** with drag-to-reorder; `Ctrl+T` opens a new tab pointing to the *current folder* (not "This PC"), so you can branch off your current location instantly
 - **Tab and bookmark persistence** — your open tabs, active tab and bookmarks are restored on the next launch
 - **Split view** — two independent panels side by side (`Ctrl+\`), each with its own tabs, view mode, selection and scroll position. Drag-and-drop works across panels
+- **Resizable Details columns** — drag a separator in the column header to resize Name / Type / Date Modified / Size (Name takes up whatever is left); double-click a separator to reset that column. Widths are saved in `settings.ini`
 - **View modes per folder**: Details, Small Icons, Large Icons — the choice is remembered per directory via an LRU cache (capped at 200 entries)
 - **Per-folder sort memory** — sort column and direction are remembered per directory (LRU, capped at 200)
 - **Time grouping in the Downloads folder** — entries are bucketed into *Today*, *Yesterday*, *This Week*, *Last Week*, *This Month*, *Last Month*, *Older* headers so recent downloads are always at the top

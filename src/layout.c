@@ -337,3 +337,13 @@ int layout_valid(const Layout* L) {
         if (L->n[i].used && !seen[i]) return 0;
     return 1;
 }
+
+void details_col_drag(int w[3], int col, float right, float x, float avail, int min_w) {
+    if (col < 0 || col > 2) return;
+    float others = 0;
+    for (int i = 0; i < 3; i++) if (i != col) others += (float)w[i];
+    float nw = right - x;
+    if (nw > avail - others) nw = avail - others;
+    if (nw < (float)min_w) nw = (float)min_w;
+    w[col] = (int)(nw + 0.5f);
+}

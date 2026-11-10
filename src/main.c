@@ -56,10 +56,16 @@ static int g_row_h = 20;
 #define RESIZE_BORDER 6
 #define WIN_BTN_W    46
 
-/* Column widths */
-#define COLW_TYPE    90
-#define COLW_DATE    150
-#define COLW_SIZE    55
+/* Column widths: Type, Date, Size. Drag a header separator to resize;
+   persisted in settings.ini, double-click a separator for the default. */
+static const int COLW_DEFAULT[3] = {90, 150, 55};
+static int g_colw[3] = {90, 150, 55};
+#define COLW_TYPE    g_colw[0]
+#define COLW_DATE    g_colw[1]
+#define COLW_SIZE    g_colw[2]
+#define COLW_MIN     30
+#define COLW_MAX     800
+#define COLSEP_HIT   4    /* px either side of a header separator */
 #define NAME_MIN_W   120  /* narrower panels clip Date/Size instead of Name */
 
 /* Details columns sit against the right edge, but Name keeps NAME_MIN_W:
@@ -538,6 +544,22 @@ static int   g_dock_panel = -1, g_dock_zone = DOCK_NONE;   /* live, while draggi
 static int   g_dock_op_tab, g_dock_op_dst, g_dock_op_zone;  /* queued drop */
 #define SPLITTER_HIT_W 6
 
+/* Details column separators, as drawn last frame (for WM_SETCURSOR), and
+   the one being dragged. g_colsep_x[p][c] is the left edge of Type/Date/Size;
+   0 = not shown. */
+static float g_colsep_x[MAX_PANELS][3];
+static float g_colsep_y[MAX_PANELS];
+static int   g_colsep_drag = -1, g_colsep_drag_panel = -1;
+
+static int colsep_at(float x, float y) {
+    for (int p = 0; p < MAX_PANELS; p++) {
+        if (y < g_colsep_y[p] || y >= g_colsep_y[p] + COL_HDR_H) continue;
+        for (int c = 0; c < 3; c++)
+            if (g_colsep_x[p][c] > 0 && fabsf(x - g_colsep_x[p][c]) <= COLSEP_HIT) return c;
+    }
+    return -1;
+}
+
 /* Sync scroll between panels (default off) */
 static int   g_sync_scroll = 0;
 
@@ -575,6 +597,9 @@ static void settings_save(void) {
        drop a hand-edited custom terminal. */
     if (g_pref_terminal_cmd [0]) fprintf(f, "terminal_cmd = %s\r\n",  g_pref_terminal_cmd);
     if (g_pref_terminal_args[0]) fprintf(f, "terminal_args = %s\r\n", g_pref_terminal_args);
+    fprintf(f, "col_type = %d\r\n", g_colw[0]);
+    fprintf(f, "col_date = %d\r\n", g_colw[1]);
+    fprintf(f, "col_size = %d\r\n", g_colw[2]);
     fclose(f);
 }
 
@@ -604,6 +629,9 @@ static void settings_load(void) {
         if (!strcmp(p, "font_size"))    g_pref_font_size = v;
         else if (!strcmp(p, "row_h"))   g_pref_row_h = v;
         else if (!strcmp(p, "terminal")) g_pref_terminal = v;
+        else if (!strcmp(p, "col_type")) g_colw[0] = v;
+        else if (!strcmp(p, "col_date")) g_colw[1] = v;
+        else if (!strcmp(p, "col_size")) g_colw[2] = v;
         else if (!strcmp(p, "terminal_cmd"))
             lstrcpynA(g_pref_terminal_cmd,  val, MAX_PATH);
         else if (!strcmp(p, "terminal_args"))
@@ -616,6 +644,8 @@ static void settings_load(void) {
     if (g_pref_row_h < 14) g_pref_row_h = 14;
     if (g_pref_row_h > 32) g_pref_row_h = 32;
     if (g_pref_terminal < 0 || g_pref_terminal > 3) g_pref_terminal = 0;
+    for (int i = 0; i < 3; i++)
+        if (g_colw[i] < COLW_MIN || g_colw[i] > COLW_MAX) g_colw[i] = COLW_DEFAULT[i];
     g_row_h = g_pref_row_h;
 }
 
@@ -6419,9 +6449,40 @@ static void build_sidebar(void) {
     /* Theme picker moved to Settings modal (open with kebab in toolbar). */
 }
 
+/* Small-font text cut at a UTF-8 boundary so it fits in max_w: a narrowed
+   column must not spill into the next one. */
+static void small_text_fit(Renderer* r, const char* s, float x, float y, float max_w, uint32_t col) {
+    int n = (int)strlen(s);
+    while (n > 0 && render_text_width_small_n(r, s, n) > (int)max_w) {
+        n--;
+        while (n > 0 && ((unsigned char)s[n] & 0xC0) == 0x80) n--;
+    }
+    if (n > 0) render_text_small_n(r, s, n, x, y, col);
+}
+
 static void build_column_headers(float lx, float ly, float lw) {
     Renderer* r = &g_renderer;
+    int panel = g_app.active_panel;
     render_quad(r, lx, ly, lw, COL_HDR_H, COL_HEADER);
+
+    /* Separator drag: the separator on a column's left edge follows the
+       cursor; that column's right edge stays put and Name gives or takes. */
+    float avail = lw - 10 - 28 - NAME_MIN_W;
+    if (g_colsep_drag >= 0 && g_colsep_drag_panel == panel) {
+        if (!g_ui.input.mouse_down) {
+            g_colsep_drag = g_colsep_drag_panel = -1;
+            settings_save();
+        } else {
+            float tx = details_type_x(lx, lw);
+            float right = tx + COLW_TYPE;
+            if (g_colsep_drag >= 1) right += COLW_DATE;
+            if (g_colsep_drag >= 2) right += COLW_SIZE;
+            details_col_drag(g_colw, g_colsep_drag, right, (float)g_ui.input.mouse_x,
+                             avail, COLW_MIN);
+            g_needs_redraw = 1;
+        }
+    }
+
     float type_x = details_type_x(lx, lw);
     float date_x = type_x + COLW_TYPE;
     float size_x = date_x + COLW_DATE;
@@ -6432,18 +6493,41 @@ static void build_column_headers(float lx, float ly, float lw) {
         {"Name", lx+28, type_x-lx-28, 0}, {"Type", type_x, COLW_TYPE, 1},
         {"Date Modified", date_x, COLW_DATE, 2}, {"Size", size_x, COLW_SIZE, 5},
     };
+
+    /* Separators past the panel edge are clipped away: not grabbable. */
+    g_colsep_y[panel] = ly;
+    int sep_hov = -1;
+    for (int c = 0; c < 3; c++) {
+        float sx = cols[c + 1].x;
+        g_colsep_x[panel][c] = (sx < lx + lw - COLSEP_HIT) ? sx : 0;
+        if (g_colsep_x[panel][c] > 0 && g_colsep_drag < 0 && g_splitter_drag < 0 &&
+            g_ui.input.mouse_y >= ly && g_ui.input.mouse_y < ly + COL_HDR_H &&
+            fabsf((float)g_ui.input.mouse_x - sx) <= COLSEP_HIT)
+            sep_hov = c;
+    }
+    if (sep_hov >= 0 && g_ui.input.mouse_dblclick) {
+        g_colw[sep_hov] = COLW_DEFAULT[sep_hov];
+        settings_save();
+        g_needs_redraw = 1;
+    } else if (sep_hov >= 0 && g_ui.input.mouse_clicked) {
+        g_colsep_drag = sep_hov;
+        g_colsep_drag_panel = panel;
+    }
+    /* A press on a separator resizes; it must not also sort. */
+    int sort_ok = sep_hov < 0 && g_colsep_drag < 0;
+
     for (int i = 0; i < 4; i++) {
         /* columns pushed past the panel edge must not catch the neighbour's clicks */
         if (cols[i].x + cols[i].w > lx + lw) cols[i].w = lx + lw - cols[i].x;
         if (cols[i].w <= 0) break;
-        int hov = ui_hover(&g_ui, cols[i].x, ly, cols[i].w, COL_HDR_H);
+        int hov = sort_ok && ui_hover(&g_ui, cols[i].x, ly, cols[i].w, COL_HDR_H);
         render_text(r, cols[i].label, cols[i].x+4, ty, hov ? COL_TEXT : COL_SUBTEXT);
         if (g_app.sort_col == cols[i].col) {
             int tw = render_text_width(r, cols[i].label);
             render_mdl2(r, g_app.sort_asc ? ICON_CHEVRON_UP : ICON_CHEVRON_DOWN,
                         cols[i].x+tw+8, ly + (COL_HDR_H - 8) / 2, 8, COL_ACCENT);
         }
-        if (ui_clicked(&g_ui, UIID(500+i), cols[i].x, ly, cols[i].w, COL_HDR_H)) {
+        if (sort_ok && ui_clicked(&g_ui, UIID(500+i), cols[i].x, ly, cols[i].w, COL_HDR_H)) {
             if (g_app.sort_col == cols[i].col) g_app.sort_asc = !g_app.sort_asc;
             else { g_app.sort_col = cols[i].col; g_app.sort_asc = 1; }
             Tab* tab = active_tab();
@@ -6453,7 +6537,12 @@ static void build_column_headers(float lx, float ly, float lw) {
             sort_prefs_set(tab->path, g_app.sort_col, g_app.sort_asc);
             resort_directory(tab);
         }
-        if (i > 0) render_quad(r, cols[i].x-1, ly+4, 1, COL_HDR_H-8, COL_BORDER);
+        if (i > 0) {
+            int act = (sep_hov == i - 1) ||
+                      (g_colsep_drag == i - 1 && g_colsep_drag_panel == panel);
+            if (act) render_quad(r, cols[i].x-1, ly+2, 2, COL_HDR_H-4, COL_ACCENT);
+            else     render_quad(r, cols[i].x-1, ly+4, 1, COL_HDR_H-8, COL_BORDER);
+        }
     }
     render_scissor_reset(r);
     render_quad(r, lx, ly+COL_HDR_H-1, lw, 1, COL_BORDER);
@@ -6954,13 +7043,13 @@ static void build_file_list(float lx, float ly, float lw, float lh) {
         }
         /* Type/Date/Size use smaller font (size 11), vertically centered with same baseline */
         float ty_sm = ry + (ROW_H - g_renderer.fonts[1].font_height) / 2;
-        render_text_small(r, e->is_dir ? "File folder" : (strrchr(e->name,'.') ? strrchr(e->name,'.') : "File"),
-                          type_x+4, ty_sm, COL_SUBTEXT);
+        small_text_fit(r, e->is_dir ? "File folder" : (strrchr(e->name,'.') ? strrchr(e->name,'.') : "File"),
+                       type_x+4, ty_sm, COLW_TYPE - 8, COL_SUBTEXT);
         { char db[48]; format_time(e->modified, db, sizeof(db));
-          render_text_small(r, db, date_x+4, ty_sm, COL_SUBTEXT); }
-        if (e->is_dir) render_text_small(r, "--", size_x+14, ty_sm, COL_DIM);
+          small_text_fit(r, db, date_x+4, ty_sm, COLW_DATE - 8, COL_SUBTEXT); }
+        if (e->is_dir) small_text_fit(r, "--", size_x+14, ty_sm, COLW_SIZE - 18, COL_DIM);
         else { char sz[32]; format_size(e->size, sz, sizeof(sz));
-               render_text_small(r, sz, size_x+4, ty_sm, COL_SUBTEXT); }
+               small_text_fit(r, sz, size_x+4, ty_sm, COLW_SIZE - 8, COL_SUBTEXT); }
 
         /* Record drag-start info on press so cursor movement past threshold
            can initiate DoDragDrop. Pre-select the file if it isn't already. */
@@ -7758,6 +7847,8 @@ static void build_settings_modal(void) {
             { NULL,         "Ctrl+Alt+arrows",  "Focus panel in that direction"   },
             { NULL,         "Drag tab",         "Onto a panel / its edge to dock"  },
             { NULL,         "Dbl-click splitter","Even out panel sizes"            },
+            { NULL,         "Drag column edge",  "Resize Type / Date / Size"       },
+            { NULL,         "Dbl-click col edge","Reset that column's width"       },
             { "Search",     "Ctrl+F",           "Fuzzy find in current folder"     },
             { NULL,         "Ctrl+R",           "Toggle recursive (in fuzzy)"      },
             { NULL,         "Ctrl+.",           "Stop recursive scan"              },
@@ -7925,6 +8016,14 @@ static void build_ui(void) {
     int saved_active = g_app.active_panel;
     g_focused_panel = saved_active;
     g_in_panel_loop = 1;
+    memset(g_colsep_x, 0, sizeof(g_colsep_x));
+    if (g_colsep_drag >= 0 && (!g_mouse_down ||
+            g_app.panels[g_colsep_drag_panel].tab_count == 0 ||
+            layout_leaf(&g_app.layout, g_colsep_drag_panel) < 0 ||
+            prect(g_colsep_drag_panel)->w <= 0)) {
+        g_colsep_drag = g_colsep_drag_panel = -1;
+        settings_save();
+    }
     for (int p = 0; p < MAX_PANELS; p++) {
         if (g_app.panels[p].tab_count == 0 || layout_leaf(&g_app.layout, p) < 0) continue;
         if (prect(p)->w <= 0) continue;   /* hidden behind a maximized panel */
@@ -8153,6 +8252,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (c >= 0) {
                     int v = g_app.layout.n[g_app.layout.n[c].parent].vertical;
                     SetCursor(LoadCursor(NULL, v ? IDC_SIZEWE : IDC_SIZENS));
+                    return TRUE;
+                }
+                if (g_colsep_drag >= 0 || colsep_at((float)pt.x, (float)pt.y) >= 0) {
+                    SetCursor(LoadCursor(NULL, IDC_SIZEWE));
                     return TRUE;
                 }
             }

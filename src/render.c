@@ -432,6 +432,10 @@ int render_text_width_small(Renderer* r, const char* text) {
     return width_atlas(r, &r->fonts[1], text, -1);
 }
 
+int render_text_width_small_n(Renderer* r, const char* text, int n) {
+    return width_atlas(r, &r->fonts[1], text, n);
+}
+
 void render_folder_icon(Renderer* r, float x, float y, float sz, uint32_t color) {
     float tab_w = sz * 0.5f, tab_h = sz * 0.25f;
     float body_y = y + tab_h * 0.6f;
