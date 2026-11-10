@@ -131,5 +131,19 @@ int main(void) {
     L.n[L.n[L.root].child].ratio = 1.0f;
     assert(!layout_valid(&L));
     puts("layout ok");
+    /* details column drag: separator on Date's left edge (Date's right edge
+       at 500) dragged to 300 widens Date to 200; Name absorbs the rest */
+    {
+        int w[3] = {90, 150, 55};
+        details_col_drag(w, 1, 500, 300, 1000, 30);
+        assert(w[0] == 90 && w[1] == 200 && w[2] == 55);
+        details_col_drag(w, 1, 500, 495, 1000, 30);   /* min width */
+        assert(w[1] == 30);
+        details_col_drag(w, 2, 600, 0, 400, 30);      /* fits beside the others */
+        assert(w[2] == 400 - 90 - 30);
+        details_col_drag(w, 0, 100, 50, 40, 30);      /* no room: min wins */
+        assert(w[0] == 30);
+    }
+
     return 0;
 }
